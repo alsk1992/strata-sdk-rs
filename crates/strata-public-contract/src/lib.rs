@@ -57,8 +57,8 @@ pub struct QuoteResponse {
     pub amount_in_consumed_atoms: String,
     pub amount_out_atoms: String,
     pub minimum_output_atoms: String,
-    /// Fees charged in the request's input asset. Combined Market execution
-    /// can charge fees on either side, so a single unlabelled fee is unsafe.
+    /// Fees charged in the request's input asset. Sonar can charge fees on
+    /// either side, so a single unlabelled fee is unsafe.
     pub input_fee_atoms: String,
     /// Fees charged in the response's output asset.
     pub output_fee_atoms: String,
@@ -82,8 +82,8 @@ pub struct Market {
     pub ready: bool,
     pub base_decimals: u8,
     pub quote_decimals: u8,
-    /// Stable product-level address for a full-system Sonar quote. This is an
-    /// API operation, not an execution route; its target remains opaque.
+    /// Stable product-level operation for a Sonar quote. Its implementation
+    /// remains opaque.
     pub quote_path: Option<String>,
 }
 
@@ -270,25 +270,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn public_quote_contains_economics_but_no_sonar_recipe() {
+    fn public_quote_field_set_is_sealed() {
         let quote: QuoteResponse = serde_json::from_str(contract_fixtures::QUOTE).unwrap();
         let value = serde_json::to_value(quote).unwrap();
         let object = value.as_object().unwrap();
-
-        for forbidden in [
-            "route",
-            "source",
-            "pool",
-            "split",
-            "plan_hash",
-            "density",
-            "fit",
-        ] {
-            assert!(
-                object.keys().all(|key| !key.contains(forbidden)),
-                "public quote leaked forbidden key fragment {forbidden}"
-            );
-        }
+        let mut actual = object.keys().map(String::as_str).collect::<Vec<_>>();
+        actual.sort_unstable();
+        let mut expected = vec![
+            "amount_in_atoms",
+            "amount_in_consumed_atoms",
+            "amount_out_atoms",
+            "contract_version",
+            "expires_at_ms",
+            "input_fee_atoms",
+            "market_id",
+            "minimum_output_atoms",
+            "output_fee_atoms",
+            "price_impact_pct",
+            "provider",
+            "quote_id",
+            "reference_price",
+            "schema_version",
+            "server_time_ms",
+            "side",
+        ];
+        expected.sort_unstable();
+        assert_eq!(actual, expected, "public quote fields must remain sealed");
         assert_eq!(object["amount_out_atoms"], "1990000");
         assert_eq!(object["minimum_output_atoms"], "1980050");
         assert_eq!(object["provider"], "Sonar");

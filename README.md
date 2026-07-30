@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="https://stratabook.app/docs/agent-sdks">Documentation</a>
+  <a href="https://stratabook.org/docs/agent-sdks">Documentation</a>
   ·
   <a href="https://github.com/alsk1992/strata-sdk-ts">TypeScript</a>
   ·
@@ -136,8 +136,8 @@ sign, or submit transactions and never needs wallet or private-key material.
 
 ## Resources
 
-- [Agent quick start](https://stratabook.app/docs/hello-agents)
-- [SDK documentation](https://stratabook.app/docs/agent-sdks)
+- [Agent quick start](https://stratabook.org/docs/hello-agents)
+- [SDK documentation](https://stratabook.org/docs/agent-sdks)
 - [Issues and feature requests](https://github.com/alsk1992/strata-sdk-rs/issues)
 - [Security policy](SECURITY.md)
 
