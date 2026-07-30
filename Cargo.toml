@@ -11,7 +11,7 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 authors = ["Strata Labs"]
 repository = "https://github.com/alsk1992/strata-sdk-rs"
-homepage = "https://stratabook.app/docs/agent-sdks"
+homepage = "https://stratabook.org/docs/agent-sdks"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
