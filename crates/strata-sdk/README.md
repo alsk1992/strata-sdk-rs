@@ -1,15 +1,24 @@
-# Strata SDK
+# `strata-sdk`
 
-The official Rust client for Strata markets and Sonar quotes.
+The official async Rust client for live Strata markets and Sonar quotes.
 
-## Quick start
+## Install
+
+```toml
+[dependencies]
+strata-public-contract = "0.1"
+strata-sdk = "0.1"
+```
+
+## Request a Sonar quote
 
 ```rust
 use strata_public_contract::{QuoteRequest, QuoteSide};
 use strata_sdk::StrataClient;
 
-# async fn example() -> Result<(), Box<dyn std::error::Error>> {
+# async fn run() -> Result<(), Box<dyn std::error::Error>> {
 let strata = StrataClient::production()?;
+
 let quote = strata
     .quote(QuoteRequest {
         market_id: "SOL/USDC".into(),
@@ -19,37 +28,42 @@ let quote = strata
     })
     .await?;
 
-println!("output: {}", quote.amount_out_atoms);
-println!("minimum: {}", quote.minimum_output_atoms);
+println!("Sonar output: {}", quote.amount_out_atoms);
+println!("Minimum:      {}", quote.minimum_output_atoms);
+println!("Price impact: {}%", quote.price_impact_pct);
 # Ok(())
 # }
 ```
 
-Sonar is Strata's unified liquidity and matching system. A quote includes
-expected output, consumed input, fees by token, minimum output, price impact,
-and expiry.
+Sonar is Strata's unified liquidity and matching system. The response brings
+together expected output, consumed input, fees, minimum output, price impact,
+and expiry in one typed result.
 
-All token amounts use exact decimal strings in atomic units. Quotes are
-short-lived, so request a new quote after expiry and always respect
-`minimum_output_atoms`.
+## Client operations
 
-## Terminal client
+| Method | Result |
+| --- | --- |
+| `capabilities()` | Features currently available through the public contract |
+| `markets()` | Strata markets, token decimals, and Sonar quote readiness |
+| `quote(request)` | A short-lived Sonar economic quote |
 
-Install the companion CLI:
+Token amounts use unsigned decimal strings in atomic units. The client validates
+contract compatibility, quote binding, lifetime, and economic fields before
+returning data to the caller.
+
+## Terminal companion
 
 ```sh
 cargo install strata-agent-cli
-```
 
-```sh
 strata-agent markets
 strata-agent quote --market SOL/USDC --side sell --amount-atoms 10000000
 ```
 
-Add `--json` for machine-readable output.
+Add `--json` for scripts, pipes, and agents.
 
-The `0.1.x` release supports market discovery and read-only Sonar quotes. It
-does not prepare, sign, or submit transactions.
+`0.1.x` covers market discovery and read-only Sonar quotes. It does not prepare,
+sign, or submit transactions.
 
-See the [repository README](https://github.com/alsk1992/strata-sdk-rs) for full
-documentation.
+See the [workspace README](https://github.com/alsk1992/strata-sdk-rs) for the
+complete guide.
