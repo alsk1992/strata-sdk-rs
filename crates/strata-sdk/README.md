@@ -1,14 +1,16 @@
-# `strata-sdk`
+# Strata SDK
 
-Strict Rust bindings for Strata's versioned public agent contract.
+The official Rust client for Strata markets and Sonar quotes.
+
+## Quick start
 
 ```rust
 use strata_public_contract::{QuoteRequest, QuoteSide};
 use strata_sdk::StrataClient;
 
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-let client = StrataClient::production()?;
-let quote = client
+let strata = StrataClient::production()?;
+let quote = strata
     .quote(QuoteRequest {
         market_id: "SOL/USDC".into(),
         side: QuoteSide::Sell,
@@ -16,27 +18,38 @@ let quote = client
         slippage_bps: 50,
     })
     .await?;
-println!("{}", quote.amount_out_atoms);
+
+println!("output: {}", quote.amount_out_atoms);
+println!("minimum: {}", quote.minimum_output_atoms);
 # Ok(())
 # }
 ```
 
-Atomic money values remain decimal strings at the public boundary. The SDK
-strictly validates contract versions, response fields, quote binding, lifetime,
-and economic invariants. Input and output fees are labelled separately. The
-quote uses Strata's complete eligible market while exposing no Sonar
-implementation types.
+Sonar is Strata's unified liquidity and matching system. A quote includes
+expected output, consumed input, fees by token, minimum output, price impact,
+and expiry.
 
-The separate `strata-agent-cli` crate exposes the same read-only surface:
+All token amounts use exact decimal strings in atomic units. Quotes are
+short-lived, so request a new quote after expiry and always respect
+`minimum_output_atoms`.
+
+## Terminal client
+
+Install the companion CLI:
 
 ```sh
-strata-agent capabilities
+cargo install strata-agent-cli
+```
+
+```sh
 strata-agent markets
 strata-agent quote --market SOL/USDC --side sell --amount-atoms 10000000
 ```
 
-Add `--json` to any command for stable machine-readable output.
+Add `--json` for machine-readable output.
 
-Sonar is Strata's unified liquidity and matching system. Its result is
-composition-opaque: this crate exposes the public economics, not private
-routing, venue selection, or matching internals.
+The `0.1.x` release supports market discovery and read-only Sonar quotes. It
+does not prepare, sign, or submit transactions.
+
+See the [repository README](https://github.com/alsk1992/strata-sdk-rs) for full
+documentation.

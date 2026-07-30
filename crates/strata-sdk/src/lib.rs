@@ -1,8 +1,7 @@
-//! Rust client for Strata's versioned public agent contract.
+//! Official Rust client for Strata markets and Sonar quotes.
 //!
-//! The SDK intentionally exposes product operations and user economics only.
-//! Sonar implementation details are neither represented nor accepted by the
-//! strict response models.
+//! It provides typed requests and responses and validates compatibility, quote
+//! binding, and economic fields before returning data to the application.
 
 use reqwest::{StatusCode, Url};
 use serde::de::DeserializeOwned;

@@ -1,23 +1,15 @@
-# Strata Rust SDK
+# Strata SDK for Rust
 
-Official native Rust bindings and terminal access for Strata's versioned public
-contract.
+Build native Rust applications and terminal workflows with Strata markets and
+Sonar quotes.
 
-This workspace publishes three crates:
+The SDK provides typed, async access to Strata's public API. Sonar is Strata's
+unified liquidity and matching system: one request returns the price, fees,
+minimum output, price impact, and expiry for the complete Strata market.
 
-- [`strata-public-contract`](crates/strata-public-contract) — strict public data
-  types and compatibility fixtures.
-- [`strata-sdk`](crates/strata-sdk) — async client with fail-closed response
-  validation.
-- [`strata-agent-cli`](crates/strata-agent-cli) — the read-only `strata-agent`
-  terminal command.
+## Quick start
 
-Sonar is Strata's unified liquidity and matching system. A Sonar quote considers
-the complete eligible market and returns one composition-opaque economic result.
-The public crates do not expose private routing, venue selection, or matching
-internals.
-
-## SDK quick start
+Add the SDK and shared types to your project:
 
 ```toml
 [dependencies]
@@ -25,13 +17,15 @@ strata-public-contract = "0.1"
 strata-sdk = "0.1"
 ```
 
+Request a quote:
+
 ```rust
 use strata_public_contract::{QuoteRequest, QuoteSide};
 use strata_sdk::StrataClient;
 
 # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-let client = StrataClient::production()?;
-let quote = client
+let strata = StrataClient::production()?;
+let quote = strata
     .quote(QuoteRequest {
         market_id: "SOL/USDC".into(),
         side: QuoteSide::Sell,
@@ -40,36 +34,63 @@ let quote = client
     })
     .await?;
 
-println!("{}", quote.amount_out_atoms);
+println!("output: {}", quote.amount_out_atoms);
+println!("minimum: {}", quote.minimum_output_atoms);
 # Ok(())
 # }
 ```
 
-## Terminal quick start
+## Use it from the terminal
+
+Install the `strata-agent` command:
 
 ```sh
 cargo install strata-agent-cli
-strata-agent capabilities --json
-strata-agent markets --json
+```
+
+Explore markets and request a quote:
+
+```sh
+strata-agent markets
+
 strata-agent quote \
   --market SOL/USDC \
   --side sell \
   --amount-atoms 10000000 \
-  --slippage-bps 50 \
-  --json
+  --slippage-bps 50
 ```
 
-## Contract guarantees
+Add `--json` to any command for stable machine-readable output.
 
-- Token amounts cross the public boundary as unsigned base-10 atomic strings.
-- Unknown fields and unsupported contract versions fail closed.
-- Quotes are rebound to the requested market, side, and input amount.
-- Expiry, minimum output, fee labels, and core economic invariants are checked.
-- Product capability policy is discovered from Strata instead of hard-coded.
+## Working with quotes
 
-Version `0.1.x` is read-only. It cannot prepare, sign, or submit transactions
-and never accepts wallet, keypair, or session-key material.
+Token amounts use atomic units—the smallest unit of each token—and cross the API
+boundary as decimal strings so they remain exact. A quote includes expected
+output, consumed input, fees by token, minimum output, price impact, and expiry.
 
-Public product documentation lives at
-[stratabook.app/docs](https://stratabook.app/docs/hello-agents). Security issues
-should be reported privately as described in [SECURITY.md](SECURITY.md).
+Quotes are short-lived. Request a new quote after expiry and always respect
+`minimum_output_atoms`.
+
+## Crates
+
+| Crate | Purpose |
+| --- | --- |
+| [`strata-sdk`](crates/strata-sdk) | Async client for markets, capabilities, and Sonar quotes |
+| [`strata-public-contract`](crates/strata-public-contract) | Shared request and response types |
+| [`strata-agent-cli`](crates/strata-agent-cli) | The `strata-agent` terminal command |
+
+## Available today
+
+The `0.1.x` release supports market discovery and read-only Sonar quotes. It
+does not prepare, sign, or submit transactions and never needs wallet or
+private-key material.
+
+## Documentation and support
+
+- [Agent quick start](https://stratabook.app/docs/hello-agents)
+- [SDK documentation](https://stratabook.app/docs/agent-sdks)
+- [TypeScript SDK](https://github.com/alsk1992/strata-sdk-ts)
+- [Report a bug or request a feature](https://github.com/alsk1992/strata-sdk-rs/issues)
+- [Report a security issue](SECURITY.md)
+
+Licensed under either [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT).
