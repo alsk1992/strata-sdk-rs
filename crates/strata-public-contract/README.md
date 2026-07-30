@@ -1,10 +1,21 @@
-# `strata-public-contract`
+# Strata Public Contract
 
-Strict data types and fixtures for Strata's versioned public product contract.
+Shared Rust types for Strata market discovery and Sonar quotes.
 
-The crate deliberately contains no HTTP client, transaction builder, wallet
-handling, or private Sonar implementation types. Enable the `fixtures` feature
-to consume the canonical JSON examples used by the language SDK test suites.
+Most applications should depend on [`strata-sdk`](https://crates.io/crates/strata-sdk),
+which includes the HTTP client. Use this crate directly when you need Strata's
+request and response models without a network client.
 
-Atomic token amounts are represented as unsigned base-10 strings so callers do
-not lose precision at a JSON or language boundary.
+Token amounts are represented as unsigned decimal strings in atomic units so
+they remain exact across JSON and language boundaries.
+
+Enable the optional `fixtures` feature to use the canonical JSON examples shared
+by the official Strata SDK test suites:
+
+```toml
+[dev-dependencies]
+strata-public-contract = { version = "0.1", features = ["fixtures"] }
+```
+
+See the [repository README](https://github.com/alsk1992/strata-sdk-rs) for full
+documentation.
