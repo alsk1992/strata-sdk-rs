@@ -383,13 +383,13 @@ mod tests {
     #[test]
     fn accepts_only_product_level_quote_operation_paths() {
         assert!(valid_public_operation_path("/sonar/markets/sol-usdc/quote"));
-        for private_or_ambiguous in [
-            "/market/build",
-            "/private/service/quote",
+        for unsupported_or_ambiguous in [
+            "/unsupported/build",
+            "/unsupported/quote",
             "/sonar/markets/../quote",
             "/sonar/markets/SOL-USDC/quote",
         ] {
-            assert!(!valid_public_operation_path(private_or_ambiguous));
+            assert!(!valid_public_operation_path(unsupported_or_ambiguous));
         }
     }
 }
