@@ -1,0 +1,42 @@
+name: Publish
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  crates:
+    runs-on: ubuntu-latest
+    environment: crates-release
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          ref: ${{ github.event.release.tag_name }}
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+      - run: cargo test --locked --workspace --all-features
+      - name: Verify release tag
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: python3 -c 'import os,tomllib; v=tomllib.load(open("crates/strata-sdk/Cargo.toml","rb"))["package"]["version"]; assert os.environ["RELEASE_TAG"] == f"v{v}"'
+      - uses: rust-lang/crates-io-auth-action@c6f97d42243bad5fab37ca0427f495c86d5b1a18 # v1.0.5
+        id: auth
+      - name: Publish public contract
+        run: cargo publish --locked -p strata-public-contract
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+      - name: Wait for public contract index
+        run: for attempt in {1..18}; do cargo search strata-public-contract --limit 1 | grep -q "^strata-public-contract " && exit 0; sleep 10; done; exit 1
+      - name: Publish SDK
+        run: cargo publish --locked -p strata-sdk
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+      - name: Wait for SDK index
+        run: for attempt in {1..18}; do cargo search strata-sdk --limit 1 | grep -q "^strata-sdk " && exit 0; sleep 10; done; exit 1
+      - name: Publish terminal client
+        run: cargo publish --locked -p strata-agent-cli
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}

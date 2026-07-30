@@ -1,0 +1,23 @@
+[package]
+name = "strata-agent-cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Read-only terminal client for Strata's public agent API."
+readme = "README.md"
+keywords = ["solana", "trading", "cli", "strata", "sonar"]
+categories = ["command-line-utilities"]
+publish = ["crates-io"]
+
+[[bin]]
+name = "strata-agent"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive", "env"] }
+serde_json = { workspace = true }
+strata-sdk = { workspace = true }
+tokio = { workspace = true }

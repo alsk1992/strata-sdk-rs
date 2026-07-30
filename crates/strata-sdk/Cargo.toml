@@ -1,0 +1,25 @@
+[package]
+name = "strata-sdk"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Strict, versioned Rust client for Strata's public agent API."
+readme = "README.md"
+keywords = ["solana", "trading", "sdk", "strata"]
+categories = ["api-bindings", "web-programming::http-client"]
+publish = ["crates-io"]
+
+[dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+strata-public-contract = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+strata-public-contract = { workspace = true, features = ["fixtures"] }
+tokio = { workspace = true }
+wiremock = "0.6"
