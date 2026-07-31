@@ -151,6 +151,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+fn side_label(side: QuoteSide) -> &'static str {
+    match side {
+        QuoteSide::Buy => "buy",
+        QuoteSide::Sell => "sell",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -173,12 +180,5 @@ mod tests {
             panic!("expected quote command");
         };
         assert_eq!(slippage_bps, DEFAULT_SLIPPAGE_BPS);
-    }
-}
-
-fn side_label(side: QuoteSide) -> &'static str {
-    match side {
-        QuoteSide::Buy => "buy",
-        QuoteSide::Sell => "sell",
     }
 }
