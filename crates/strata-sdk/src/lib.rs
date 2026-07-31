@@ -12,7 +12,7 @@ use thiserror::Error;
 
 pub use strata_public_contract::{
     CapabilityCatalog, CapabilityDescriptor, CapabilityRisk, CapabilityStability, Market,
-    MarketsResponse, McpExposure, QuoteRequest, QuoteResponse, QuoteSide,
+    MarketsResponse, McpExposure, QuoteRequest, QuoteResponse, QuoteSide, DEFAULT_SLIPPAGE_BPS,
 };
 
 pub const DEFAULT_API_BASE: &str = "https://api.stratabook.app";

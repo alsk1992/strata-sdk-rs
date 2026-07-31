@@ -31,7 +31,7 @@ strata-sdk = "0.1"
 ```
 
 ```rust
-use strata_public_contract::{QuoteRequest, QuoteSide};
+use strata_public_contract::{QuoteRequest, QuoteSide, DEFAULT_SLIPPAGE_BPS};
 use strata_sdk::StrataClient;
 
 # async fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -42,7 +42,7 @@ let quote = strata
         market_id: "SOL/USDC".into(),
         side: QuoteSide::Sell,
         amount_in_atoms: "10000000".into(),
-        slippage_bps: 50,
+        slippage_bps: DEFAULT_SLIPPAGE_BPS,
     })
     .await?;
 
@@ -82,8 +82,7 @@ strata-agent markets
 strata-agent quote \
   --market SOL/USDC \
   --side sell \
-  --amount-atoms 10000000 \
-  --slippage-bps 50
+  --amount-atoms 10000000
 ```
 
 Use `--json` for scripts, pipes, and agents:
@@ -110,7 +109,7 @@ strata-agent quote \
 | --- | --- |
 | `amount_in_consumed_atoms` | How much input the quote expects to use |
 | `amount_out_atoms` | The quoted output |
-| `minimum_output_atoms` | The output floor at your chosen slippage |
+| `minimum_output_atoms` | The lowest output allowed by the requested tolerance |
 | `input_fee_atoms` / `output_fee_atoms` | Which token pays each fee and how much |
 | `reference_price` | The public reference price used for context |
 | `price_impact_pct` | Estimated price impact |
@@ -119,6 +118,17 @@ strata-agent quote \
 Amounts are unsigned base-10 strings in atomic units. That representation is
 deliberate: parsing through floating point would make financial values less
 exact, not more convenient.
+
+### Optional execution tolerance
+
+`DEFAULT_SLIPPAGE_BPS` is `0`, so the minimum output equals the quoted output.
+This is separate from price impact, which describes the depth consumed by the
+quote itself.
+
+Choose a non-zero `slippage_bps` only when you are willing to accept less
+output in exchange for greater execution tolerance. The returned
+`minimum_output_atoms` remains the authoritative floor, and the requested
+tolerance can affect which Sonar result is viable.
 
 ## Choose your Strata interface
 
