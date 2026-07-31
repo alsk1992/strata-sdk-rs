@@ -7,9 +7,7 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use std::error::Error;
 use std::time::Duration;
-use strata_sdk::{
-    QuoteRequest, QuoteSide, StrataClient, DEFAULT_API_BASE, DEFAULT_SLIPPAGE_BPS,
-};
+use strata_sdk::{QuoteRequest, QuoteSide, StrataClient, DEFAULT_API_BASE, DEFAULT_SLIPPAGE_BPS};
 
 #[derive(Debug, Parser)]
 #[command(
