@@ -130,6 +130,21 @@ output in exchange for greater execution tolerance. The returned
 `minimum_output_atoms` remains the authoritative floor, and the requested
 tolerance can affect which Sonar result is viable.
 
+## Authenticated execution
+
+When the live prepare and submit capabilities are enabled, `execute_quote`
+executes an unexpired quote with application-owned implementations of
+`SessionSigner` and `ExecutionVerifier`.
+
+The SDK never accepts private key bytes. It validates a one-time authorization
+bound to the quote and `minimum_output_atoms`, calls the deny-by-default
+verifier, and only then asks the non-exportable Vault session to sign.
+Submission is idempotent.
+
+The owner wallet remains the recovery authority for pausing or revoking the
+session and for withdrawals. Prepare and submit are disabled by default; the
+native terminal client remains read-only.
+
 ## Choose your Strata interface
 
 | You are building… | Start here |
@@ -141,8 +156,9 @@ tolerance can affect which Sonar result is viable.
 
 ## Current release
 
-`0.1.x` covers market discovery and read-only Sonar quotes. It does not prepare,
-sign, or submit transactions and never needs wallet or private-key material.
+The SDK contains market discovery, Sonar quotes, and the gated Vault-session
+execution contract. The native terminal client is read-only. Live capability
+discovery is authoritative.
 
 ## Resources
 
