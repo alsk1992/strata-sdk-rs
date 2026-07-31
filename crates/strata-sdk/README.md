@@ -46,6 +46,7 @@ and expiry in one typed result.
 | `capabilities()` | Features currently available through the public contract |
 | `markets()` | Strata markets, token decimals, and Sonar quote readiness |
 | `quote(request)` | A short-lived Sonar economic quote |
+| `execute_quote(...)` | Authenticated Vault-session execution when enabled |
 
 Token amounts use unsigned decimal strings in atomic units. The client validates
 contract compatibility, quote binding, lifetime, and economic fields before
@@ -66,8 +67,12 @@ strata-agent quote --market SOL/USDC --side sell --amount-atoms 10000000
 
 Add `--json` for scripts, pipes, and agents.
 
-`0.1.x` covers market discovery and read-only Sonar quotes. It does not prepare,
-sign, or submit transactions.
+Execution uses application-owned implementations of `SessionSigner` and
+`ExecutionVerifier`. The SDK validates the one-time authorization, quote,
+minimum output, expiry, blockhash, prepared response, and receipt. It calls the
+verifier before the session adapter can sign and never accepts private key
+bytes. The live prepare and submit capabilities remain disabled by default;
+the terminal and MCP clients do not submit transactions.
 
 See the [workspace README](https://github.com/alsk1992/strata-sdk-rs) for the
 complete guide.

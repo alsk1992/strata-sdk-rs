@@ -18,6 +18,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 strata-public-contract = { workspace = true }
 thiserror = { workspace = true }
+async-trait = "0.1"
+base64 = "0.22"
+bs58 = "0.5"
+hex = "0.4"
 
 [dev-dependencies]
 strata-public-contract = { workspace = true, features = ["fixtures"] }

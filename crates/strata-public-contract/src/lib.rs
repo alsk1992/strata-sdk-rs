@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 
 pub const CONTRACT_MAJOR: u16 = 1;
-pub const CONTRACT_VERSION: &str = "1.0";
+pub const CONTRACT_VERSION: &str = "1.1";
 /// Exact-output default for the current read-only quote surface.
 pub const DEFAULT_SLIPPAGE_BPS: u16 = 0;
 
@@ -20,6 +20,9 @@ pub const DEFAULT_SLIPPAGE_BPS: u16 = 0;
 #[doc(hidden)]
 pub mod contract_fixtures {
     pub const CAPABILITIES: &str = include_str!("../fixtures/v1/capabilities.json");
+    pub const EXECUTION_CHALLENGE: &str = include_str!("../fixtures/v1/execution-challenge.json");
+    pub const EXECUTION_PREPARE: &str = include_str!("../fixtures/v1/execution-prepare.json");
+    pub const EXECUTION_SUBMIT: &str = include_str!("../fixtures/v1/execution-submit.json");
     pub const MARKETS: &str = include_str!("../fixtures/v1/markets.json");
     pub const QUOTE: &str = include_str!("../fixtures/v1/quote.json");
 }
@@ -71,6 +74,93 @@ pub struct QuoteResponse {
     pub reference_price: String,
     pub price_impact_pct: String,
     pub provider: String,
+}
+
+/// Ask Strata for a one-time payload authorizing preparation of an existing
+/// Sonar quote. The session key signs locally; no private signing material is
+/// accepted by this contract.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionChallengeRequest {
+    pub quote_id: String,
+    pub owner_wallet: String,
+    pub session_public_key: String,
+    /// Vault-owned Market account sequence encoded as an unsigned decimal
+    /// string. It prevents a prepared internal fill from targeting stale state.
+    pub account_sequence: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionChallengeResponse {
+    pub schema_version: u16,
+    pub contract_version: String,
+    pub challenge_id: String,
+    pub quote_id: String,
+    pub market_id: String,
+    pub side: QuoteSide,
+    pub amount_in_atoms: String,
+    /// The sole customer-facing execution protection.
+    pub minimum_output_atoms: String,
+    /// Canonical bytes to sign locally with the declared session key.
+    pub authorization_payload_base64: String,
+    pub server_time_ms: u64,
+    pub expires_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionPrepareRequest {
+    pub challenge_id: String,
+    /// Base58 Ed25519 signature over `authorization_payload_base64`.
+    pub authorization_signature: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionPrepareResponse {
+    pub schema_version: u16,
+    pub contract_version: String,
+    pub execution_id: String,
+    pub quote_id: String,
+    pub market_id: String,
+    pub side: QuoteSide,
+    pub amount_in_atoms: String,
+    /// The same signed minimum returned by the challenge. Preparation may fail,
+    /// but it may never weaken this value.
+    pub minimum_output_atoms: String,
+    /// Partially signed Solana v0 transaction. The session signature slot is
+    /// deliberately empty and must be filled locally.
+    pub transaction_base64: String,
+    pub recent_blockhash: String,
+    pub last_valid_block_height: u64,
+    pub expires_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionSubmitRequest {
+    pub execution_id: String,
+    pub signed_transaction_base64: String,
+    /// Caller-generated opaque key. Repeating it may return the original
+    /// result, but can never create a second execution.
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionSubmitResponse {
+    pub schema_version: u16,
+    pub contract_version: String,
+    pub execution_id: String,
+    pub signature: String,
+    pub status: ExecutionStatus,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionStatus {
+    Submitted,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -192,19 +282,25 @@ impl CapabilityCatalog {
         use CapabilityStability::{Beta, Stable};
         use McpExposure::{None as McpNone, Read as McpRead};
 
-        let capability =
-            |id: &str, stability, scope: &str, risk, default_enabled, public_sdk, mcp_exposure| {
-                CapabilityDescriptor {
-                    id: id.to_owned(),
-                    introduced_in: CONTRACT_VERSION.to_owned(),
-                    stability,
-                    required_scope: scope.to_owned(),
-                    risk,
-                    default_enabled,
-                    public_sdk,
-                    mcp_exposure,
-                }
-            };
+        let capability = |id: &str,
+                          introduced_in: &str,
+                          stability,
+                          scope: &str,
+                          risk,
+                          default_enabled,
+                          public_sdk,
+                          mcp_exposure| {
+            CapabilityDescriptor {
+                id: id.to_owned(),
+                introduced_in: introduced_in.to_owned(),
+                stability,
+                required_scope: scope.to_owned(),
+                risk,
+                default_enabled,
+                public_sdk,
+                mcp_exposure,
+            }
+        };
 
         Self {
             schema_version: CONTRACT_MAJOR,
@@ -212,6 +308,7 @@ impl CapabilityCatalog {
             capabilities: vec![
                 capability(
                     "markets.read",
+                    "1.0",
                     Stable,
                     "market:read",
                     Read,
@@ -221,6 +318,7 @@ impl CapabilityCatalog {
                 ),
                 capability(
                     "books.read",
+                    "1.0",
                     Beta,
                     "market:read",
                     Read,
@@ -230,6 +328,7 @@ impl CapabilityCatalog {
                 ),
                 capability(
                     "quotes.read",
+                    "1.0",
                     Beta,
                     "market:read",
                     Read,
@@ -239,6 +338,7 @@ impl CapabilityCatalog {
                 ),
                 capability(
                     "account.read",
+                    "1.0",
                     Beta,
                     "account:read",
                     Read,
@@ -248,20 +348,22 @@ impl CapabilityCatalog {
                 ),
                 capability(
                     "trade.prepare",
+                    "1.1",
                     Beta,
                     "trade:prepare",
                     Prepare,
                     false,
-                    false,
+                    true,
                     McpNone,
                 ),
                 capability(
                     "trade.submit",
+                    "1.1",
                     Beta,
                     "trade:submit",
                     Submit,
                     false,
-                    false,
+                    true,
                     McpNone,
                 ),
             ],
@@ -336,5 +438,48 @@ mod tests {
             .insert("unexpected_field".to_owned(), serde_json::json!("hidden"));
 
         assert!(serde_json::from_value::<QuoteResponse>(value).is_err());
+    }
+
+    #[test]
+    fn execution_contract_exposes_only_minimum_output_protection() {
+        let challenge: ExecutionChallengeResponse =
+            serde_json::from_str(contract_fixtures::EXECUTION_CHALLENGE).unwrap();
+        let prepared: ExecutionPrepareResponse =
+            serde_json::from_str(contract_fixtures::EXECUTION_PREPARE).unwrap();
+        let submitted: ExecutionSubmitResponse =
+            serde_json::from_str(contract_fixtures::EXECUTION_SUBMIT).unwrap();
+
+        assert_eq!(
+            challenge.minimum_output_atoms,
+            prepared.minimum_output_atoms
+        );
+        assert_eq!(challenge.quote_id, prepared.quote_id);
+        assert_eq!(challenge.market_id, prepared.market_id);
+        assert_eq!(submitted.execution_id, prepared.execution_id);
+
+        for fixture in [
+            contract_fixtures::EXECUTION_CHALLENGE,
+            contract_fixtures::EXECUTION_PREPARE,
+            contract_fixtures::EXECUTION_SUBMIT,
+        ] {
+            let value: serde_json::Value = serde_json::from_str(fixture).unwrap();
+            let keys = value.as_object().unwrap().keys().collect::<Vec<_>>();
+            for forbidden in [
+                "route",
+                "venue",
+                "layer",
+                "plan",
+                "collar",
+                "limit_price",
+                "internal",
+                "l3",
+                "footprint",
+            ] {
+                assert!(
+                    keys.iter().all(|key| !key.contains(forbidden)),
+                    "execution contract exposed forbidden field containing {forbidden}"
+                );
+            }
+        }
     }
 }

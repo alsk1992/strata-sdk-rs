@@ -3,20 +3,54 @@
 //! It provides typed requests and responses and validates compatibility, quote
 //! binding, and economic fields before returning data to the application.
 
+use async_trait::async_trait;
+use base64::Engine as _;
 use reqwest::{StatusCode, Url};
 use serde::de::DeserializeOwned;
 use std::collections::HashSet;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use strata_public_contract::{ErrorResponse, CONTRACT_MAJOR, CONTRACT_VERSION};
 use thiserror::Error;
 
 pub use strata_public_contract::{
-    CapabilityCatalog, CapabilityDescriptor, CapabilityRisk, CapabilityStability, Market,
-    MarketsResponse, McpExposure, QuoteRequest, QuoteResponse, QuoteSide, DEFAULT_SLIPPAGE_BPS,
+    CapabilityCatalog, CapabilityDescriptor, CapabilityRisk, CapabilityStability,
+    ExecutionChallengeRequest, ExecutionChallengeResponse, ExecutionPrepareRequest,
+    ExecutionPrepareResponse, ExecutionStatus, ExecutionSubmitRequest, ExecutionSubmitResponse,
+    Market, MarketsResponse, McpExposure, QuoteRequest, QuoteResponse, QuoteSide,
+    DEFAULT_SLIPPAGE_BPS,
 };
 
 pub const DEFAULT_API_BASE: &str = "https://api.stratabook.app";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+const PUBLIC_EXECUTION_AUTH_DOMAIN: &[u8] = b"strata-sonar-execution:v1\0";
+
+#[async_trait]
+pub trait SessionSigner: Send + Sync {
+    /// Canonical base58 Ed25519 public key registered as the Vault delegate.
+    fn public_key(&self) -> &str;
+
+    /// Sign the exact SDK-validated public execution authorization.
+    async fn sign_message(&self, message: &[u8]) -> Result<Vec<u8>, String>;
+
+    /// Add only the session signature to an already-verified transaction.
+    async fn sign_transaction(&self, transaction_base64: &str) -> Result<String, String>;
+}
+
+#[derive(Debug)]
+pub struct ExecutionVerificationContext<'a> {
+    pub quote: &'a QuoteResponse,
+    pub challenge: &'a ExecutionChallengeResponse,
+    pub prepared: &'a ExecutionPrepareResponse,
+    pub owner_wallet: &'a str,
+    pub session_public_key: &'a str,
+}
+
+#[async_trait]
+pub trait ExecutionVerifier: Send + Sync {
+    /// Reject unless the prepared transaction is acceptable for this exact
+    /// Vault session and public economic intent.
+    async fn verify(&self, context: &ExecutionVerificationContext<'_>) -> Result<(), String>;
+}
 
 #[derive(Debug, Error)]
 pub enum SdkError {
@@ -37,6 +71,10 @@ pub enum SdkError {
     },
     #[error("invalid public contract response: {0}")]
     InvalidResponse(String),
+    #[error("session signer rejected the operation: {0}")]
+    Signer(String),
+    #[error("prepared transaction was rejected: {0}")]
+    Verification(String),
     #[error(transparent)]
     Transport(#[from] reqwest::Error),
 }
@@ -134,6 +172,129 @@ impl StrataClient {
         let quote: QuoteResponse = self.post(quote_path, &wire).await?;
         validate_quote(&quote, market_pda, &request, amount_in)?;
         Ok(quote)
+    }
+
+    /// Execute one short-lived Sonar quote without giving the SDK custody of a
+    /// session private key. The transaction verifier always runs before the
+    /// session adapter is allowed to sign.
+    pub async fn execute_quote<S, V>(
+        &self,
+        quote: &QuoteResponse,
+        owner_wallet: &str,
+        account_sequence: u64,
+        signer: &S,
+        verifier: &V,
+        idempotency_key: Option<&str>,
+    ) -> Result<ExecutionSubmitResponse, SdkError>
+    where
+        S: SessionSigner + ?Sized,
+        V: ExecutionVerifier + ?Sized,
+    {
+        validate_version(quote.schema_version, &quote.contract_version)?;
+        let now_ms = unix_ms()?;
+        if quote.expires_at_ms <= now_ms {
+            return Err(SdkError::InvalidRequest("quote has expired".to_owned()));
+        }
+        let owner_wallet = canonical_public_key(owner_wallet, "owner_wallet")?;
+        let session_public_key = canonical_public_key(signer.public_key(), "session_public_key")?;
+        let markets = self.markets().await?;
+        let market = markets
+            .markets
+            .iter()
+            .find(|market| market.market_pda.as_deref() == Some(quote.market_id.as_str()))
+            .ok_or_else(|| SdkError::MarketNotFound(quote.market_id.clone()))?;
+        let quote_path = market
+            .quote_path
+            .as_deref()
+            .filter(|path| valid_public_operation_path(path))
+            .ok_or_else(|| SdkError::OperationUnavailable(market.label.clone()))?;
+        let execution_path = format!(
+            "{}/execution",
+            quote_path
+                .strip_suffix("/quote")
+                .ok_or_else(|| SdkError::OperationUnavailable(market.label.clone()))?
+        );
+        let challenge: ExecutionChallengeResponse = self
+            .post(
+                &format!("{execution_path}/challenge"),
+                &ExecutionChallengeRequest {
+                    quote_id: quote.quote_id.clone(),
+                    owner_wallet: owner_wallet.clone(),
+                    session_public_key: session_public_key.clone(),
+                    account_sequence: account_sequence.to_string(),
+                },
+            )
+            .await?;
+        validate_execution_challenge(&challenge, quote)?;
+        let authorization = validate_execution_authorization(
+            &challenge,
+            quote,
+            &owner_wallet,
+            &session_public_key,
+            account_sequence,
+        )?;
+        let signature = signer
+            .sign_message(&authorization.bytes)
+            .await
+            .map_err(SdkError::Signer)?;
+        if signature.len() != 64 {
+            return Err(SdkError::InvalidResponse(
+                "session authorization signature must contain 64 bytes".to_owned(),
+            ));
+        }
+        let prepared: ExecutionPrepareResponse = self
+            .post(
+                &format!("{execution_path}/prepare"),
+                &ExecutionPrepareRequest {
+                    challenge_id: challenge.challenge_id.clone(),
+                    authorization_signature: bs58::encode(signature).into_string(),
+                },
+            )
+            .await?;
+        validate_execution_prepare(&prepared, quote, &challenge, &authorization)?;
+        verifier
+            .verify(&ExecutionVerificationContext {
+                quote,
+                challenge: &challenge,
+                prepared: &prepared,
+                owner_wallet: &owner_wallet,
+                session_public_key: &session_public_key,
+            })
+            .await
+            .map_err(SdkError::Verification)?;
+        let signed_transaction = signer
+            .sign_transaction(&prepared.transaction_base64)
+            .await
+            .map_err(SdkError::Signer)?;
+        base64::engine::general_purpose::STANDARD
+            .decode(signed_transaction.trim())
+            .map_err(|_| {
+                SdkError::InvalidResponse(
+                    "session signer returned an invalid base64 transaction".to_owned(),
+                )
+            })?;
+        let idempotency_key =
+            normalize_idempotency_key(idempotency_key.unwrap_or(&prepared.execution_id))?;
+        let submitted: ExecutionSubmitResponse = self
+            .post(
+                &format!("{execution_path}/submit"),
+                &ExecutionSubmitRequest {
+                    execution_id: prepared.execution_id.clone(),
+                    signed_transaction_base64: signed_transaction,
+                    idempotency_key,
+                },
+            )
+            .await?;
+        validate_version(submitted.schema_version, &submitted.contract_version)?;
+        if submitted.execution_id != prepared.execution_id
+            || submitted.status != ExecutionStatus::Submitted
+            || submitted.signature.trim().is_empty()
+        {
+            return Err(SdkError::InvalidResponse(
+                "execution receipt does not match the prepared transaction".to_owned(),
+            ));
+        }
+        Ok(submitted)
     }
 
     async fn get<T: DeserializeOwned>(
@@ -306,6 +467,270 @@ fn validate_quote(
         .filter(|value| value.is_finite() && *value >= 0.0)
         .ok_or_else(|| SdkError::InvalidResponse("price_impact_pct is invalid".to_owned()))?;
     Ok(())
+}
+
+struct ExecutionAuthorization {
+    bytes: Vec<u8>,
+    recent_blockhash: String,
+    last_valid_block_height: u64,
+}
+
+fn validate_execution_challenge(
+    challenge: &ExecutionChallengeResponse,
+    quote: &QuoteResponse,
+) -> Result<(), SdkError> {
+    validate_version(challenge.schema_version, &challenge.contract_version)?;
+    validate_execution_binding(
+        &challenge.quote_id,
+        &challenge.market_id,
+        challenge.side,
+        &challenge.amount_in_atoms,
+        &challenge.minimum_output_atoms,
+        quote,
+    )?;
+    if !valid_handle(&challenge.challenge_id, "sc_")
+        || challenge.expires_at_ms <= challenge.server_time_ms
+        || challenge.expires_at_ms > quote.expires_at_ms
+    {
+        return Err(SdkError::InvalidResponse(
+            "execution challenge binding or lifetime is invalid".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_execution_prepare(
+    prepared: &ExecutionPrepareResponse,
+    quote: &QuoteResponse,
+    challenge: &ExecutionChallengeResponse,
+    authorization: &ExecutionAuthorization,
+) -> Result<(), SdkError> {
+    validate_version(prepared.schema_version, &prepared.contract_version)?;
+    validate_execution_binding(
+        &prepared.quote_id,
+        &prepared.market_id,
+        prepared.side,
+        &prepared.amount_in_atoms,
+        &prepared.minimum_output_atoms,
+        quote,
+    )?;
+    if !valid_handle(&prepared.execution_id, "se_")
+        || prepared.recent_blockhash != authorization.recent_blockhash
+        || prepared.last_valid_block_height != authorization.last_valid_block_height
+        || prepared.expires_at_ms > challenge.expires_at_ms
+        || prepared.transaction_base64.trim().is_empty()
+        || base64::engine::general_purpose::STANDARD
+            .decode(prepared.transaction_base64.trim())
+            .is_err()
+    {
+        return Err(SdkError::InvalidResponse(
+            "prepared execution changed the signed authorization".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_execution_binding(
+    quote_id: &str,
+    market_id: &str,
+    side: QuoteSide,
+    amount_in_atoms: &str,
+    minimum_output_atoms: &str,
+    quote: &QuoteResponse,
+) -> Result<(), SdkError> {
+    if quote_id != quote.quote_id
+        || market_id != quote.market_id
+        || side != quote.side
+        || amount_in_atoms != quote.amount_in_atoms
+        || minimum_output_atoms != quote.minimum_output_atoms
+    {
+        return Err(SdkError::InvalidResponse(
+            "execution does not match the Sonar quote".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_execution_authorization(
+    challenge: &ExecutionChallengeResponse,
+    quote: &QuoteResponse,
+    owner_wallet: &str,
+    session_public_key: &str,
+    account_sequence: u64,
+) -> Result<ExecutionAuthorization, SdkError> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(challenge.authorization_payload_base64.trim())
+        .map_err(|_| SdkError::InvalidResponse("authorization payload is not base64".to_owned()))?;
+    let market = decode_public_key(&quote.market_id, "market_id")?;
+    let owner = decode_public_key(owner_wallet, "owner_wallet")?;
+    let session = decode_public_key(session_public_key, "session_public_key")?;
+    let mut cursor = 0usize;
+    take_expected(
+        &bytes,
+        &mut cursor,
+        PUBLIC_EXECUTION_AUTH_DOMAIN,
+        "authorization domain",
+    )?;
+    take_expected(&bytes, &mut cursor, &market, "authorization market")?;
+    take_expected(
+        &bytes,
+        &mut cursor,
+        quote.quote_id.as_bytes(),
+        "authorization quote",
+    )?;
+    take_expected(&bytes, &mut cursor, &owner, "authorization owner")?;
+    take_expected(&bytes, &mut cursor, &session, "authorization session")?;
+    let side = take_bytes(&bytes, &mut cursor, 1, "authorization side")?[0];
+    if side != if quote.side == QuoteSide::Buy { 0 } else { 1 } {
+        return Err(SdkError::InvalidResponse(
+            "authorization side changed".to_owned(),
+        ));
+    }
+    take_u64_eq(
+        &bytes,
+        &mut cursor,
+        parse_atoms("amount_in_atoms", &quote.amount_in_atoms)?,
+        "authorization input",
+    )?;
+    take_u64_eq(
+        &bytes,
+        &mut cursor,
+        parse_atoms("minimum_output_atoms", &quote.minimum_output_atoms)?,
+        "authorization minimum output",
+    )?;
+    take_u64_eq(
+        &bytes,
+        &mut cursor,
+        account_sequence,
+        "authorization account sequence",
+    )?;
+    let _output_balance = take_u64(&bytes, &mut cursor, "authorization output balance")?;
+    let recent_blockhash = bs58::encode(take_bytes(
+        &bytes,
+        &mut cursor,
+        32,
+        "authorization blockhash",
+    )?)
+    .into_string();
+    let last_valid_block_height =
+        take_u64(&bytes, &mut cursor, "authorization last valid block height")?;
+    take_u64_eq(
+        &bytes,
+        &mut cursor,
+        challenge.expires_at_ms,
+        "authorization expiry",
+    )?;
+    let nonce = take_bytes(&bytes, &mut cursor, 16, "authorization nonce")?;
+    if hex::encode(nonce) != challenge.challenge_id[3..] {
+        return Err(SdkError::InvalidResponse(
+            "authorization challenge nonce changed".to_owned(),
+        ));
+    }
+    let _epoch = take_bytes(&bytes, &mut cursor, 16, "authorization epoch")?;
+    if cursor != bytes.len() {
+        return Err(SdkError::InvalidResponse(
+            "authorization contains unrecognized fields".to_owned(),
+        ));
+    }
+    Ok(ExecutionAuthorization {
+        bytes,
+        recent_blockhash,
+        last_valid_block_height,
+    })
+}
+
+fn take_expected(
+    source: &[u8],
+    cursor: &mut usize,
+    expected: &[u8],
+    field: &str,
+) -> Result<(), SdkError> {
+    if take_bytes(source, cursor, expected.len(), field)? != expected {
+        return Err(SdkError::InvalidResponse(format!("{field} changed")));
+    }
+    Ok(())
+}
+
+fn take_bytes<'a>(
+    source: &'a [u8],
+    cursor: &mut usize,
+    length: usize,
+    field: &str,
+) -> Result<&'a [u8], SdkError> {
+    let end = cursor
+        .checked_add(length)
+        .filter(|end| *end <= source.len())
+        .ok_or_else(|| SdkError::InvalidResponse(format!("{field} is missing")))?;
+    let value = &source[*cursor..end];
+    *cursor = end;
+    Ok(value)
+}
+
+fn take_u64(source: &[u8], cursor: &mut usize, field: &str) -> Result<u64, SdkError> {
+    let bytes: [u8; 8] = take_bytes(source, cursor, 8, field)?
+        .try_into()
+        .map_err(|_| SdkError::InvalidResponse(format!("{field} is invalid")))?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
+fn take_u64_eq(
+    source: &[u8],
+    cursor: &mut usize,
+    expected: u64,
+    field: &str,
+) -> Result<(), SdkError> {
+    if take_u64(source, cursor, field)? != expected {
+        return Err(SdkError::InvalidResponse(format!("{field} changed")));
+    }
+    Ok(())
+}
+
+fn decode_public_key(value: &str, field: &str) -> Result<Vec<u8>, SdkError> {
+    let bytes = bs58::decode(value.trim())
+        .into_vec()
+        .map_err(|_| SdkError::InvalidRequest(format!("{field} must be base58")))?;
+    if bytes.len() != 32 || bs58::encode(&bytes).into_string() != value.trim() {
+        return Err(SdkError::InvalidRequest(format!(
+            "{field} must be a canonical 32-byte public key"
+        )));
+    }
+    Ok(bytes)
+}
+
+fn canonical_public_key(value: &str, field: &str) -> Result<String, SdkError> {
+    decode_public_key(value, field)?;
+    Ok(value.trim().to_owned())
+}
+
+fn valid_handle(value: &str, prefix: &str) -> bool {
+    value.len() == prefix.len() + 32
+        && value.starts_with(prefix)
+        && value[prefix.len()..]
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn normalize_idempotency_key(value: &str) -> Result<String, SdkError> {
+    let value = value.trim();
+    if value.is_empty()
+        || value.len() > 64
+        || !value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_' || byte == b'.'
+        })
+    {
+        return Err(SdkError::InvalidRequest(
+            "idempotency key must contain 1-64 URL-safe characters".to_owned(),
+        ));
+    }
+    Ok(value.to_owned())
+}
+
+fn unix_ms() -> Result<u64, SdkError> {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| SdkError::InvalidRequest("system clock is before Unix epoch".to_owned()))?;
+    u64::try_from(elapsed.as_millis())
+        .map_err(|_| SdkError::InvalidRequest("system clock exceeds supported range".to_owned()))
 }
 
 #[cfg(test)]
