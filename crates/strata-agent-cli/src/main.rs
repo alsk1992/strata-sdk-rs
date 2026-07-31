@@ -7,7 +7,9 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use std::error::Error;
 use std::time::Duration;
-use strata_sdk::{QuoteRequest, QuoteSide, StrataClient, DEFAULT_API_BASE};
+use strata_sdk::{
+    QuoteRequest, QuoteSide, StrataClient, DEFAULT_API_BASE, DEFAULT_SLIPPAGE_BPS,
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -46,7 +48,8 @@ enum Command {
         /// Input amount in the input token's smallest atomic unit.
         #[arg(long)]
         amount_atoms: String,
-        #[arg(long, default_value_t = 50)]
+        /// Optional maximum execution tolerance. The default requires exact output.
+        #[arg(long, default_value_t = DEFAULT_SLIPPAGE_BPS)]
         slippage_bps: u16,
     },
 }
@@ -148,6 +151,31 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quote_defaults_to_exact_output() {
+        let cli = Cli::try_parse_from([
+            "strata-agent",
+            "quote",
+            "--market",
+            "SOL/USDC",
+            "--side",
+            "sell",
+            "--amount-atoms",
+            "10000000",
+        ])
+        .expect("valid quote command");
+
+        let Command::Quote { slippage_bps, .. } = cli.command else {
+            panic!("expected quote command");
+        };
+        assert_eq!(slippage_bps, DEFAULT_SLIPPAGE_BPS);
+    }
 }
 
 fn side_label(side: QuoteSide) -> &'static str {

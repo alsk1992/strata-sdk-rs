@@ -13,7 +13,7 @@ strata-sdk = "0.1"
 ## Request a Sonar quote
 
 ```rust
-use strata_public_contract::{QuoteRequest, QuoteSide};
+use strata_public_contract::{QuoteRequest, QuoteSide, DEFAULT_SLIPPAGE_BPS};
 use strata_sdk::StrataClient;
 
 # async fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -24,7 +24,7 @@ let quote = strata
         market_id: "SOL/USDC".into(),
         side: QuoteSide::Sell,
         amount_in_atoms: "10000000".into(),
-        slippage_bps: 50,
+        slippage_bps: DEFAULT_SLIPPAGE_BPS,
     })
     .await?;
 
@@ -50,6 +50,10 @@ and expiry in one typed result.
 Token amounts use unsigned decimal strings in atomic units. The client validates
 contract compatibility, quote binding, lifetime, and economic fields before
 returning data to the caller.
+
+`DEFAULT_SLIPPAGE_BPS` is `0` for exact read-only quotes. Set a non-zero
+execution tolerance explicitly only when your application is willing to accept
+less than the quoted output; `minimum_output_atoms` is the resulting floor.
 
 ## Terminal companion
 

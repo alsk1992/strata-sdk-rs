@@ -20,12 +20,16 @@ strata-public-contract = "0.1"
 | --- | --- |
 | `CapabilityCatalog` | Features currently available from Strata |
 | `MarketsResponse` | Markets, token decimals, and Sonar quote readiness |
-| `QuoteRequest` | Market, side, exact input amount, and slippage |
+| `QuoteRequest` | Market, side, exact input amount, and execution tolerance |
 | `QuoteResponse` | Output, fees, minimum output, price impact, and expiry |
 | `ErrorResponse` | Stable public error details |
 
 Token amounts are unsigned decimal strings in atomic units so values stay exact
 across Rust, JSON, JavaScript, and terminal boundaries.
+
+`DEFAULT_SLIPPAGE_BPS` is `0` for exact read-only quotes. Price impact remains
+a separate response field because current depth and future execution tolerance
+answer different questions.
 
 ## Versioned fixtures
 

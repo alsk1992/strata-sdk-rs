@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 
 pub const CONTRACT_MAJOR: u16 = 1;
 pub const CONTRACT_VERSION: &str = "1.0";
+/// Exact-output default for the current read-only quote surface.
+pub const DEFAULT_SLIPPAGE_BPS: u16 = 0;
 
 /// Canonical v1 examples used to prove cross-language contract parity.
 ///
@@ -37,6 +39,8 @@ pub struct QuoteRequest {
     /// Atomic input amount encoded as a base-10 string. Public money values
     /// never cross JSON as floating-point numbers.
     pub amount_in_atoms: String,
+    /// Maximum execution tolerance. Use [`DEFAULT_SLIPPAGE_BPS`] for an exact
+    /// read-only quote.
     pub slippage_bps: u16,
 }
 
