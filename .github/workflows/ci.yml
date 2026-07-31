@@ -25,6 +25,18 @@ jobs:
       - run: cargo test --locked --workspace --all-features
       - run: cargo package --locked -p strata-public-contract
       - name: Package SDK when its contract version is indexed
-        run: if cargo search strata-public-contract --limit 1 | grep -q '^strata-public-contract = "0.1.0"'; then cargo package --locked -p strata-sdk; else echo "contract bootstrap pending; workspace tests passed"; fi
+        run: |
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("crates/strata-public-contract/Cargo.toml","rb"))["package"]["version"])')"
+          if cargo info "strata-public-contract@${version}" --registry crates-io >/dev/null 2>&1; then
+            cargo package --locked -p strata-sdk
+          else
+            echo "contract bootstrap pending; workspace tests passed"
+          fi
       - name: Package terminal client when its SDK version is indexed
-        run: if cargo search strata-sdk --limit 1 | grep -q '^strata-sdk = "0.1.0"'; then cargo package --locked -p strata-agent-cli; else echo "SDK bootstrap pending; workspace tests passed"; fi
+        run: |
+          version="$(python3 -c 'import tomllib; print(tomllib.load(open("crates/strata-sdk/Cargo.toml","rb"))["package"]["version"])')"
+          if cargo info "strata-sdk@${version}" --registry crates-io >/dev/null 2>&1; then
+            cargo package --locked -p strata-agent-cli
+          else
+            echo "SDK bootstrap pending; workspace tests passed"
+          fi
