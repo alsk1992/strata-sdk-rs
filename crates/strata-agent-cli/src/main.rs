@@ -1,19 +1,22 @@
-//! Read-only public CLI for humans and terminal agents.
+//! Capability-gated public CLI for humans and terminal agents.
 //!
-//! This binary deliberately has no wallet, keypair, RPC, admin, preparation,
-//! or submission flags. Future write commands belong behind explicit public
-//! capabilities and separate confirmation policy.
+//! External agent owners control permission and signing. This binary accepts
+//! public keys, detached signatures, and signed transactions, never private
+//! keys, seed phrases, RPC credentials, or admin material.
 
 use clap::{Parser, Subcommand, ValueEnum};
 use std::error::Error;
 use std::time::Duration;
-use strata_sdk::{QuoteRequest, QuoteSide, StrataClient, DEFAULT_API_BASE, DEFAULT_SLIPPAGE_BPS};
+use strata_sdk::{
+    ExecutionChallengeRequest, ExecutionPrepareRequest, ExecutionSubmitRequest, QuoteRequest,
+    QuoteSide, StrataClient, DEFAULT_API_BASE, DEFAULT_SLIPPAGE_BPS,
+};
 
 #[derive(Debug, Parser)]
 #[command(
     name = "strata-agent",
     version,
-    about = "Explore Strata and request validated Sonar quotes"
+    about = "Discover and traverse Strata's capability-gated action graph"
 )]
 struct Cli {
     #[arg(long, env = "STRATA_API_BASE", default_value = DEFAULT_API_BASE)]
@@ -31,6 +34,8 @@ struct Cli {
 enum Command {
     /// Show the versioned public capability catalog.
     Capabilities,
+    /// Show the executable action topology and live node availability.
+    ActionGraph,
     /// List available public markets.
     Markets {
         /// Include markets that are currently not quote-ready.
@@ -49,6 +54,39 @@ enum Command {
         /// Optional maximum execution tolerance. The default requires exact output.
         #[arg(long, default_value_t = DEFAULT_SLIPPAGE_BPS)]
         slippage_bps: u16,
+    },
+    /// Request quote-bound authorization bytes for an external signer.
+    ExecutionChallenge {
+        #[arg(long)]
+        market: String,
+        #[arg(long)]
+        quote_id: String,
+        #[arg(long)]
+        owner_wallet: String,
+        #[arg(long)]
+        session_public_key: String,
+        #[arg(long)]
+        account_sequence: String,
+    },
+    /// Exchange an external authorization signature for a prepared transaction.
+    ExecutionPrepare {
+        #[arg(long)]
+        market: String,
+        #[arg(long)]
+        challenge_id: String,
+        #[arg(long)]
+        authorization_signature: String,
+    },
+    /// Submit an externally signed prepared transaction idempotently.
+    ExecutionSubmit {
+        #[arg(long)]
+        market: String,
+        #[arg(long)]
+        execution_id: String,
+        #[arg(long)]
+        signed_transaction_base64: String,
+        #[arg(long)]
+        idempotency_key: String,
     },
 }
 
@@ -90,6 +128,24 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         } else {
                             "disabled"
                         }
+                    );
+                }
+            }
+        }
+        Command::ActionGraph => {
+            let graph = client.action_graph().await?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&graph)?);
+            } else {
+                println!("Strata action graph {}", graph.graph_version);
+                println!("  permission: {}", graph.authority.permission_source);
+                println!("  signing:    {}", graph.authority.signing_location);
+                for node in graph.nodes {
+                    println!(
+                        "{} {}: {}",
+                        if node.available { "ready" } else { "off  " },
+                        node.id,
+                        node.summary
                     );
                 }
             }
@@ -145,6 +201,78 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     quote.expires_at_ms.saturating_sub(quote.server_time_ms)
                 );
                 println!("  provider:        {}", quote.provider);
+            }
+        }
+        Command::ExecutionChallenge {
+            market,
+            quote_id,
+            owner_wallet,
+            session_public_key,
+            account_sequence,
+        } => {
+            let challenge = client
+                .execution_challenge(
+                    &market,
+                    ExecutionChallengeRequest {
+                        quote_id,
+                        owner_wallet,
+                        session_public_key,
+                        account_sequence,
+                    },
+                )
+                .await?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&challenge)?);
+            } else {
+                println!("challenge:     {}", challenge.challenge_id);
+                println!("authorization: {}", challenge.authorization_payload_base64);
+                println!("expires:       {}", challenge.expires_at_ms);
+            }
+        }
+        Command::ExecutionPrepare {
+            market,
+            challenge_id,
+            authorization_signature,
+        } => {
+            let prepared = client
+                .execution_prepare(
+                    &market,
+                    ExecutionPrepareRequest {
+                        challenge_id,
+                        authorization_signature,
+                    },
+                )
+                .await?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&prepared)?);
+            } else {
+                println!("execution:   {}", prepared.execution_id);
+                println!("transaction: {}", prepared.transaction_base64);
+                println!("expires:     {}", prepared.expires_at_ms);
+            }
+        }
+        Command::ExecutionSubmit {
+            market,
+            execution_id,
+            signed_transaction_base64,
+            idempotency_key,
+        } => {
+            let receipt = client
+                .execution_submit(
+                    &market,
+                    ExecutionSubmitRequest {
+                        execution_id,
+                        signed_transaction_base64,
+                        idempotency_key,
+                    },
+                )
+                .await?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&receipt)?);
+            } else {
+                println!("execution: {}", receipt.execution_id);
+                println!("signature: {}", receipt.signature);
+                println!("status:    submitted");
             }
         }
     }
