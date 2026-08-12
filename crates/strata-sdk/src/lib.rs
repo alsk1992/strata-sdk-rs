@@ -13,6 +13,7 @@ use strata_public_contract::{ErrorResponse, CONTRACT_MAJOR, CONTRACT_VERSION};
 use thiserror::Error;
 
 pub use strata_public_contract::{
+    ActionAuthorityModel, ActionEdge, ActionGraph, ActionNode, ActionNodeKind, ActionOperation,
     CapabilityCatalog, CapabilityDescriptor, CapabilityRisk, CapabilityStability,
     ExecutionChallengeRequest, ExecutionChallengeResponse, ExecutionPrepareRequest,
     ExecutionPrepareResponse, ExecutionStatus, ExecutionSubmitRequest, ExecutionSubmitResponse,
@@ -122,6 +123,14 @@ impl StrataClient {
         Ok(catalog)
     }
 
+    /// Return the live operation topology, including capability-gated nodes and
+    /// the points where the agent owner's signer acts outside Strata.
+    pub async fn action_graph(&self) -> Result<ActionGraph, SdkError> {
+        let graph: ActionGraph = self.get("sonar/action-graph", &[]).await?;
+        validate_action_graph(&graph)?;
+        Ok(graph)
+    }
+
     pub async fn markets(&self) -> Result<MarketsResponse, SdkError> {
         let markets: MarketsResponse = self.get("sonar/markets", &[]).await?;
         validate_version(markets.schema_version, &markets.contract_version)?;
@@ -172,6 +181,128 @@ impl StrataClient {
         let quote: QuoteResponse = self.post(quote_path, &wire).await?;
         validate_quote(&quote, market_pda, &request, amount_in)?;
         Ok(quote)
+    }
+
+    /// Request canonical authorization bytes for an external signer. This
+    /// operation accepts public identity only; signing material stays external.
+    pub async fn execution_challenge(
+        &self,
+        market: &str,
+        request: ExecutionChallengeRequest,
+    ) -> Result<ExecutionChallengeResponse, SdkError> {
+        if !valid_handle(&request.quote_id, "sq_") {
+            return Err(SdkError::InvalidRequest("quote_id is invalid".to_owned()));
+        }
+        let request = ExecutionChallengeRequest {
+            quote_id: request.quote_id,
+            owner_wallet: canonical_public_key(&request.owner_wallet, "owner_wallet")?,
+            session_public_key: canonical_public_key(
+                &request.session_public_key,
+                "session_public_key",
+            )?,
+            account_sequence: parse_atoms("account_sequence", &request.account_sequence)?
+                .to_string(),
+        };
+        let execution_path = self.execution_path(market).await?;
+        let challenge: ExecutionChallengeResponse = self
+            .post(&format!("{execution_path}/challenge"), &request)
+            .await?;
+        validate_version(challenge.schema_version, &challenge.contract_version)?;
+        if !valid_handle(&challenge.challenge_id, "sc_") || challenge.quote_id != request.quote_id {
+            return Err(SdkError::InvalidResponse(
+                "execution challenge does not match the requested quote".to_owned(),
+            ));
+        }
+        Ok(challenge)
+    }
+
+    /// Exchange an external authorization signature for a quote-bound,
+    /// partially signed transaction.
+    pub async fn execution_prepare(
+        &self,
+        market: &str,
+        request: ExecutionPrepareRequest,
+    ) -> Result<ExecutionPrepareResponse, SdkError> {
+        if !valid_handle(&request.challenge_id, "sc_") {
+            return Err(SdkError::InvalidRequest(
+                "challenge_id is invalid".to_owned(),
+            ));
+        }
+        let signature = bs58::decode(request.authorization_signature.trim())
+            .into_vec()
+            .map_err(|_| {
+                SdkError::InvalidRequest("authorization_signature must be base58".to_owned())
+            })?;
+        if signature.len() != 64
+            || bs58::encode(&signature).into_string() != request.authorization_signature.trim()
+        {
+            return Err(SdkError::InvalidRequest(
+                "authorization_signature must be a canonical Ed25519 signature".to_owned(),
+            ));
+        }
+        let request = ExecutionPrepareRequest {
+            challenge_id: request.challenge_id,
+            authorization_signature: bs58::encode(signature).into_string(),
+        };
+        let execution_path = self.execution_path(market).await?;
+        let prepared: ExecutionPrepareResponse = self
+            .post(&format!("{execution_path}/prepare"), &request)
+            .await?;
+        validate_version(prepared.schema_version, &prepared.contract_version)?;
+        if !valid_handle(&prepared.execution_id, "se_") {
+            return Err(SdkError::InvalidResponse(
+                "prepared execution ID is invalid".to_owned(),
+            ));
+        }
+        Ok(prepared)
+    }
+
+    /// Submit an externally signed transaction. Reusing the same idempotency
+    /// key cannot create a second execution.
+    pub async fn execution_submit(
+        &self,
+        market: &str,
+        request: ExecutionSubmitRequest,
+    ) -> Result<ExecutionSubmitResponse, SdkError> {
+        if !valid_handle(&request.execution_id, "se_") {
+            return Err(SdkError::InvalidRequest(
+                "execution_id is invalid".to_owned(),
+            ));
+        }
+        let transaction = request.signed_transaction_base64.trim();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(transaction)
+            .map_err(|_| {
+                SdkError::InvalidRequest(
+                    "signed_transaction_base64 must be canonical base64".to_owned(),
+                )
+            })?;
+        if decoded.is_empty()
+            || base64::engine::general_purpose::STANDARD.encode(&decoded) != transaction
+        {
+            return Err(SdkError::InvalidRequest(
+                "signed_transaction_base64 must be canonical base64".to_owned(),
+            ));
+        }
+        let request = ExecutionSubmitRequest {
+            execution_id: request.execution_id,
+            signed_transaction_base64: transaction.to_owned(),
+            idempotency_key: normalize_idempotency_key(&request.idempotency_key)?,
+        };
+        let execution_path = self.execution_path(market).await?;
+        let submitted: ExecutionSubmitResponse = self
+            .post(&format!("{execution_path}/submit"), &request)
+            .await?;
+        validate_version(submitted.schema_version, &submitted.contract_version)?;
+        if submitted.execution_id != request.execution_id
+            || submitted.status != ExecutionStatus::Submitted
+            || submitted.signature.trim().is_empty()
+        {
+            return Err(SdkError::InvalidResponse(
+                "execution receipt does not match the submitted transaction".to_owned(),
+            ));
+        }
+        Ok(submitted)
     }
 
     /// Execute one short-lived Sonar quote without giving the SDK custody of a
@@ -369,6 +500,32 @@ impl StrataClient {
         }
         serde_json::from_slice(&bytes).map_err(|error| SdkError::InvalidResponse(error.to_string()))
     }
+
+    async fn execution_path(&self, requested_market: &str) -> Result<String, SdkError> {
+        let markets = self.markets().await?;
+        let market = markets
+            .markets
+            .iter()
+            .find(|market| {
+                market.label.eq_ignore_ascii_case(requested_market.trim())
+                    || market.market_pda.as_deref() == Some(requested_market.trim())
+            })
+            .ok_or_else(|| SdkError::MarketNotFound(requested_market.to_owned()))?;
+        if !market.ready {
+            return Err(SdkError::OperationUnavailable(market.label.clone()));
+        }
+        let quote_path = market
+            .quote_path
+            .as_deref()
+            .filter(|path| valid_public_operation_path(path))
+            .ok_or_else(|| SdkError::OperationUnavailable(market.label.clone()))?;
+        Ok(format!(
+            "{}/execution",
+            quote_path
+                .strip_suffix("/quote")
+                .ok_or_else(|| SdkError::OperationUnavailable(market.label.clone()))?
+        ))
+    }
 }
 
 fn normalize_base_url(value: &str) -> Result<Url, SdkError> {
@@ -384,6 +541,39 @@ fn normalize_base_url(value: &str) -> Result<Url, SdkError> {
         ));
     }
     Ok(url)
+}
+
+fn validate_action_graph(graph: &ActionGraph) -> Result<(), SdkError> {
+    validate_version(graph.schema_version, &graph.contract_version)?;
+    if graph.graph_version != "1.0"
+        || graph.authority.permission_source != "external_agent_owner"
+        || graph.authority.signing_location != "external"
+        || graph.authority.accepts_private_keys
+    {
+        return Err(SdkError::InvalidResponse(
+            "unsupported action graph authority model".to_owned(),
+        ));
+    }
+    let ids = graph
+        .nodes
+        .iter()
+        .map(|node| node.id.as_str())
+        .collect::<HashSet<_>>();
+    if ids.len() != graph.nodes.len() || !ids.contains(graph.entry_node.as_str()) {
+        return Err(SdkError::InvalidResponse(
+            "action graph node IDs are invalid".to_owned(),
+        ));
+    }
+    if graph.edges.iter().any(|edge| {
+        !ids.contains(edge.from.as_str())
+            || !ids.contains(edge.to.as_str())
+            || edge.condition.trim().is_empty()
+    }) {
+        return Err(SdkError::InvalidResponse(
+            "action graph contains an invalid edge".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_version(schema_version: u16, contract_version: &str) -> Result<(), SdkError> {
@@ -741,6 +931,7 @@ mod tests {
 
     fn fixture(path: &str) -> serde_json::Value {
         let raw = match path {
+            "action-graph" => strata_public_contract::contract_fixtures::ACTION_GRAPH,
             "markets" => strata_public_contract::contract_fixtures::MARKETS,
             "quote" => strata_public_contract::contract_fixtures::QUOTE,
             "capabilities" => strata_public_contract::contract_fixtures::CAPABILITIES,
@@ -763,6 +954,12 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
+        Mock::given(method("GET"))
+            .and(path("/sonar/action-graph"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fixture("action-graph")))
+            .expect(1)
+            .mount(&server)
+            .await;
         Mock::given(method("POST"))
             .and(path("/sonar/markets/sol-usdc/quote"))
             .and(body_json(serde_json::json!({
@@ -782,6 +979,10 @@ mod tests {
             .capabilities
             .iter()
             .any(|capability| capability.id == "quotes.read"));
+
+        let graph = client.action_graph().await.unwrap();
+        assert_eq!(graph.entry_node, "discover_capabilities");
+        assert_eq!(graph.authority.permission_source, "external_agent_owner");
 
         let quote = client
             .quote(QuoteRequest {
