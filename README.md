@@ -53,6 +53,7 @@ minimum output, price impact, and expiry in one typed result.
 | `order_challenge(...)` | Canonical authorization bytes for a resting-order action |
 | `order_prepare(...)` | Partially signed place or cancel transaction |
 | `order_submit(...)` | Idempotent submission of an externally signed order action |
+| `order_status(...)` | Durable recovery of an ambiguous order submission |
 | `execute_order(...)` | Verified place or cancel flow when enabled |
 
 Token amounts use unsigned decimal strings in atomic units. The client validates
