@@ -14,10 +14,11 @@ use strata_public_contract::{ErrorResponse, CONTRACT_MAJOR, CONTRACT_VERSION};
 use thiserror::Error;
 
 pub use strata_public_contract::platform::{
-    PlatformOrderAction, PlatformOrderChallengeRequest, PlatformOrderChallengeResponse,
-    PlatformOrderControlStatus, PlatformOrderPrepareRequest, PlatformOrderPrepareResponse,
-    PlatformOrderStatusRequest, PlatformOrderStatusResponse, PlatformOrderSubmissionStatus,
-    PlatformOrderSubmitRequest, PlatformOrderSubmitResponse, PlatformOrderType, PlatformTradeSide,
+    PlatformOrderAction, PlatformOrderBatchOperation, PlatformOrderChallengeRequest,
+    PlatformOrderChallengeResponse, PlatformOrderControlStatus, PlatformOrderPrepareRequest,
+    PlatformOrderPrepareResponse, PlatformOrderStatusRequest, PlatformOrderStatusResponse,
+    PlatformOrderSubmissionStatus, PlatformOrderSubmitRequest, PlatformOrderSubmitResponse,
+    PlatformOrderType, PlatformTradeSide,
 };
 pub use strata_public_contract::{
     ActionAuthorityModel, ActionEdge, ActionGraph, ActionNode, ActionNodeKind, ActionOperation,
@@ -63,6 +64,20 @@ pub enum OrderExecuteOperation {
     CancelAll {
         owner_wallet: String,
     },
+    Replace {
+        owner_wallet: String,
+        order_id: String,
+        account_sequence: String,
+        client_order_id: String,
+        side: PlatformTradeSide,
+        order_type: PlatformOrderType,
+        limit_price_atoms: String,
+        size_atoms: String,
+    },
+    Batch {
+        owner_wallet: String,
+        operations: Vec<PlatformOrderBatchOperation>,
+    },
 }
 
 impl OrderExecuteOperation {
@@ -97,6 +112,34 @@ impl OrderExecuteOperation {
             Self::CancelAll { owner_wallet } => PlatformOrderChallengeRequest::CancelAll {
                 owner_wallet: owner_wallet.clone(),
                 session_public_key,
+            },
+            Self::Replace {
+                owner_wallet,
+                order_id,
+                account_sequence,
+                client_order_id,
+                side,
+                order_type,
+                limit_price_atoms,
+                size_atoms,
+            } => PlatformOrderChallengeRequest::Replace {
+                owner_wallet: owner_wallet.clone(),
+                session_public_key,
+                order_id: order_id.clone(),
+                account_sequence: account_sequence.clone(),
+                client_order_id: client_order_id.clone(),
+                side: *side,
+                order_type: *order_type,
+                limit_price_atoms: limit_price_atoms.clone(),
+                size_atoms: size_atoms.clone(),
+            },
+            Self::Batch {
+                owner_wallet,
+                operations,
+            } => PlatformOrderChallengeRequest::Batch {
+                owner_wallet: owner_wallet.clone(),
+                session_public_key,
+                operations: operations.clone(),
             },
         }
     }
@@ -406,7 +449,7 @@ impl StrataClient {
             || challenge.action != expected_action
             || !valid_handle(&challenge.challenge_id, "oc_")
             || challenge.order_ids.is_empty()
-            || challenge.order_ids.len() > 6
+            || challenge.order_ids.len() > 12
             || challenge.expires_at_ms <= challenge.server_time_ms
             || challenge
                 .order_ids
@@ -452,7 +495,7 @@ impl StrataClient {
         if prepared.market_id != market_id
             || !valid_handle(&prepared.order_control_id, "or_")
             || prepared.order_ids.is_empty()
-            || prepared.order_ids.len() > 6
+            || prepared.order_ids.len() > 12
             || prepared.transaction_base64.trim().is_empty()
             || prepared.expires_at_ms == 0
         {
@@ -529,7 +572,7 @@ impl StrataClient {
         if status.market_id != market_id
             || status.order_control_id != request.order_control_id
             || status.order_ids.is_empty()
-            || status.order_ids.len() > 6
+            || status.order_ids.len() > 12
             || status
                 .order_ids
                 .iter()
@@ -1063,6 +1106,74 @@ fn normalize_order_challenge_request(
             owner_wallet: canonical_public_key(&owner_wallet, "owner_wallet")?,
             session_public_key: canonical_public_key(&session_public_key, "session_public_key")?,
         },
+        PlatformOrderChallengeRequest::Replace {
+            owner_wallet,
+            session_public_key,
+            order_id,
+            account_sequence,
+            client_order_id,
+            side,
+            order_type,
+            limit_price_atoms,
+            size_atoms,
+        } => {
+            let PlatformOrderBatchOperation::Replace {
+                order_id,
+                account_sequence,
+                client_order_id,
+                side,
+                order_type,
+                limit_price_atoms,
+                size_atoms,
+            } = normalize_order_batch_operation(PlatformOrderBatchOperation::Replace {
+                order_id,
+                account_sequence,
+                client_order_id,
+                side,
+                order_type,
+                limit_price_atoms,
+                size_atoms,
+            })?
+            else {
+                unreachable!()
+            };
+            PlatformOrderChallengeRequest::Replace {
+                owner_wallet: canonical_public_key(&owner_wallet, "owner_wallet")?,
+                session_public_key: canonical_public_key(
+                    &session_public_key,
+                    "session_public_key",
+                )?,
+                order_id,
+                account_sequence,
+                client_order_id,
+                side,
+                order_type,
+                limit_price_atoms,
+                size_atoms,
+            }
+        }
+        PlatformOrderChallengeRequest::Batch {
+            owner_wallet,
+            session_public_key,
+            operations,
+        } => {
+            if operations.is_empty() || operations.len() > 6 {
+                return Err(SdkError::InvalidRequest(
+                    "order batch must contain between one and six operations".to_owned(),
+                ));
+            }
+            PlatformOrderChallengeRequest::Batch {
+                owner_wallet: canonical_public_key(&owner_wallet, "owner_wallet")?,
+                session_public_key: canonical_public_key(
+                    &session_public_key,
+                    "session_public_key",
+                )?,
+                operations: operations
+                    .into_iter()
+                    .map(normalize_order_batch_operation)
+                    .collect::<Result<_, _>>()?,
+            }
+        }
     };
     if order_request_owner(&normalized) == order_request_session(&normalized) {
         return Err(SdkError::InvalidRequest(
@@ -1072,11 +1183,107 @@ fn normalize_order_challenge_request(
     Ok(normalized)
 }
 
+fn normalize_order_batch_operation(
+    operation: PlatformOrderBatchOperation,
+) -> Result<PlatformOrderBatchOperation, SdkError> {
+    match operation {
+        PlatformOrderBatchOperation::Place {
+            account_sequence,
+            client_order_id,
+            side,
+            order_type,
+            limit_price_atoms,
+            size_atoms,
+        } => {
+            let client_order_id = normalize_order_client_id(client_order_id, order_type)?;
+            Ok(PlatformOrderBatchOperation::Place {
+                account_sequence: canonical_request_atoms(
+                    &account_sequence,
+                    "account_sequence",
+                    true,
+                )?,
+                client_order_id,
+                side,
+                order_type,
+                limit_price_atoms: canonical_request_atoms(
+                    &limit_price_atoms,
+                    "limit_price_atoms",
+                    false,
+                )?,
+                size_atoms: canonical_request_atoms(&size_atoms, "size_atoms", false)?,
+            })
+        }
+        PlatformOrderBatchOperation::Cancel { order_id } => {
+            if !valid_handle(order_id.trim(), "order_") {
+                return Err(SdkError::InvalidRequest("order_id is invalid".to_owned()));
+            }
+            Ok(PlatformOrderBatchOperation::Cancel {
+                order_id: order_id.trim().to_owned(),
+            })
+        }
+        PlatformOrderBatchOperation::Replace {
+            order_id,
+            account_sequence,
+            client_order_id,
+            side,
+            order_type,
+            limit_price_atoms,
+            size_atoms,
+        } => {
+            if !valid_handle(order_id.trim(), "order_") {
+                return Err(SdkError::InvalidRequest("order_id is invalid".to_owned()));
+            }
+            let client_order_id = normalize_order_client_id(client_order_id, order_type)?;
+            Ok(PlatformOrderBatchOperation::Replace {
+                order_id: order_id.trim().to_owned(),
+                account_sequence: canonical_request_atoms(
+                    &account_sequence,
+                    "account_sequence",
+                    true,
+                )?,
+                client_order_id,
+                side,
+                order_type,
+                limit_price_atoms: canonical_request_atoms(
+                    &limit_price_atoms,
+                    "limit_price_atoms",
+                    false,
+                )?,
+                size_atoms: canonical_request_atoms(&size_atoms, "size_atoms", false)?,
+            })
+        }
+    }
+}
+
+fn normalize_order_client_id(
+    client_order_id: String,
+    order_type: PlatformOrderType,
+) -> Result<String, SdkError> {
+    let client_order_id = client_order_id.trim().to_owned();
+    if client_order_id.is_empty()
+        || client_order_id.len() > 64
+        || !client_order_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        || !matches!(
+            order_type,
+            PlatformOrderType::GoodUntilCancelled | PlatformOrderType::PostOnly
+        )
+    {
+        return Err(SdkError::InvalidRequest(
+            "resting order client ID or type is invalid".to_owned(),
+        ));
+    }
+    Ok(client_order_id)
+}
+
 fn order_request_action(request: &PlatformOrderChallengeRequest) -> PlatformOrderAction {
     match request {
         PlatformOrderChallengeRequest::Place { .. } => PlatformOrderAction::Place,
         PlatformOrderChallengeRequest::Cancel { .. } => PlatformOrderAction::Cancel,
         PlatformOrderChallengeRequest::CancelAll { .. } => PlatformOrderAction::CancelAll,
+        PlatformOrderChallengeRequest::Replace { .. } => PlatformOrderAction::Replace,
+        PlatformOrderChallengeRequest::Batch { .. } => PlatformOrderAction::Batch,
     }
 }
 
@@ -1084,7 +1291,9 @@ fn order_request_owner(request: &PlatformOrderChallengeRequest) -> &str {
     match request {
         PlatformOrderChallengeRequest::Place { owner_wallet, .. }
         | PlatformOrderChallengeRequest::Cancel { owner_wallet, .. }
-        | PlatformOrderChallengeRequest::CancelAll { owner_wallet, .. } => owner_wallet,
+        | PlatformOrderChallengeRequest::CancelAll { owner_wallet, .. }
+        | PlatformOrderChallengeRequest::Replace { owner_wallet, .. }
+        | PlatformOrderChallengeRequest::Batch { owner_wallet, .. } => owner_wallet,
     }
 }
 
@@ -1098,6 +1307,12 @@ fn order_request_session(request: &PlatformOrderChallengeRequest) -> &str {
         }
         | PlatformOrderChallengeRequest::CancelAll {
             session_public_key, ..
+        }
+        | PlatformOrderChallengeRequest::Replace {
+            session_public_key, ..
+        }
+        | PlatformOrderChallengeRequest::Batch {
+            session_public_key, ..
         } => session_public_key,
     }
 }
@@ -1106,6 +1321,87 @@ struct OrderAuthorization {
     bytes: Vec<u8>,
     recent_blockhash: String,
     last_valid_block_height: u64,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_order_place_authorization(
+    bytes: &[u8],
+    cursor: &mut usize,
+    challenge: &PlatformOrderChallengeResponse,
+    account_sequence: &str,
+    client_order_id: &str,
+    side: PlatformTradeSide,
+    order_type: PlatformOrderType,
+    limit_price_atoms: &str,
+    size_atoms: &str,
+) -> Result<String, SdkError> {
+    take_u64_eq(
+        bytes,
+        cursor,
+        parse_request_u64(account_sequence, "account_sequence")?,
+        "order account sequence",
+    )?;
+    let client_length = take_u16(bytes, cursor, "client order ID length")? as usize;
+    if client_length != client_order_id.len() {
+        return Err(SdkError::InvalidResponse(
+            "client order ID length changed".to_owned(),
+        ));
+    }
+    take_expected(bytes, cursor, client_order_id.as_bytes(), "client order ID")?;
+    let actual_side = take_bytes(bytes, cursor, 1, "order side")?[0];
+    let expected_side = if side == PlatformTradeSide::Buy { 0 } else { 1 };
+    if actual_side != expected_side {
+        return Err(SdkError::InvalidResponse("order side changed".to_owned()));
+    }
+    let actual_type = take_bytes(bytes, cursor, 1, "order type")?[0];
+    let expected_type = match order_type {
+        PlatformOrderType::GoodUntilCancelled => 0,
+        PlatformOrderType::PostOnly => 3,
+        PlatformOrderType::ImmediateOrCancel | PlatformOrderType::FillOrKill => {
+            return Err(SdkError::InvalidRequest(
+                "order type is not a resting order".to_owned(),
+            ));
+        }
+    };
+    if actual_type != expected_type {
+        return Err(SdkError::InvalidResponse("order type changed".to_owned()));
+    }
+    take_u64_eq(
+        bytes,
+        cursor,
+        parse_request_u64(limit_price_atoms, "limit_price_atoms")?,
+        "order limit price",
+    )?;
+    take_u64_eq(
+        bytes,
+        cursor,
+        parse_request_u64(size_atoms, "size_atoms")?,
+        "order size",
+    )?;
+    let order = take_bytes(bytes, cursor, 32, "order identity")?;
+    Ok(opaque_order_id(&challenge.market_id, order))
+}
+
+fn validate_order_cancel_authorization(
+    bytes: &[u8],
+    cursor: &mut usize,
+    challenge: &PlatformOrderChallengeResponse,
+    expected_order_id: &str,
+) -> Result<String, SdkError> {
+    let order = take_bytes(bytes, cursor, 32, "cancel order identity")?;
+    let rent_source = take_bytes(bytes, cursor, 1, "cancel rent source")?[0];
+    if rent_source > 1 {
+        return Err(SdkError::InvalidResponse(
+            "cancel rent source is invalid".to_owned(),
+        ));
+    }
+    let order_id = opaque_order_id(&challenge.market_id, order);
+    if order_id != expected_order_id {
+        return Err(SdkError::InvalidResponse(
+            "cancel order identity changed".to_owned(),
+        ));
+    }
+    Ok(order_id)
 }
 
 fn validate_order_authorization(
@@ -1132,6 +1428,8 @@ fn validate_order_authorization(
         PlatformOrderAction::Place => 0,
         PlatformOrderAction::Cancel => 1,
         PlatformOrderAction::CancelAll => 2,
+        PlatformOrderAction::Replace => 3,
+        PlatformOrderAction::Batch => 4,
     };
     if action != expected_action || challenge.action != order_request_action(request) {
         return Err(SdkError::InvalidResponse(
@@ -1235,6 +1533,105 @@ fn validate_order_authorization(
                     return Err(SdkError::InvalidResponse(
                         "cancel order identity changed".to_owned(),
                     ));
+                }
+            }
+        }
+        PlatformOrderChallengeRequest::Replace {
+            order_id,
+            account_sequence,
+            client_order_id,
+            side,
+            order_type,
+            limit_price_atoms,
+            size_atoms,
+            ..
+        } => {
+            derived_order_ids.push(validate_order_cancel_authorization(
+                &bytes,
+                &mut cursor,
+                challenge,
+                order_id,
+            )?);
+            derived_order_ids.push(validate_order_place_authorization(
+                &bytes,
+                &mut cursor,
+                challenge,
+                account_sequence,
+                client_order_id,
+                *side,
+                *order_type,
+                limit_price_atoms,
+                size_atoms,
+            )?);
+        }
+        PlatformOrderChallengeRequest::Batch { operations, .. } => {
+            let count = usize::from(take_bytes(&bytes, &mut cursor, 1, "batch count")?[0]);
+            if count == 0 || count > 6 || count != operations.len() {
+                return Err(SdkError::InvalidResponse(
+                    "order batch count changed".to_owned(),
+                ));
+            }
+            for operation in operations {
+                let tag = take_bytes(&bytes, &mut cursor, 1, "batch action")?[0];
+                match operation {
+                    PlatformOrderBatchOperation::Place {
+                        account_sequence,
+                        client_order_id,
+                        side,
+                        order_type,
+                        limit_price_atoms,
+                        size_atoms,
+                    } if tag == 0 => derived_order_ids.push(validate_order_place_authorization(
+                        &bytes,
+                        &mut cursor,
+                        challenge,
+                        account_sequence,
+                        client_order_id,
+                        *side,
+                        *order_type,
+                        limit_price_atoms,
+                        size_atoms,
+                    )?),
+                    PlatformOrderBatchOperation::Cancel { order_id } if tag == 1 => {
+                        derived_order_ids.push(validate_order_cancel_authorization(
+                            &bytes,
+                            &mut cursor,
+                            challenge,
+                            order_id,
+                        )?)
+                    }
+                    PlatformOrderBatchOperation::Replace {
+                        order_id,
+                        account_sequence,
+                        client_order_id,
+                        side,
+                        order_type,
+                        limit_price_atoms,
+                        size_atoms,
+                    } if tag == 3 => {
+                        derived_order_ids.push(validate_order_cancel_authorization(
+                            &bytes,
+                            &mut cursor,
+                            challenge,
+                            order_id,
+                        )?);
+                        derived_order_ids.push(validate_order_place_authorization(
+                            &bytes,
+                            &mut cursor,
+                            challenge,
+                            account_sequence,
+                            client_order_id,
+                            *side,
+                            *order_type,
+                            limit_price_atoms,
+                            size_atoms,
+                        )?);
+                    }
+                    _ => {
+                        return Err(SdkError::InvalidResponse(
+                            "order batch action changed".to_owned(),
+                        ))
+                    }
                 }
             }
         }
@@ -1909,6 +2306,87 @@ mod tests {
         let mut changed = request;
         if let PlatformOrderChallengeRequest::Place { size_atoms, .. } = &mut changed {
             *size_atoms = "1000001".to_owned();
+        }
+        assert!(validate_order_authorization(&challenge, &changed).is_err());
+    }
+
+    #[test]
+    fn order_authorization_parser_binds_atomic_batch_order_and_replacement_fields() {
+        let owner = [1u8; 32];
+        let session = [2u8; 32];
+        let cancelled = [3u8; 32];
+        let replaced = [4u8; 32];
+        let replacement = [5u8; 32];
+        let nonce = [6u8; 16];
+        let blockhash = [7u8; 32];
+        let market_id = "market_22222222222222222222222222222222";
+        let expires_at_ms = 1_786_550_460_000u64;
+        let request = PlatformOrderChallengeRequest::Batch {
+            owner_wallet: bs58::encode(owner).into_string(),
+            session_public_key: bs58::encode(session).into_string(),
+            operations: vec![
+                PlatformOrderBatchOperation::Cancel {
+                    order_id: opaque_order_id(market_id, &cancelled),
+                },
+                PlatformOrderBatchOperation::Replace {
+                    order_id: opaque_order_id(market_id, &replaced),
+                    account_sequence: "8".to_owned(),
+                    client_order_id: "replacement-8".to_owned(),
+                    side: PlatformTradeSide::Sell,
+                    order_type: PlatformOrderType::PostOnly,
+                    limit_price_atoms: "151000000".to_owned(),
+                    size_atoms: "2000000".to_owned(),
+                },
+            ],
+        };
+        let mut payload = Vec::new();
+        payload.extend_from_slice(PUBLIC_ORDER_AUTH_DOMAIN);
+        payload.extend_from_slice(&[9u8; 32]);
+        payload.extend_from_slice(&owner);
+        payload.extend_from_slice(&session);
+        payload.push(4);
+        payload.push(2);
+        payload.push(1);
+        payload.extend_from_slice(&cancelled);
+        payload.push(1);
+        payload.push(3);
+        payload.extend_from_slice(&replaced);
+        payload.push(0);
+        payload.extend_from_slice(&8u64.to_le_bytes());
+        payload.extend_from_slice(&("replacement-8".len() as u16).to_le_bytes());
+        payload.extend_from_slice(b"replacement-8");
+        payload.push(1);
+        payload.push(3);
+        payload.extend_from_slice(&151_000_000u64.to_le_bytes());
+        payload.extend_from_slice(&2_000_000u64.to_le_bytes());
+        payload.extend_from_slice(&replacement);
+        payload.extend_from_slice(&blockhash);
+        payload.extend_from_slice(&400_000_000u64.to_le_bytes());
+        payload.extend_from_slice(&expires_at_ms.to_le_bytes());
+        payload.extend_from_slice(&nonce);
+        payload.extend_from_slice(&[8u8; 16]);
+        let challenge = PlatformOrderChallengeResponse {
+            schema_version: 2,
+            contract_version: "2.0".to_owned(),
+            challenge_id: format!("oc_{}", hex::encode(nonce)),
+            market_id: market_id.to_owned(),
+            action: PlatformOrderAction::Batch,
+            order_ids: vec![
+                opaque_order_id(market_id, &cancelled),
+                opaque_order_id(market_id, &replaced),
+                opaque_order_id(market_id, &replacement),
+            ],
+            authorization_payload_base64: base64::engine::general_purpose::STANDARD.encode(payload),
+            server_time_ms: expires_at_ms - 60_000,
+            expires_at_ms,
+        };
+        validate_order_authorization(&challenge, &request).unwrap();
+
+        let mut changed = request;
+        if let PlatformOrderChallengeRequest::Batch { operations, .. } = &mut changed {
+            if let PlatformOrderBatchOperation::Replace { size_atoms, .. } = &mut operations[1] {
+                *size_atoms = "2000001".to_owned();
+            }
         }
         assert!(validate_order_authorization(&challenge, &changed).is_err());
     }

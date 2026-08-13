@@ -9,9 +9,9 @@ use std::error::Error;
 use std::time::Duration;
 use strata_sdk::{
     ExecutionChallengeRequest, ExecutionPrepareRequest, ExecutionSubmitRequest,
-    PlatformOrderChallengeRequest, PlatformOrderPrepareRequest, PlatformOrderStatusRequest,
-    PlatformOrderSubmitRequest, PlatformOrderType, PlatformTradeSide, QuoteRequest, QuoteSide,
-    StrataClient, DEFAULT_API_BASE, DEFAULT_SLIPPAGE_BPS,
+    PlatformOrderBatchOperation, PlatformOrderChallengeRequest, PlatformOrderPrepareRequest,
+    PlatformOrderStatusRequest, PlatformOrderSubmitRequest, PlatformOrderType, PlatformTradeSide,
+    QuoteRequest, QuoteSide, StrataClient, DEFAULT_API_BASE, DEFAULT_SLIPPAGE_BPS,
 };
 
 #[derive(Debug, Parser)]
@@ -139,6 +139,41 @@ enum OrderCommand {
         owner_wallet: String,
         #[arg(long)]
         session_public_key: String,
+    },
+    /// Request exact authorization bytes for an atomic cancel-and-place replacement.
+    ChallengeReplace {
+        #[arg(long)]
+        market_id: String,
+        #[arg(long)]
+        owner_wallet: String,
+        #[arg(long)]
+        session_public_key: String,
+        #[arg(long)]
+        order_id: String,
+        #[arg(long)]
+        account_sequence: String,
+        #[arg(long)]
+        client_order_id: String,
+        #[arg(long, value_enum)]
+        side: Side,
+        #[arg(long, value_enum)]
+        order_type: RestingOrderType,
+        #[arg(long)]
+        limit_price_atoms: String,
+        #[arg(long)]
+        size_atoms: String,
+    },
+    /// Request exact authorization bytes for one atomic bounded operation batch.
+    ChallengeBatch {
+        #[arg(long)]
+        market_id: String,
+        #[arg(long)]
+        owner_wallet: String,
+        #[arg(long)]
+        session_public_key: String,
+        /// JSON array of place, cancel, and replace operation objects.
+        #[arg(long)]
+        operations_json: String,
     },
     /// Exchange a detached authorization signature for a prepared transaction.
     Prepare {
@@ -295,8 +330,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 println!("{} {} quote", quote.market_id, side_label(quote.side));
                 println!("  input atoms:    {}", quote.amount_in_atoms);
                 println!("  consumed atoms: {}", quote.amount_in_consumed_atoms);
-                println!("  output atoms:   {}", quote.amount_out_atoms);
-                println!("  minimum atoms:  {}", quote.minimum_output_atoms);
+                println!("  output atoms (net):  {}", quote.amount_out_atoms);
+                println!("  minimum atoms (net): {}", quote.minimum_output_atoms);
                 println!("  input fee:      {}", quote.input_fee_atoms);
                 println!("  output fee:     {}", quote.output_fee_atoms);
                 println!("  reference:      {}", quote.reference_price);
@@ -443,6 +478,56 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     .await?;
                 print_order_challenge(&challenge, cli.json)?;
             }
+            OrderCommand::ChallengeReplace {
+                market_id,
+                owner_wallet,
+                session_public_key,
+                order_id,
+                account_sequence,
+                client_order_id,
+                side,
+                order_type,
+                limit_price_atoms,
+                size_atoms,
+            } => {
+                let challenge = client
+                    .order_challenge(
+                        &market_id,
+                        PlatformOrderChallengeRequest::Replace {
+                            owner_wallet,
+                            session_public_key,
+                            order_id,
+                            account_sequence,
+                            client_order_id,
+                            side: side.into(),
+                            order_type: order_type.into(),
+                            limit_price_atoms,
+                            size_atoms,
+                        },
+                    )
+                    .await?;
+                print_order_challenge(&challenge, cli.json)?;
+            }
+            OrderCommand::ChallengeBatch {
+                market_id,
+                owner_wallet,
+                session_public_key,
+                operations_json,
+            } => {
+                let operations: Vec<PlatformOrderBatchOperation> =
+                    serde_json::from_str(&operations_json)?;
+                let challenge = client
+                    .order_challenge(
+                        &market_id,
+                        PlatformOrderChallengeRequest::Batch {
+                            owner_wallet,
+                            session_public_key,
+                            operations,
+                        },
+                    )
+                    .await?;
+                print_order_challenge(&challenge, cli.json)?;
+            }
             OrderCommand::Prepare {
                 market_id,
                 challenge_id,
@@ -583,6 +668,63 @@ mod tests {
             cli.command,
             Command::Order {
                 command: OrderCommand::Status { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn order_replace_and_batch_commands_parse_as_explicit_controls() {
+        let replace = Cli::try_parse_from([
+            "strata-agent",
+            "order",
+            "challenge-replace",
+            "--market-id",
+            "market_22222222222222222222222222222222",
+            "--owner-wallet",
+            "11111111111111111111111111111111",
+            "--session-public-key",
+            "22222222222222222222222222222222",
+            "--order-id",
+            "order_11111111111111111111111111111111",
+            "--account-sequence",
+            "8",
+            "--client-order-id",
+            "replacement-8",
+            "--side",
+            "sell",
+            "--order-type",
+            "post-only",
+            "--limit-price-atoms",
+            "151000000",
+            "--size-atoms",
+            "2000000",
+        ])
+        .expect("valid replace command");
+        assert!(matches!(
+            replace.command,
+            Command::Order {
+                command: OrderCommand::ChallengeReplace { .. }
+            }
+        ));
+
+        let batch = Cli::try_parse_from([
+            "strata-agent",
+            "order",
+            "challenge-batch",
+            "--market-id",
+            "market_22222222222222222222222222222222",
+            "--owner-wallet",
+            "11111111111111111111111111111111",
+            "--session-public-key",
+            "22222222222222222222222222222222",
+            "--operations-json",
+            r#"[{"action":"cancel","order_id":"order_11111111111111111111111111111111"}]"#,
+        ])
+        .expect("valid batch command");
+        assert!(matches!(
+            batch.command,
+            Command::Order {
+                command: OrderCommand::ChallengeBatch { .. }
             }
         ));
     }
