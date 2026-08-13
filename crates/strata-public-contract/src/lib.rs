@@ -733,6 +733,17 @@ impl ActionGraph {
                     &[],
                     None,
                 ),
+                node(
+                    "recover_order_status",
+                    ActionNodeKind::Read,
+                    "Recover durable submitting, submitted, or failed status after a timeout or restart.",
+                    &["orders.submit"],
+                    Some(operation(
+                        "POST",
+                        "/v2/markets/{market_id}/orders/status",
+                        Some("strata_order_status"),
+                    )),
+                ),
             ],
             edges: vec![
                 edge("discover_capabilities", "discover_action_graph", "the returned contract version is supported"),
@@ -761,6 +772,8 @@ impl ActionGraph {
                 edge("prepare_order_control", "sign_order_transaction", "the prepared transaction preserves the signed order bindings"),
                 edge("sign_order_transaction", "submit_order_control", "orders.submit is enabled and the signed transaction is unmodified"),
                 edge("submit_order_control", "receive_order_receipt", "the control ID and idempotency key match"),
+                edge("submit_order_control", "recover_order_status", "the submission result is ambiguous or either process restarted"),
+                edge("recover_order_status", "receive_order_receipt", "durable status is submitted"),
             ],
         }
     }

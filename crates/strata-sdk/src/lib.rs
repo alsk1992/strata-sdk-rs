@@ -15,7 +15,8 @@ use thiserror::Error;
 
 pub use strata_public_contract::platform::{
     PlatformOrderAction, PlatformOrderChallengeRequest, PlatformOrderChallengeResponse,
-    PlatformOrderPrepareRequest, PlatformOrderPrepareResponse, PlatformOrderSubmissionStatus,
+    PlatformOrderControlStatus, PlatformOrderPrepareRequest, PlatformOrderPrepareResponse,
+    PlatformOrderStatusRequest, PlatformOrderStatusResponse, PlatformOrderSubmissionStatus,
     PlatformOrderSubmitRequest, PlatformOrderSubmitResponse, PlatformOrderType, PlatformTradeSide,
 };
 pub use strata_public_contract::{
@@ -501,6 +502,49 @@ impl StrataClient {
         }
         canonical_signature(&submitted.signature, "signature")?;
         Ok(submitted)
+    }
+
+    /// Recover the durable result for a prior submission. The same opaque
+    /// control ID and idempotency key are required, so status polling never
+    /// broadens authority beyond the original external submission.
+    pub async fn order_status(
+        &self,
+        market_id: &str,
+        request: PlatformOrderStatusRequest,
+    ) -> Result<PlatformOrderStatusResponse, SdkError> {
+        let market_id = validate_platform_market_id(market_id)?;
+        if !valid_handle(&request.order_control_id, "or_") {
+            return Err(SdkError::InvalidRequest(
+                "order_control_id is invalid".to_owned(),
+            ));
+        }
+        let request = PlatformOrderStatusRequest {
+            order_control_id: request.order_control_id,
+            idempotency_key: normalize_idempotency_key(&request.idempotency_key)?,
+        };
+        let status: PlatformOrderStatusResponse = self
+            .post(&format!("v2/markets/{market_id}/orders/status"), &request)
+            .await?;
+        validate_platform_version(status.schema_version, &status.contract_version)?;
+        if status.market_id != market_id
+            || status.order_control_id != request.order_control_id
+            || status.order_ids.is_empty()
+            || status.order_ids.len() > 6
+            || status
+                .order_ids
+                .iter()
+                .any(|order_id| !valid_handle(order_id, "order_"))
+            || (status.status == PlatformOrderControlStatus::Failed
+                && status.failure_code.as_deref().is_none_or(str::is_empty))
+            || (status.status != PlatformOrderControlStatus::Failed
+                && status.failure_code.is_some())
+        {
+            return Err(SdkError::InvalidResponse(
+                "order control status is invalid".to_owned(),
+            ));
+        }
+        canonical_signature(&status.signature, "signature")?;
+        Ok(status)
     }
 
     /// Execute one resting-order operation while all private keys and signing
@@ -1633,6 +1677,7 @@ mod tests {
             "order-challenge" => strata_public_contract::platform::PLATFORM_ORDER_CHALLENGE_FIXTURE,
             "order-prepare" => strata_public_contract::platform::PLATFORM_ORDER_PREPARE_FIXTURE,
             "order-submit" => strata_public_contract::platform::PLATFORM_ORDER_SUBMIT_FIXTURE,
+            "order-status" => strata_public_contract::platform::PLATFORM_ORDER_STATUS_FIXTURE,
             _ => unreachable!(),
         };
         serde_json::from_str(raw).unwrap()
@@ -1741,6 +1786,16 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/v2/markets/{market_id}/orders/status")))
+            .and(body_json(serde_json::json!({
+                "order_control_id": "or_44444444444444444444444444444444",
+                "idempotency_key": "order-attempt-7"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fixture("order-status")))
+            .expect(1)
+            .mount(&server)
+            .await;
 
         let client = StrataClient::new(server.uri()).unwrap();
         let challenge = client
@@ -1781,6 +1836,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(receipt.status, PlatformOrderSubmissionStatus::Submitted);
+        let status = client
+            .order_status(
+                market_id,
+                PlatformOrderStatusRequest {
+                    order_control_id: receipt.order_control_id,
+                    idempotency_key: "order-attempt-7".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(status.status, PlatformOrderControlStatus::Submitting);
     }
 
     #[test]

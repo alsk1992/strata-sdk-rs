@@ -44,6 +44,9 @@ pub const PLATFORM_ORDER_PREPARE_FIXTURE: &str = include_str!("../fixtures/v2/or
 #[cfg(any(test, feature = "fixtures"))]
 #[doc(hidden)]
 pub const PLATFORM_ORDER_SUBMIT_FIXTURE: &str = include_str!("../fixtures/v2/order-submit.json");
+#[cfg(any(test, feature = "fixtures"))]
+#[doc(hidden)]
+pub const PLATFORM_ORDER_STATUS_FIXTURE: &str = include_str!("../fixtures/v2/order-status.json");
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -485,6 +488,36 @@ pub struct PlatformOrderSubmitResponse {
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct PlatformOrderStatusRequest {
+    pub order_control_id: String,
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlatformOrderControlStatus {
+    Submitting,
+    Submitted,
+    Failed,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlatformOrderStatusResponse {
+    pub schema_version: u16,
+    pub contract_version: String,
+    pub order_control_id: String,
+    pub market_id: String,
+    pub action: PlatformOrderAction,
+    pub order_ids: Vec<String>,
+    pub signature: String,
+    pub status: PlatformOrderControlStatus,
+    pub failure_code: Option<String>,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PlatformAccountOrder {
     pub order_id: String,
     pub side: PlatformTradeSide,
@@ -663,6 +696,8 @@ mod tests {
             serde_json::from_str(PLATFORM_ORDER_PREPARE_FIXTURE).unwrap();
         let order_submit: PlatformOrderSubmitResponse =
             serde_json::from_str(PLATFORM_ORDER_SUBMIT_FIXTURE).unwrap();
+        let order_status: PlatformOrderStatusResponse =
+            serde_json::from_str(PLATFORM_ORDER_STATUS_FIXTURE).unwrap();
 
         assert_eq!(discovery.schema_version, PLATFORM_SCHEMA_VERSION);
         assert_eq!(discovery.capabilities.len(), 5);
@@ -681,6 +716,8 @@ mod tests {
         assert_eq!(order_challenge.action, PlatformOrderAction::Place);
         assert_eq!(order_prepare.order_ids, order_challenge.order_ids);
         assert_eq!(order_submit.order_ids, order_challenge.order_ids);
+        assert_eq!(order_status.order_control_id, order_submit.order_control_id);
+        assert_eq!(order_status.status, PlatformOrderControlStatus::Submitting);
     }
 
     #[test]
