@@ -34,6 +34,16 @@ pub const PLATFORM_TRADES_FIXTURE: &str = include_str!("../fixtures/v2/trades.js
 #[cfg(any(test, feature = "fixtures"))]
 #[doc(hidden)]
 pub const PLATFORM_ACCOUNT_FIXTURE: &str = include_str!("../fixtures/v2/account.json");
+#[cfg(any(test, feature = "fixtures"))]
+#[doc(hidden)]
+pub const PLATFORM_ORDER_CHALLENGE_FIXTURE: &str =
+    include_str!("../fixtures/v2/order-challenge.json");
+#[cfg(any(test, feature = "fixtures"))]
+#[doc(hidden)]
+pub const PLATFORM_ORDER_PREPARE_FIXTURE: &str = include_str!("../fixtures/v2/order-prepare.json");
+#[cfg(any(test, feature = "fixtures"))]
+#[doc(hidden)]
+pub const PLATFORM_ORDER_SUBMIT_FIXTURE: &str = include_str!("../fixtures/v2/order-submit.json");
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -367,6 +377,112 @@ pub enum PlatformOrderType {
     PostOnly,
 }
 
+/// Externally authorized resting-order operation. The public contract exposes
+/// product intent only; private construction details never cross the SDK
+/// boundary.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlatformOrderAction {
+    Place,
+    Cancel,
+    CancelAll,
+}
+
+/// Request canonical bytes for one externally signed order-control operation.
+/// Variant-specific fields are sealed so an authorization cannot be widened
+/// between challenge and transaction preparation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PlatformOrderChallengeRequest {
+    Place {
+        owner_wallet: String,
+        session_public_key: String,
+        account_sequence: String,
+        client_order_id: String,
+        side: PlatformTradeSide,
+        order_type: PlatformOrderType,
+        limit_price_atoms: String,
+        size_atoms: String,
+    },
+    Cancel {
+        owner_wallet: String,
+        session_public_key: String,
+        order_id: String,
+    },
+    CancelAll {
+        owner_wallet: String,
+        session_public_key: String,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlatformOrderChallengeResponse {
+    pub schema_version: u16,
+    pub contract_version: String,
+    pub challenge_id: String,
+    pub market_id: String,
+    pub action: PlatformOrderAction,
+    /// Exact opaque order set bound by the authorization. Place contains the
+    /// deterministic new order ID; cancel-all contains at most six IDs.
+    pub order_ids: Vec<String>,
+    pub authorization_payload_base64: String,
+    pub server_time_ms: u64,
+    pub expires_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlatformOrderPrepareRequest {
+    pub challenge_id: String,
+    /// Base58 Ed25519 signature over `authorization_payload_base64`.
+    pub authorization_signature: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlatformOrderPrepareResponse {
+    pub schema_version: u16,
+    pub contract_version: String,
+    pub order_control_id: String,
+    pub market_id: String,
+    pub action: PlatformOrderAction,
+    pub order_ids: Vec<String>,
+    /// Backend-partially-signed Solana v0 transaction. The external session
+    /// signer verifies and fills only its signature slot.
+    pub transaction_base64: String,
+    pub recent_blockhash: String,
+    pub last_valid_block_height: u64,
+    pub expires_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlatformOrderSubmitRequest {
+    pub order_control_id: String,
+    pub signed_transaction_base64: String,
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlatformOrderSubmissionStatus {
+    Submitted,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlatformOrderSubmitResponse {
+    pub schema_version: u16,
+    pub contract_version: String,
+    pub order_control_id: String,
+    pub market_id: String,
+    pub action: PlatformOrderAction,
+    pub order_ids: Vec<String>,
+    pub signature: String,
+    pub status: PlatformOrderSubmissionStatus,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlatformAccountOrder {
@@ -541,6 +657,12 @@ mod tests {
         let trades: PlatformTradesResponse = serde_json::from_str(PLATFORM_TRADES_FIXTURE).unwrap();
         let account: PlatformAccountSnapshotResponse =
             serde_json::from_str(PLATFORM_ACCOUNT_FIXTURE).unwrap();
+        let order_challenge: PlatformOrderChallengeResponse =
+            serde_json::from_str(PLATFORM_ORDER_CHALLENGE_FIXTURE).unwrap();
+        let order_prepare: PlatformOrderPrepareResponse =
+            serde_json::from_str(PLATFORM_ORDER_PREPARE_FIXTURE).unwrap();
+        let order_submit: PlatformOrderSubmitResponse =
+            serde_json::from_str(PLATFORM_ORDER_SUBMIT_FIXTURE).unwrap();
 
         assert_eq!(discovery.schema_version, PLATFORM_SCHEMA_VERSION);
         assert_eq!(discovery.capabilities.len(), 5);
@@ -556,6 +678,9 @@ mod tests {
         assert_eq!(trades.trades.len(), 1);
         assert_eq!(account.orders.len(), 1);
         assert_eq!(account.fills.len(), 1);
+        assert_eq!(order_challenge.action, PlatformOrderAction::Place);
+        assert_eq!(order_prepare.order_ids, order_challenge.order_ids);
+        assert_eq!(order_submit.order_ids, order_challenge.order_ids);
     }
 
     #[test]

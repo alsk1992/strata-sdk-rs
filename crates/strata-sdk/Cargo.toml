@@ -1,6 +1,6 @@
 [package]
 name = "strata-sdk"
-version = "0.1.4"
+version = "0.1.5"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -22,6 +22,7 @@ async-trait = "0.1"
 base64 = "0.22"
 bs58 = "0.5"
 hex = "0.4"
+sha2 = "0.10"
 
 [dev-dependencies]
 strata-public-contract = { workspace = true, features = ["fixtures"] }
