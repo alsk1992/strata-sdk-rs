@@ -1,34 +1,16 @@
-<p align="center">
-  <img src="./assets/readme-hero.svg" alt="Strata — The deepest book in DeFi." width="100%" />
-</p>
+# `strata-sdk`
 
-<h1 align="center">Strata SDK for Rust</h1>
+The official async Rust client for live Strata markets and Sonar quotes.
 
-<p align="center">
-  Native, typed access to live Strata markets and Sonar quotes.
-</p>
-
-<p align="center">
-  <a href="https://stratabook.org/docs/agent-sdks">Documentation</a>
-  ·
-  <a href="https://github.com/alsk1992/strata-sdk-ts">TypeScript</a>
-  ·
-  <a href="https://github.com/alsk1992/strata-mcp">MCP</a>
-  ·
-  <a href="https://stratabook.app">Strata</a>
-</p>
-
-Build market monitors, pricing services, terminal workflows, and native
-integrations against Strata's public contract. The SDK is async, uses Rustls,
-and keeps token economics exact across every boundary.
-
-## Start with a live quote
+## Install
 
 ```toml
 [dependencies]
 strata-public-contract = "0.1"
 strata-sdk = "0.1"
 ```
+
+## Request a Sonar quote
 
 ```rust
 use strata_public_contract::{QuoteRequest, QuoteSide, DEFAULT_SLIPPAGE_BPS};
@@ -53,118 +35,57 @@ println!("Price impact: {}%", quote.price_impact_pct);
 # }
 ```
 
-Sonar is Strata's unified liquidity and matching system. One request produces
-one decision-ready economic result for the whole Strata market.
+Sonar returns one Strata quote with expected output, consumed input, fees,
+minimum output, price impact, and expiry in one typed result.
 
-## Why build with it
+## Client operations
 
-| | |
+| Method | Result |
 | --- | --- |
-| **Native types** | Requests, responses, capabilities, markets, and errors are ordinary Rust types. |
-| **Exact by construction** | Token amounts remain decimal atomic strings instead of passing through floats. |
-| **Strict at the boundary** | Compatibility, quote binding, lifetime, and economics are checked before data reaches your application. |
-| **Async and portable** | A small Reqwest client with Rustls works cleanly in services and command-line tools. |
-| **One mental model** | Rust, TypeScript, MCP, and both CLIs share the same public contract. |
+| `capabilities()` | Features currently available through the public contract |
+| `action_graph()` | Live operation topology and external signing boundaries |
+| `markets()` | Strata markets, token decimals, and Sonar quote readiness |
+| `quote(request)` | A short-lived Sonar economic quote |
+| `execution_challenge(...)` | Canonical authorization bytes for an external signer |
+| `execution_prepare(...)` | Quote-bound partially signed transaction |
+| `execution_submit(...)` | Idempotent submission of an externally signed transaction |
+| `execute_quote(...)` | Authenticated Vault-session execution when enabled |
+| `order_challenge(...)` | Canonical authorization bytes for a resting-order action |
+| `order_prepare(...)` | Partially signed place or cancel transaction |
+| `order_submit(...)` | Idempotent submission of an externally signed order action |
+| `execute_order(...)` | Verified place or cancel flow when enabled |
 
-## Take it to the terminal
+Token amounts use unsigned decimal strings in atomic units. The client validates
+contract compatibility, quote binding, lifetime, and economic fields before
+returning data to the caller.
 
-Install the native CLI:
+`DEFAULT_SLIPPAGE_BPS` is `0` for exact read-only quotes. Set a non-zero
+execution tolerance explicitly only when your application is willing to accept
+less than the quoted output; `minimum_output_atoms` is the resulting floor.
+
+## Terminal companion
 
 ```sh
 cargo install strata-agent-cli
-```
 
-Discover markets and request a Sonar quote:
-
-```sh
 strata-agent markets
-
-strata-agent quote \
-  --market SOL/USDC \
-  --side sell \
-  --amount-atoms 10000000
+strata-agent quote --market SOL/USDC --side sell --amount-atoms 10000000
 ```
 
-Use `--json` for scripts, pipes, and agents:
+Add `--json` for scripts, pipes, and agents.
 
-```sh
-strata-agent quote \
-  --market SOL/USDC \
-  --side sell \
-  --amount-atoms 10000000 \
-  --json
-```
+Execution uses external-owner implementations of `SessionSigner` and
+`ExecutionVerifier`. The SDK validates the one-time authorization, quote,
+minimum output, expiry, blockhash, prepared response, and receipt. It calls the
+verifier before the session adapter can sign and never accepts private key
+bytes. The agent owner controls permission and signer policy; MCP exposes the
+same separate challenge, prepare, and submit operations when live capabilities
+allow them.
 
-## Workspace
+Resting-order actions use the same external-owner boundary. The high-level
+`execute_order(...)` helper validates every signed action field, opaque order
+identity, lifetime, and replay value before asking the session to sign. It then
+requires an `OrderVerifier` before requesting the transaction signature.
 
-| Crate | Use it when… |
-| --- | --- |
-| [`strata-sdk`](crates/strata-sdk) | You want the async Strata client |
-| [`strata-public-contract`](crates/strata-public-contract) | You need shared models without an HTTP client |
-| [`strata-agent-cli`](crates/strata-agent-cli) | You want Strata and Sonar in a terminal |
-
-## Read a Sonar quote
-
-| Field | What you can decide from it |
-| --- | --- |
-| `amount_in_consumed_atoms` | How much input the quote expects to use |
-| `amount_out_atoms` | The quoted output |
-| `minimum_output_atoms` | The lowest output allowed by the requested tolerance |
-| `input_fee_atoms` / `output_fee_atoms` | Which token pays each fee and how much |
-| `reference_price` | The public reference price used for context |
-| `price_impact_pct` | Estimated price impact |
-| `expires_at_ms` | When to discard the quote and request a fresh one |
-
-Amounts are unsigned base-10 strings in atomic units. That representation is
-deliberate: parsing through floating point would make financial values less
-exact, not more convenient.
-
-### Optional execution tolerance
-
-`DEFAULT_SLIPPAGE_BPS` is `0`, so the minimum output equals the quoted output.
-This is separate from price impact, which describes the depth consumed by the
-quote itself.
-
-Choose a non-zero `slippage_bps` only when you are willing to accept less
-output in exchange for greater execution tolerance. The returned
-`minimum_output_atoms` remains the authoritative floor, and the requested
-tolerance can affect which Sonar result is viable.
-
-## Authenticated execution
-
-When the live prepare and submit capabilities are enabled, `execute_quote`
-executes an unexpired quote with application-owned implementations of
-`SessionSigner` and `ExecutionVerifier`.
-
-The SDK never accepts private key bytes. It validates a one-time authorization
-bound to the quote and `minimum_output_atoms`, calls the deny-by-default
-verifier, and only then asks the non-exportable Vault session to sign.
-Submission is idempotent.
-
-The owner wallet remains the recovery authority for pausing or revoking the
-session and for withdrawals. Prepare and submit are disabled by default; the
-native terminal client remains read-only.
-
-## Choose your Strata interface
-
-| You are building… | Start here |
-| --- | --- |
-| A native service, bot, or Rust CLI | This SDK |
-| A TypeScript application or browser experience | [Strata SDK for TypeScript](https://github.com/alsk1992/strata-sdk-ts) |
-| An AI agent that should call Strata directly | [Strata MCP](https://github.com/alsk1992/strata-mcp) |
-| Better Strata judgment inside a coding agent | [Strata Agent Skills](https://github.com/alsk1992/strata-agent-skills) |
-
-## Current release
-
-The SDK contains market discovery, Sonar quotes, and the gated Vault-session
-execution contract. The native terminal client is read-only. Live capability
-discovery is authoritative.
-
-## Resources
-
-- [Agent quick start](https://stratabook.org/docs/hello-agents)
-- [SDK documentation](https://stratabook.org/docs/agent-sdks)
-- [Issues and feature requests](https://github.com/alsk1992/strata-sdk-rs/issues)
-- [Security policy](SECURITY.md)
-
-Licensed under either [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT).
+See the [workspace README](https://github.com/alsk1992/strata-sdk-rs) for the
+complete guide.
