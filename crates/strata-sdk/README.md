@@ -35,8 +35,11 @@ println!("Price impact: {}%", quote.price_impact_pct);
 # }
 ```
 
-Sonar returns one Strata quote with expected output, consumed input, fees,
-minimum output, price impact, and expiry in one typed result.
+Sonar returns one Strata quote with expected user-net output, consumed input,
+fees, user-net minimum output, price impact, and expiry in one typed result.
+Gross route output for an external route-quality comparison is exactly
+`amount_out_atoms + output_fee_atoms`; all-in user comparisons use
+`amount_out_atoms`.
 
 ## Client operations
 

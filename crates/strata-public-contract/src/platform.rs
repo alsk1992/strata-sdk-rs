@@ -389,6 +389,39 @@ pub enum PlatformOrderAction {
     Place,
     Cancel,
     CancelAll,
+    /// Atomically cancel one existing order and place its explicitly bound
+    /// successor in the same transaction.
+    Replace,
+    /// Atomically execute a bounded heterogeneous set of place, cancel, and
+    /// replace operations in one transaction.
+    Batch,
+}
+
+/// One operation inside an atomic order-control batch. Owner and session
+/// identity live on the enclosing challenge so no item can widen authority.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PlatformOrderBatchOperation {
+    Place {
+        account_sequence: String,
+        client_order_id: String,
+        side: PlatformTradeSide,
+        order_type: PlatformOrderType,
+        limit_price_atoms: String,
+        size_atoms: String,
+    },
+    Cancel {
+        order_id: String,
+    },
+    Replace {
+        order_id: String,
+        account_sequence: String,
+        client_order_id: String,
+        side: PlatformTradeSide,
+        order_type: PlatformOrderType,
+        limit_price_atoms: String,
+        size_atoms: String,
+    },
 }
 
 /// Request canonical bytes for one externally signed order-control operation.
@@ -416,6 +449,22 @@ pub enum PlatformOrderChallengeRequest {
         owner_wallet: String,
         session_public_key: String,
     },
+    Replace {
+        owner_wallet: String,
+        session_public_key: String,
+        order_id: String,
+        account_sequence: String,
+        client_order_id: String,
+        side: PlatformTradeSide,
+        order_type: PlatformOrderType,
+        limit_price_atoms: String,
+        size_atoms: String,
+    },
+    Batch {
+        owner_wallet: String,
+        session_public_key: String,
+        operations: Vec<PlatformOrderBatchOperation>,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -426,8 +475,9 @@ pub struct PlatformOrderChallengeResponse {
     pub challenge_id: String,
     pub market_id: String,
     pub action: PlatformOrderAction,
-    /// Exact opaque order set bound by the authorization. Place contains the
-    /// deterministic new order ID; cancel-all contains at most six IDs.
+    /// Exact opaque order set bound by the authorization. Replace returns the
+    /// old then new ID. Batch flattens item IDs in request order, with replace
+    /// contributing old then new. A batch contains at most six operations.
     pub order_ids: Vec<String>,
     pub authorization_payload_base64: String,
     pub server_time_ms: u64,
@@ -741,5 +791,53 @@ mod tests {
         event.insert("sequence".to_owned(), serde_json::json!("1"));
         event.insert("unexpected_field".to_owned(), serde_json::json!(true));
         assert!(serde_json::from_value::<PlatformAccountEvent>(account_event).is_err());
+    }
+
+    #[test]
+    fn atomic_order_batch_request_is_strict_and_typed() {
+        let request: PlatformOrderChallengeRequest = serde_json::from_value(serde_json::json!({
+            "action": "batch",
+            "owner_wallet": "11111111111111111111111111111111",
+            "session_public_key": "22222222222222222222222222222222",
+            "operations": [
+                {
+                    "action": "cancel",
+                    "order_id": "order_11111111111111111111111111111111"
+                },
+                {
+                    "action": "replace",
+                    "order_id": "order_22222222222222222222222222222222",
+                    "account_sequence": "8",
+                    "client_order_id": "replacement-8",
+                    "side": "sell",
+                    "order_type": "post_only",
+                    "limit_price_atoms": "151000000",
+                    "size_atoms": "2000000"
+                }
+            ]
+        }))
+        .unwrap();
+        let PlatformOrderChallengeRequest::Batch { operations, .. } = request else {
+            panic!("expected batch request");
+        };
+        assert_eq!(operations.len(), 2);
+        assert!(matches!(
+            operations[1],
+            PlatformOrderBatchOperation::Replace { .. }
+        ));
+
+        assert!(
+            serde_json::from_value::<PlatformOrderChallengeRequest>(serde_json::json!({
+                "action": "batch",
+                "owner_wallet": "11111111111111111111111111111111",
+                "session_public_key": "22222222222222222222222222222222",
+                "operations": [{
+                    "action": "cancel",
+                    "order_id": "order_11111111111111111111111111111111",
+                    "implementation": "hidden"
+                }]
+            }))
+            .is_err()
+        );
     }
 }

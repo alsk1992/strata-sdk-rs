@@ -131,12 +131,16 @@ pub struct QuoteResponse {
     pub amount_in_atoms: String,
     /// Requested input actually consumed by the quoted execution.
     pub amount_in_consumed_atoms: String,
+    /// User-net output after `output_fee_atoms`. Gross route output for
+    /// external route-quality comparison is their exact atomic sum.
     pub amount_out_atoms: String,
+    /// User-net execution floor after fees and requested tolerance.
     pub minimum_output_atoms: String,
     /// Fees charged in the request's input asset. Sonar can charge fees on
     /// either side, so a single unlabelled fee is unsafe.
     pub input_fee_atoms: String,
-    /// Fees charged in the response's output asset.
+    /// Strata fee charged in the response's output asset. It is reported
+    /// separately so route quality and all-in user economics cannot be mixed.
     pub output_fee_atoms: String,
     /// Display-only decimal strings. SDKs may parse these for presentation but
     /// must not use them for settlement or signing bounds.
@@ -682,7 +686,7 @@ impl ActionGraph {
                 node(
                     "request_order_challenge",
                     ActionNodeKind::Prepare,
-                    "Bind a product-level place, cancel, or cancel-all operation to canonical authorization bytes.",
+                    "Bind a product-level place, cancel, bounded cancel-all, atomic replace, or atomic batch operation to canonical authorization bytes.",
                     &["orders.prepare"],
                     Some(operation(
                         "POST",
