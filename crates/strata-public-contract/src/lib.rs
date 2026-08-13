@@ -7,6 +7,8 @@
 
 use serde::{Deserialize, Serialize};
 
+pub mod platform;
+
 pub const CONTRACT_MAJOR: u16 = 1;
 pub const CONTRACT_VERSION: &str = "1.1";
 /// Exact-output default for the current read-only quote surface.
@@ -57,7 +59,8 @@ pub struct ActionAuthorityModel {
 pub struct ActionOperation {
     pub method: String,
     pub path: String,
-    pub mcp_tool: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mcp_tool: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -386,12 +389,12 @@ impl CapabilityCatalog {
                 ),
                 capability(
                     "books.read",
-                    "1.0",
+                    "1.1",
                     Beta,
                     "market:read",
                     Read,
-                    false,
-                    false,
+                    true,
+                    true,
                     McpNone,
                 ),
                 capability(
@@ -406,12 +409,12 @@ impl CapabilityCatalog {
                 ),
                 capability(
                     "account.read",
-                    "1.0",
+                    "1.1",
                     Beta,
                     "account:read",
                     Read,
-                    false,
-                    false,
+                    true,
+                    true,
                     McpNone,
                 ),
                 capability(
@@ -451,10 +454,10 @@ impl ActionGraph {
                 })
             })
         };
-        let operation = |method: &str, path: &str, mcp_tool: &str| ActionOperation {
+        let operation = |method: &str, path: &str, mcp_tool: Option<&str>| ActionOperation {
             method: method.to_owned(),
             path: path.to_owned(),
-            mcp_tool: mcp_tool.to_owned(),
+            mcp_tool: mcp_tool.map(str::to_owned),
         };
         let node = |id: &str,
                     kind,
@@ -490,21 +493,106 @@ impl ActionGraph {
                     ActionNodeKind::Discovery,
                     "Read the live capabilities that currently expose Strata operations.",
                     &[],
-                    Some(operation("GET", "/sonar/capabilities", "strata_capabilities")),
+                    Some(operation("GET", "/sonar/capabilities", Some("strata_capabilities"))),
                 ),
                 node(
                     "discover_markets",
                     ActionNodeKind::Discovery,
                     "Discover ready markets, token decimals, and public operation paths.",
                     &["markets.read"],
-                    Some(operation("GET", "/sonar/markets", "strata_markets")),
+                    Some(operation("GET", "/sonar/markets", Some("strata_markets"))),
                 ),
                 node(
                     "discover_action_graph",
                     ActionNodeKind::Discovery,
                     "Read the executable topology, live node availability, external signing steps, and transition conditions.",
                     &[],
-                    Some(operation("GET", "/sonar/action-graph", "strata_action_graph")),
+                    Some(operation("GET", "/sonar/action-graph", Some("strata_action_graph"))),
+                ),
+                node(
+                    "discover_platform_capabilities",
+                    ActionNodeKind::Discovery,
+                    "Read the versioned capabilities available through the official SDK.",
+                    &[],
+                    Some(operation("GET", "/v2/capabilities", None)),
+                ),
+                node(
+                    "discover_platform_markets",
+                    ActionNodeKind::Discovery,
+                    "Discover opaque market IDs and current market status.",
+                    &["markets.read"],
+                    Some(operation("GET", "/v2/markets", None)),
+                ),
+                node(
+                    "read_book",
+                    ActionNodeKind::Read,
+                    "Read a sequenced Strata book snapshot.",
+                    &["books.read"],
+                    Some(operation("GET", "/v2/markets/{market_id}/book", None)),
+                ),
+                node(
+                    "read_market_status",
+                    ActionNodeKind::Read,
+                    "Read tick size, minimum order size, and current market status.",
+                    &["books.read"],
+                    Some(operation("GET", "/v2/markets/{market_id}/status", None)),
+                ),
+                node(
+                    "read_best_bid_ask",
+                    ActionNodeKind::Read,
+                    "Read the current best bid and ask.",
+                    &["books.read"],
+                    Some(operation("GET", "/v2/markets/{market_id}/bbo", None)),
+                ),
+                node(
+                    "read_fees",
+                    ActionNodeKind::Read,
+                    "Read the market fee schedule.",
+                    &["books.read"],
+                    Some(operation("GET", "/v2/markets/{market_id}/fees", None)),
+                ),
+                node(
+                    "read_trades",
+                    ActionNodeKind::Read,
+                    "Read recent anonymized trades.",
+                    &["books.read"],
+                    Some(operation("GET", "/v2/markets/{market_id}/trades", None)),
+                ),
+                node(
+                    "stream_market",
+                    ActionNodeKind::Read,
+                    "Subscribe to book changes, trades, and heartbeats with automatic recovery.",
+                    &["books.read"],
+                    Some(operation("WEBSOCKET", "/v2/markets/{market_id}/stream", None)),
+                ),
+                node(
+                    "authorize_account_read",
+                    ActionNodeKind::ExternalSignature,
+                    "The agent owner's configured signer authorizes the exact account request or stream challenge.",
+                    &[],
+                    None,
+                ),
+                node(
+                    "read_account",
+                    ActionNodeKind::Read,
+                    "Read the owner's sanitized open orders and fills for a Strata market.",
+                    &["account.read"],
+                    Some(operation(
+                        "GET",
+                        "/v2/markets/{market_id}/account/{wallet_address}",
+                        None,
+                    )),
+                ),
+                node(
+                    "stream_account",
+                    ActionNodeKind::Read,
+                    "Subscribe to signed, sequenced order and fill state for the owner.",
+                    &["account.read"],
+                    Some(operation(
+                        "WEBSOCKET",
+                        "/v2/markets/{market_id}/account/{wallet_address}/stream",
+                        None,
+                    )),
                 ),
                 node(
                     "request_quote",
@@ -514,7 +602,7 @@ impl ActionGraph {
                     Some(operation(
                         "POST",
                         "/sonar/markets/{market}/quote",
-                        "strata_quote",
+                        Some("strata_quote"),
                     )),
                 ),
                 node(
@@ -525,7 +613,7 @@ impl ActionGraph {
                     Some(operation(
                         "POST",
                         "/sonar/markets/{market}/execution/challenge",
-                        "strata_execution_challenge",
+                        Some("strata_execution_challenge"),
                     )),
                 ),
                 node(
@@ -543,7 +631,7 @@ impl ActionGraph {
                     Some(operation(
                         "POST",
                         "/sonar/markets/{market}/execution/prepare",
-                        "strata_execution_prepare",
+                        Some("strata_execution_prepare"),
                     )),
                 ),
                 node(
@@ -561,7 +649,7 @@ impl ActionGraph {
                     Some(operation(
                         "POST",
                         "/sonar/markets/{market}/execution/submit",
-                        "strata_execution_submit",
+                        Some("strata_execution_submit"),
                     )),
                 ),
                 node(
@@ -575,6 +663,17 @@ impl ActionGraph {
             edges: vec![
                 edge("discover_capabilities", "discover_action_graph", "the returned contract version is supported"),
                 edge("discover_action_graph", "discover_markets", "markets.read is enabled"),
+                edge("discover_action_graph", "discover_platform_capabilities", "the versioned SDK contract is supported"),
+                edge("discover_platform_capabilities", "discover_platform_markets", "markets.read is enabled"),
+                edge("discover_platform_markets", "read_book", "books.read is enabled and the market is active"),
+                edge("discover_platform_markets", "read_market_status", "books.read is enabled"),
+                edge("discover_platform_markets", "read_best_bid_ask", "books.read is enabled"),
+                edge("discover_platform_markets", "read_fees", "books.read is enabled"),
+                edge("discover_platform_markets", "read_trades", "books.read is enabled"),
+                edge("read_book", "stream_market", "books.read is enabled and the snapshot sequence is accepted"),
+                edge("discover_platform_markets", "authorize_account_read", "account.read is enabled and the owner-configured signer is available"),
+                edge("authorize_account_read", "read_account", "the signature binds the wallet, market, request time, and fill limit"),
+                edge("read_account", "stream_account", "the stream challenge is signed by the same owner-configured signer"),
                 edge("discover_markets", "request_quote", "quotes.read is enabled and the market is ready"),
                 edge("request_quote", "request_execution_challenge", "trade.prepare is enabled and the quote is unexpired"),
                 edge("request_execution_challenge", "sign_authorization", "the challenge bindings match the quote and signer"),
