@@ -3,6 +3,12 @@
 //! It provides typed requests and responses and validates compatibility, quote
 //! binding, and economic fields before returning data to the application.
 
+mod order_stream;
+
+pub use order_stream::{
+    DeadManGuard, OrderChallengeResult, OrderCommandStream, ORDER_STREAM_AUTH_DOMAIN,
+};
+
 use async_trait::async_trait;
 use base64::Engine as _;
 use reqwest::{StatusCode, Url};
@@ -14,11 +20,12 @@ use strata_public_contract::{ErrorResponse, CONTRACT_MAJOR, CONTRACT_VERSION};
 use thiserror::Error;
 
 pub use strata_public_contract::platform::{
-    PlatformOrderAction, PlatformOrderBatchOperation, PlatformOrderChallengeRequest,
-    PlatformOrderChallengeResponse, PlatformOrderControlStatus, PlatformOrderPrepareRequest,
-    PlatformOrderPrepareResponse, PlatformOrderStatusRequest, PlatformOrderStatusResponse,
-    PlatformOrderSubmissionStatus, PlatformOrderSubmitRequest, PlatformOrderSubmitResponse,
-    PlatformOrderType, PlatformTradeSide,
+    PlatformDeadManState, PlatformDeadManStatus, PlatformOrderAction, PlatformOrderBatchOperation,
+    PlatformOrderChallengeRequest, PlatformOrderChallengeResponse, PlatformOrderCommand,
+    PlatformOrderCommandClientFrame, PlatformOrderCommandEvent, PlatformOrderControlStatus,
+    PlatformOrderPrepareRequest, PlatformOrderPrepareResponse, PlatformOrderStatusRequest,
+    PlatformOrderStatusResponse, PlatformOrderSubmissionStatus, PlatformOrderSubmitRequest,
+    PlatformOrderSubmitResponse, PlatformOrderType, PlatformSelfTradePrevention, PlatformTradeSide,
 };
 pub use strata_public_contract::{
     ActionAuthorityModel, ActionEdge, ActionGraph, ActionNode, ActionNodeKind, ActionOperation,
@@ -81,7 +88,10 @@ pub enum OrderExecuteOperation {
 }
 
 impl OrderExecuteOperation {
-    fn challenge_request(&self, session_public_key: String) -> PlatformOrderChallengeRequest {
+    pub(crate) fn challenge_request(
+        &self,
+        session_public_key: String,
+    ) -> PlatformOrderChallengeRequest {
         match self {
             Self::Place {
                 owner_wallet,
@@ -199,6 +209,14 @@ pub enum SdkError {
     Signer(String),
     #[error("prepared transaction was rejected: {0}")]
     Verification(String),
+    #[error("persistent order command stream failed: {0}")]
+    Stream(String),
+    #[error("order command rejected ({code}): {message}")]
+    Command {
+        code: String,
+        message: String,
+        retryable: bool,
+    },
     #[error(transparent)]
     Transport(#[from] reqwest::Error),
 }
@@ -227,6 +245,17 @@ impl StrataClient {
         let base_url = normalize_base_url(base_url.as_ref())?;
         let http = reqwest::Client::builder().timeout(timeout).build()?;
         Ok(Self { base_url, http })
+    }
+
+    /// Open one authenticated, persistent order-command connection. The
+    /// external session signer is used for authentication and is not retained.
+    pub async fn connect_order_commands<S: SessionSigner + ?Sized>(
+        &self,
+        market_id: &str,
+        owner_wallet: &str,
+        signer: &S,
+    ) -> Result<OrderCommandStream, SdkError> {
+        OrderCommandStream::connect(self, market_id, owner_wallet, signer).await
     }
 
     pub async fn capabilities(&self) -> Result<CapabilityCatalog, SdkError> {

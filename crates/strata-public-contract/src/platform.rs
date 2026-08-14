@@ -130,6 +130,8 @@ pub enum PlatformPublicErrorCode {
     OrderRejected,
     OrderNotFound,
     CancelTooLate,
+    SelfTradePrevented,
+    DeadManExpired,
     RateLimited,
     TemporarilyUnavailable,
     SubmissionAmbiguous,
@@ -566,6 +568,190 @@ pub struct PlatformOrderStatusResponse {
     pub updated_at_ms: u64,
 }
 
+/// Collision policy for an incoming order that would cross the owner's own
+/// resting liquidity. Every mode still preserves Strata's matcher and on-chain
+/// self-fill prohibition; this only controls which order is cancelled first.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlatformSelfTradePrevention {
+    CancelTaker,
+    CancelMaker,
+    CancelBoth,
+    SkipOwnLiquidity,
+}
+
+/// One command on the persistent order-control connection. Challenge results
+/// may contain an effective request that differs from the requested one only
+/// by the explicitly selected self-trade prevention transformation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PlatformOrderCommand {
+    Challenge {
+        request: PlatformOrderChallengeRequest,
+        self_trade_prevention: PlatformSelfTradePrevention,
+    },
+    Prepare {
+        request: PlatformOrderPrepareRequest,
+    },
+    Submit {
+        request: PlatformOrderSubmitRequest,
+    },
+    Status {
+        request: PlatformOrderStatusRequest,
+    },
+    DeadManArm {
+        timeout_ms: u64,
+        request: PlatformOrderSubmitRequest,
+    },
+    DeadManStatus,
+    DeadManHeartbeat,
+    DeadManDisarm,
+}
+
+/// Frames sent by an external agent. Authentication proves possession of the
+/// declared session key; individual order authorizations and transactions keep
+/// their existing exact external-signing boundaries.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PlatformOrderCommandClientFrame {
+    Authenticate {
+        owner_wallet: String,
+        session_public_key: String,
+        /// Base58 Ed25519 signature over the stream authentication payload.
+        signature: String,
+    },
+    Command {
+        request_id: String,
+        sequence: String,
+        command: PlatformOrderCommand,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlatformDeadManStatus {
+    Armed,
+    Triggering,
+    Triggered,
+    Disarmed,
+    Expired,
+    Failed,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlatformDeadManState {
+    pub status: PlatformDeadManStatus,
+    pub timeout_ms: u64,
+    pub heartbeat_deadline_ms: u64,
+    pub order_control_id: Option<String>,
+    pub signature: Option<String>,
+    pub failure_code: Option<String>,
+    pub updated_at_ms: u64,
+}
+
+/// Sequenced frames emitted by the persistent order-control connection. Every
+/// command result is correlated by the caller's request ID; terminal chain
+/// status may arrive later without blocking command submission.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PlatformOrderCommandEvent {
+    AuthChallenge {
+        schema_version: u16,
+        contract_version: String,
+        market_id: String,
+        challenge: String,
+        server_time_ms: u64,
+        expires_at_ms: u64,
+    },
+    Ready {
+        schema_version: u16,
+        contract_version: String,
+        market_id: String,
+        stream_id: String,
+        sequence: String,
+        server_time_ms: u64,
+    },
+    ChallengeResult {
+        schema_version: u16,
+        contract_version: String,
+        market_id: String,
+        stream_id: String,
+        sequence: String,
+        previous_sequence: String,
+        request_id: String,
+        self_trade_prevention: PlatformSelfTradePrevention,
+        prevented_order_ids: Vec<String>,
+        effective_request: PlatformOrderChallengeRequest,
+        response: PlatformOrderChallengeResponse,
+        server_time_ms: u64,
+    },
+    PrepareResult {
+        schema_version: u16,
+        contract_version: String,
+        market_id: String,
+        stream_id: String,
+        sequence: String,
+        previous_sequence: String,
+        request_id: String,
+        response: PlatformOrderPrepareResponse,
+        server_time_ms: u64,
+    },
+    SubmitResult {
+        schema_version: u16,
+        contract_version: String,
+        market_id: String,
+        stream_id: String,
+        sequence: String,
+        previous_sequence: String,
+        request_id: String,
+        response: PlatformOrderSubmitResponse,
+        server_time_ms: u64,
+    },
+    StatusResult {
+        schema_version: u16,
+        contract_version: String,
+        market_id: String,
+        stream_id: String,
+        sequence: String,
+        previous_sequence: String,
+        request_id: String,
+        response: PlatformOrderStatusResponse,
+        server_time_ms: u64,
+    },
+    DeadManResult {
+        schema_version: u16,
+        contract_version: String,
+        market_id: String,
+        stream_id: String,
+        sequence: String,
+        previous_sequence: String,
+        request_id: String,
+        state: PlatformDeadManState,
+        server_time_ms: u64,
+    },
+    CommandError {
+        schema_version: u16,
+        contract_version: String,
+        market_id: String,
+        stream_id: String,
+        sequence: String,
+        previous_sequence: String,
+        request_id: String,
+        error: PublicOperationError,
+        server_time_ms: u64,
+    },
+    Heartbeat {
+        schema_version: u16,
+        contract_version: String,
+        market_id: String,
+        stream_id: String,
+        sequence: String,
+        previous_sequence: String,
+        server_time_ms: u64,
+    },
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlatformAccountOrder {
@@ -836,6 +1022,51 @@ mod tests {
                     "order_id": "order_11111111111111111111111111111111",
                     "implementation": "hidden"
                 }]
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn persistent_order_commands_are_strict_and_explicit_about_self_trade_policy() {
+        let frame: PlatformOrderCommandClientFrame = serde_json::from_value(serde_json::json!({
+            "type": "command",
+            "request_id": "agent-1",
+            "sequence": "1",
+            "command": {
+                "type": "challenge",
+                "self_trade_prevention": "cancel_maker",
+                "request": {
+                    "action": "cancel_all",
+                    "owner_wallet": "11111111111111111111111111111111",
+                    "session_public_key": "22222222222222222222222222222222"
+                }
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            frame,
+            PlatformOrderCommandClientFrame::Command {
+                command: PlatformOrderCommand::Challenge {
+                    self_trade_prevention: PlatformSelfTradePrevention::CancelMaker,
+                    ..
+                },
+                ..
+            }
+        ));
+        assert!(
+            serde_json::from_value::<PlatformOrderCommandClientFrame>(serde_json::json!({
+                "type": "command",
+                "request_id": "agent-1",
+                "sequence": "1",
+                "command": {
+                    "type": "challenge",
+                    "request": {
+                        "action": "cancel_all",
+                        "owner_wallet": "11111111111111111111111111111111",
+                        "session_public_key": "22222222222222222222222222222222"
+                    }
+                }
             }))
             .is_err()
         );

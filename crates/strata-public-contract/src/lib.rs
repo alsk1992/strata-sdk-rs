@@ -738,6 +738,39 @@ impl ActionGraph {
                     None,
                 ),
                 node(
+                    "open_order_command_stream",
+                    ActionNodeKind::Prepare,
+                    "Authenticate one persistent sequenced order channel for low-latency commands, explicit self-trade policy, and pushed confirmation.",
+                    &["orders.prepare", "orders.submit"],
+                    Some(operation(
+                        "WEBSOCKET",
+                        "/v2/markets/{market_id}/orders/stream",
+                        None,
+                    )),
+                ),
+                node(
+                    "maintain_dead_man",
+                    ActionNodeKind::Submit,
+                    "Arm and heartbeat an exact pre-signed cancel-all that executes if the agent stops responding.",
+                    &["orders.prepare", "orders.submit"],
+                    Some(operation(
+                        "WEBSOCKET",
+                        "/v2/markets/{market_id}/orders/stream",
+                        None,
+                    )),
+                ),
+                node(
+                    "certify_order_command_slo",
+                    ActionNodeKind::Read,
+                    "Measure authenticated command latency, concurrency, sequence integrity, and error rate without submitting a trade.",
+                    &["orders.prepare", "orders.submit"],
+                    Some(operation(
+                        "WEBSOCKET",
+                        "/v2/markets/{market_id}/orders/stream",
+                        None,
+                    )),
+                ),
+                node(
                     "recover_order_status",
                     ActionNodeKind::Read,
                     "Recover durable submitting, submitted, or failed status after a timeout or restart.",
@@ -770,6 +803,10 @@ impl ActionGraph {
                 edge("prepare_execution", "sign_transaction", "the prepared transaction preserves the signed bindings"),
                 edge("sign_transaction", "submit_execution", "trade.submit is enabled and the signed transaction is unmodified"),
                 edge("submit_execution", "receive_receipt", "the execution ID and idempotency key match"),
+                edge("discover_platform_markets", "open_order_command_stream", "orders.prepare and orders.submit advertise websocket transport and the owner-configured session signer is available"),
+                edge("open_order_command_stream", "request_order_challenge", "signed socket authentication succeeds and an explicit self-trade prevention policy is selected"),
+                edge("open_order_command_stream", "maintain_dead_man", "the exact cancel-all authorization and transaction are externally verified and signed"),
+                edge("open_order_command_stream", "certify_order_command_slo", "a release or recurring production load certificate is required"),
                 edge("discover_platform_markets", "request_order_challenge", "orders.prepare is enabled and the market accepts order control"),
                 edge("request_order_challenge", "sign_order_authorization", "the action and exact opaque order set match owner intent"),
                 edge("sign_order_authorization", "prepare_order_control", "a valid external authorization signature is available"),
@@ -777,6 +814,7 @@ impl ActionGraph {
                 edge("sign_order_transaction", "submit_order_control", "orders.submit is enabled and the signed transaction is unmodified"),
                 edge("submit_order_control", "receive_order_receipt", "the control ID and idempotency key match"),
                 edge("submit_order_control", "recover_order_status", "the submission result is ambiguous or either process restarted"),
+                edge("submit_order_control", "maintain_dead_man", "the agent has resting exposure that must fail closed on disconnect"),
                 edge("recover_order_status", "receive_order_receipt", "durable status is submitted"),
             ],
         }
