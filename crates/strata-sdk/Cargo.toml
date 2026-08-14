@@ -1,6 +1,6 @@
 [package]
 name = "strata-sdk"
-version = "0.1.7"
+version = "0.1.8"
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -23,8 +23,10 @@ base64 = "0.22"
 bs58 = "0.5"
 hex = "0.4"
 sha2 = "0.10"
+futures-util = "0.3"
+tokio = { workspace = true }
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 
 [dev-dependencies]
 strata-public-contract = { workspace = true, features = ["fixtures"] }
-tokio = { workspace = true }
 wiremock = "0.6"
