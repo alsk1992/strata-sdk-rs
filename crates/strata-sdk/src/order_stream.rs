@@ -12,6 +12,7 @@ use super::*;
 pub const ORDER_STREAM_AUTH_DOMAIN: &str = "strata:order-command-stream:v2";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const EVENT_BUFFER: usize = 1_024;
+const MAX_SERVER_EVENTS_PER_FRAME: usize = 64;
 
 #[derive(Clone, Debug)]
 pub struct OrderChallengeResult {
@@ -163,8 +164,13 @@ impl OrderCommandStream {
                 "expected a text authentication result".to_owned(),
             ));
         };
-        let ready: PlatformOrderCommandEvent = serde_json::from_str(&ready)
-            .map_err(|error| SdkError::InvalidResponse(error.to_string()))?;
+        let mut ready_events = parse_order_command_events(&ready)?;
+        if ready_events.len() != 1 {
+            return Err(SdkError::InvalidResponse(
+                "order stream authentication returned an invalid event batch".to_owned(),
+            ));
+        }
+        let ready = ready_events.pop().expect("one ready event");
         let (stream_id, sequence) = match &ready {
             PlatformOrderCommandEvent::Ready {
                 schema_version,
@@ -685,7 +691,7 @@ async fn run_actor<S>(
     let mut request_counter = 0u64;
     let mut pending =
         HashMap::<String, oneshot::Sender<Result<PlatformOrderCommandEvent, SdkError>>>::new();
-    let failure = loop {
+    let failure = 'actor: loop {
         tokio::select! {
             request = commands.recv() => {
                 let Some(request) = request else {
@@ -731,36 +737,38 @@ async fn run_actor<S>(
                     Ok(_) => continue,
                     Err(error) => break error.to_string(),
                 };
-                let event: PlatformOrderCommandEvent = match serde_json::from_str(&message) {
-                    Ok(event) => event,
-                    Err(error) => break format!("invalid order command event: {error}"),
+                let frame_events = match parse_order_command_events(&message) {
+                    Ok(events) => events,
+                    Err(error) => break error.to_string(),
                 };
-                if let Err(error) = validate_event_sequence(
-                    &event,
-                    &market_id,
-                    &stream_id,
-                    &mut server_sequence,
-                ) {
-                    break error.to_string();
-                }
-                let request_id = event_request_id(&event).map(str::to_owned);
-                let _ = events.send(event.clone());
-                if let Some(request_id) = request_id {
-                    if let Some(response) = pending.remove(&request_id) {
-                        let result = match &event {
-                            PlatformOrderCommandEvent::CommandError { error, .. } => {
-                                Err(SdkError::Command {
-                                    code: serde_json::to_value(error.code)
-                                        .ok()
-                                        .and_then(|value| value.as_str().map(str::to_owned))
-                                        .unwrap_or_else(|| "command_rejected".to_owned()),
-                                    message: error.message.clone(),
-                                    retryable: error.retryable,
-                                })
-                            }
-                            _ => Ok(event),
-                        };
-                        let _ = response.send(result);
+                for event in frame_events {
+                    if let Err(error) = validate_event_sequence(
+                        &event,
+                        &market_id,
+                        &stream_id,
+                        &mut server_sequence,
+                    ) {
+                        break 'actor error.to_string();
+                    }
+                    let request_id = event_request_id(&event).map(str::to_owned);
+                    let _ = events.send(event.clone());
+                    if let Some(request_id) = request_id {
+                        if let Some(response) = pending.remove(&request_id) {
+                            let result = match &event {
+                                PlatformOrderCommandEvent::CommandError { error, .. } => {
+                                    Err(SdkError::Command {
+                                        code: serde_json::to_value(error.code)
+                                            .ok()
+                                            .and_then(|value| value.as_str().map(str::to_owned))
+                                            .unwrap_or_else(|| "command_rejected".to_owned()),
+                                        message: error.message.clone(),
+                                        retryable: error.retryable,
+                                    })
+                                }
+                                _ => Ok(event),
+                            };
+                            let _ = response.send(result);
+                        }
                     }
                 }
             }
@@ -769,6 +777,24 @@ async fn run_actor<S>(
     for response in pending.into_values() {
         let _ = response.send(Err(SdkError::Stream(failure.clone())));
     }
+}
+
+fn parse_order_command_events(message: &str) -> Result<Vec<PlatformOrderCommandEvent>, SdkError> {
+    let value: serde_json::Value = serde_json::from_str(message).map_err(|error| {
+        SdkError::InvalidResponse(format!("invalid order command frame: {error}"))
+    })?;
+    let events = if value.is_array() {
+        serde_json::from_value::<Vec<PlatformOrderCommandEvent>>(value)
+    } else {
+        serde_json::from_value::<PlatformOrderCommandEvent>(value).map(|event| vec![event])
+    }
+    .map_err(|error| SdkError::InvalidResponse(format!("invalid order command event: {error}")))?;
+    if events.is_empty() || events.len() > MAX_SERVER_EVENTS_PER_FRAME {
+        return Err(SdkError::InvalidResponse(
+            "order command event batch is invalid".to_owned(),
+        ));
+    }
+    Ok(events)
 }
 
 fn validate_event_sequence(
@@ -1066,5 +1092,27 @@ mod tests {
         assert_eq!(parse_wire_sequence("8").unwrap(), 8);
         assert!(parse_wire_sequence("08").is_err());
         assert!(parse_wire_sequence("-1").is_err());
+    }
+
+    #[test]
+    fn parses_ordered_event_batches_and_single_frame_fallback() {
+        let event = serde_json::json!({
+            "type": "heartbeat",
+            "schema_version": 2,
+            "contract_version": "2.0",
+            "market_id": "market_11111111111111111111111111111111",
+            "stream_id": "order_command_stream_11111111111111111111111111111111",
+            "sequence": "2",
+            "previous_sequence": "1",
+            "server_time_ms": 1_786_810_000_000u64
+        });
+        let single = parse_order_command_events(&event.to_string()).unwrap();
+        assert_eq!(single.len(), 1);
+        let batch = parse_order_command_events(
+            &serde_json::Value::Array(vec![event.clone(), event]).to_string(),
+        )
+        .unwrap();
+        assert_eq!(batch.len(), 2);
+        assert!(parse_order_command_events("[]").is_err());
     }
 }
