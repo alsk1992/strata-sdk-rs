@@ -12,6 +12,7 @@ use super::*;
 pub const ORDER_STREAM_AUTH_DOMAIN: &str = "strata:order-command-stream:v2";
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 const EVENT_BUFFER: usize = 1_024;
+const MAX_CLIENT_COMMANDS_PER_FRAME: usize = 64;
 const MAX_SERVER_EVENTS_PER_FRAME: usize = 64;
 
 #[derive(Clone, Debug)]
@@ -147,6 +148,7 @@ impl OrderCommandStream {
                     owner_wallet: owner_wallet.clone(),
                     session_public_key: session_public_key.clone(),
                     signature: bs58::encode(signature).into_string(),
+                    batch_format: Some(PlatformOrderCommandBatchFormat::CompactV1),
                 })
                 .map_err(|error| SdkError::InvalidRequest(error.to_string()))?
                 .into(),
@@ -249,6 +251,33 @@ impl OrderCommandStream {
             .await
             .map_err(|_| SdkError::Stream("order command timed out".to_owned()))?
             .map_err(|_| SdkError::Stream("order command actor stopped".to_owned()))?
+    }
+
+    /// Authenticated non-trading round trip for health and latency measurement.
+    pub async fn probe(&self, nonce: &str) -> Result<(), SdkError> {
+        if nonce.is_empty()
+            || nonce.len() > 64
+            || !nonce
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        {
+            return Err(SdkError::InvalidRequest(
+                "order command probe nonce is invalid".to_owned(),
+            ));
+        }
+        match self
+            .command(PlatformOrderCommand::Probe {
+                nonce: nonce.to_owned(),
+            })
+            .await?
+        {
+            PlatformOrderCommandEvent::ProbeResult {
+                nonce: returned, ..
+            } if returned == nonce => Ok(()),
+            _ => Err(SdkError::InvalidResponse(
+                "order command probe result is invalid".to_owned(),
+            )),
+        }
     }
 
     pub async fn challenge(
@@ -698,27 +727,51 @@ async fn run_actor<S>(
                     let _ = socket.close(None).await;
                     break "order command handle closed".to_owned();
                 };
-                client_sequence = client_sequence.saturating_add(1);
-                request_counter = request_counter.saturating_add(1);
-                let request_id = format!("rust-{request_counter:x}");
-                let frame = PlatformOrderCommandClientFrame::Command {
-                    request_id: request_id.clone(),
-                    sequence: client_sequence.to_string(),
-                    command: request.command,
-                };
-                let message = match serde_json::to_string(&frame) {
+                let mut requests = Vec::with_capacity(MAX_CLIENT_COMMANDS_PER_FRAME);
+                requests.push(request);
+                // Give concurrently queued callers one scheduler turn to join
+                // this transport batch. Each command keeps its own sequence,
+                // request ID and response channel.
+                tokio::task::yield_now().await;
+                while requests.len() < MAX_CLIENT_COMMANDS_PER_FRAME {
+                    match commands.try_recv() {
+                        Ok(request) => requests.push(request),
+                        Err(mpsc::error::TryRecvError::Empty | mpsc::error::TryRecvError::Disconnected) => break,
+                    }
+                }
+                let mut frames = Vec::with_capacity(requests.len());
+                let mut responses = Vec::with_capacity(requests.len());
+                for request in requests {
+                    client_sequence = client_sequence.saturating_add(1);
+                    request_counter = request_counter.saturating_add(1);
+                    let request_id = format!("rust-{request_counter:x}");
+                    frames.push(PlatformOrderCommandClientFrame::Command {
+                        request_id: request_id.clone(),
+                        sequence: client_sequence.to_string(),
+                        command: request.command,
+                    });
+                    responses.push((request_id, request.response));
+                }
+                let message = match encode_order_command_frames(&frames) {
                     Ok(message) => message,
                     Err(error) => {
-                        let _ = request.response.send(Err(SdkError::InvalidRequest(error.to_string())));
-                        continue;
+                        let text = error.to_string();
+                        for (_, response) in responses {
+                            let _ = response.send(Err(SdkError::InvalidRequest(text.clone())));
+                        }
+                        break text;
                     }
                 };
                 if let Err(error) = socket.send(Message::Text(message.into())).await {
                     let text = error.to_string();
-                    let _ = request.response.send(Err(SdkError::Stream(text.clone())));
+                    for (_, response) in responses {
+                        let _ = response.send(Err(SdkError::Stream(text.clone())));
+                    }
                     break text;
                 }
-                pending.insert(request_id, request.response);
+                for (request_id, response) in responses {
+                    pending.insert(request_id, response);
+                }
             }
             incoming = socket.next() => {
                 let Some(incoming) = incoming else {
@@ -779,12 +832,28 @@ async fn run_actor<S>(
     }
 }
 
+fn encode_order_command_frames(
+    frames: &[PlatformOrderCommandClientFrame],
+) -> Result<String, serde_json::Error> {
+    if frames.len() == 1 {
+        serde_json::to_string(&frames[0])
+    } else {
+        serde_json::to_string(frames)
+    }
+}
+
 fn parse_order_command_events(message: &str) -> Result<Vec<PlatformOrderCommandEvent>, SdkError> {
     let value: serde_json::Value = serde_json::from_str(message).map_err(|error| {
         SdkError::InvalidResponse(format!("invalid order command frame: {error}"))
     })?;
     let events = if value.is_array() {
         serde_json::from_value::<Vec<PlatformOrderCommandEvent>>(value)
+    } else if value.get("type").and_then(serde_json::Value::as_str) == Some("event_batch") {
+        return serde_json::from_value::<PlatformOrderCommandServerFrame>(value)
+            .map_err(|error| {
+                SdkError::InvalidResponse(format!("invalid order command event batch: {error}"))
+            })
+            .and_then(expand_order_command_event_batch);
     } else {
         serde_json::from_value::<PlatformOrderCommandEvent>(value).map(|event| vec![event])
     }
@@ -795,6 +864,259 @@ fn parse_order_command_events(message: &str) -> Result<Vec<PlatformOrderCommandE
         ));
     }
     Ok(events)
+}
+
+fn expand_order_command_event_batch(
+    frame: PlatformOrderCommandServerFrame,
+) -> Result<Vec<PlatformOrderCommandEvent>, SdkError> {
+    let PlatformOrderCommandServerFrame::EventBatch {
+        schema_version,
+        contract_version,
+        market_id,
+        stream_id,
+        first_sequence,
+        previous_sequence,
+        server_time_ms,
+        events,
+    } = frame;
+    if events.is_empty() || events.len() > MAX_SERVER_EVENTS_PER_FRAME {
+        return Err(SdkError::InvalidResponse(
+            "order command event batch is invalid".to_owned(),
+        ));
+    }
+    let first = parse_wire_sequence(&first_sequence)?;
+    let previous = parse_wire_sequence(&previous_sequence)?;
+    if first
+        != previous.checked_add(1).ok_or_else(|| {
+            SdkError::InvalidResponse("order command event batch sequence overflowed".to_owned())
+        })?
+    {
+        return Err(SdkError::InvalidResponse(
+            "order command event batch sequence is invalid".to_owned(),
+        ));
+    }
+    events
+        .into_iter()
+        .enumerate()
+        .map(|(index, event)| {
+            let sequence = first
+                .checked_add(u64::try_from(index).map_err(|_| {
+                    SdkError::InvalidResponse("order command event batch is too large".to_owned())
+                })?)
+                .ok_or_else(|| {
+                    SdkError::InvalidResponse(
+                        "order command event batch sequence overflowed".to_owned(),
+                    )
+                })?;
+            let previous_sequence = sequence.saturating_sub(1).to_string();
+            let sequence = sequence.to_string();
+            let common = || {
+                (
+                    schema_version,
+                    contract_version.clone(),
+                    market_id.clone(),
+                    stream_id.clone(),
+                    sequence.clone(),
+                    previous_sequence.clone(),
+                    server_time_ms,
+                )
+            };
+            Ok(match event {
+                PlatformOrderCommandBatchEvent::ProbeResult { request_id, nonce } => {
+                    let (
+                        schema_version,
+                        contract_version,
+                        market_id,
+                        stream_id,
+                        sequence,
+                        previous_sequence,
+                        server_time_ms,
+                    ) = common();
+                    PlatformOrderCommandEvent::ProbeResult {
+                        schema_version,
+                        contract_version,
+                        market_id,
+                        stream_id,
+                        sequence,
+                        previous_sequence,
+                        request_id,
+                        nonce,
+                        server_time_ms,
+                    }
+                }
+                PlatformOrderCommandBatchEvent::ChallengeResult {
+                    request_id,
+                    self_trade_prevention,
+                    prevented_order_ids,
+                    effective_request,
+                    response,
+                } => {
+                    let (
+                        schema_version,
+                        contract_version,
+                        market_id,
+                        stream_id,
+                        sequence,
+                        previous_sequence,
+                        server_time_ms,
+                    ) = common();
+                    PlatformOrderCommandEvent::ChallengeResult {
+                        schema_version,
+                        contract_version,
+                        market_id,
+                        stream_id,
+                        sequence,
+                        previous_sequence,
+                        request_id,
+                        self_trade_prevention,
+                        prevented_order_ids,
+                        effective_request,
+                        response,
+                        server_time_ms,
+                    }
+                }
+                PlatformOrderCommandBatchEvent::PrepareResult {
+                    request_id,
+                    response,
+                } => {
+                    let (
+                        schema_version,
+                        contract_version,
+                        market_id,
+                        stream_id,
+                        sequence,
+                        previous_sequence,
+                        server_time_ms,
+                    ) = common();
+                    PlatformOrderCommandEvent::PrepareResult {
+                        schema_version,
+                        contract_version,
+                        market_id,
+                        stream_id,
+                        sequence,
+                        previous_sequence,
+                        request_id,
+                        response,
+                        server_time_ms,
+                    }
+                }
+                PlatformOrderCommandBatchEvent::SubmitResult {
+                    request_id,
+                    response,
+                } => {
+                    let (
+                        schema_version,
+                        contract_version,
+                        market_id,
+                        stream_id,
+                        sequence,
+                        previous_sequence,
+                        server_time_ms,
+                    ) = common();
+                    PlatformOrderCommandEvent::SubmitResult {
+                        schema_version,
+                        contract_version,
+                        market_id,
+                        stream_id,
+                        sequence,
+                        previous_sequence,
+                        request_id,
+                        response,
+                        server_time_ms,
+                    }
+                }
+                PlatformOrderCommandBatchEvent::StatusResult {
+                    request_id,
+                    response,
+                } => {
+                    let (
+                        schema_version,
+                        contract_version,
+                        market_id,
+                        stream_id,
+                        sequence,
+                        previous_sequence,
+                        server_time_ms,
+                    ) = common();
+                    PlatformOrderCommandEvent::StatusResult {
+                        schema_version,
+                        contract_version,
+                        market_id,
+                        stream_id,
+                        sequence,
+                        previous_sequence,
+                        request_id,
+                        response,
+                        server_time_ms,
+                    }
+                }
+                PlatformOrderCommandBatchEvent::DeadManResult { request_id, state } => {
+                    let (
+                        schema_version,
+                        contract_version,
+                        market_id,
+                        stream_id,
+                        sequence,
+                        previous_sequence,
+                        server_time_ms,
+                    ) = common();
+                    PlatformOrderCommandEvent::DeadManResult {
+                        schema_version,
+                        contract_version,
+                        market_id,
+                        stream_id,
+                        sequence,
+                        previous_sequence,
+                        request_id,
+                        state,
+                        server_time_ms,
+                    }
+                }
+                PlatformOrderCommandBatchEvent::CommandError { request_id, error } => {
+                    let (
+                        schema_version,
+                        contract_version,
+                        market_id,
+                        stream_id,
+                        sequence,
+                        previous_sequence,
+                        server_time_ms,
+                    ) = common();
+                    PlatformOrderCommandEvent::CommandError {
+                        schema_version,
+                        contract_version,
+                        market_id,
+                        stream_id,
+                        sequence,
+                        previous_sequence,
+                        request_id,
+                        error,
+                        server_time_ms,
+                    }
+                }
+                PlatformOrderCommandBatchEvent::Heartbeat => {
+                    let (
+                        schema_version,
+                        contract_version,
+                        market_id,
+                        stream_id,
+                        sequence,
+                        previous_sequence,
+                        server_time_ms,
+                    ) = common();
+                    PlatformOrderCommandEvent::Heartbeat {
+                        schema_version,
+                        contract_version,
+                        market_id,
+                        stream_id,
+                        sequence,
+                        previous_sequence,
+                        server_time_ms,
+                    }
+                }
+            })
+        })
+        .collect()
 }
 
 fn validate_event_sequence(
@@ -828,7 +1150,16 @@ fn event_sequence(
     event: &PlatformOrderCommandEvent,
 ) -> Option<(u16, &str, &str, &str, &str, &str)> {
     match event {
-        PlatformOrderCommandEvent::ChallengeResult {
+        PlatformOrderCommandEvent::ProbeResult {
+            schema_version,
+            contract_version,
+            market_id,
+            stream_id,
+            sequence,
+            previous_sequence,
+            ..
+        }
+        | PlatformOrderCommandEvent::ChallengeResult {
             schema_version,
             contract_version,
             market_id,
@@ -905,7 +1236,8 @@ fn event_sequence(
 
 fn event_request_id(event: &PlatformOrderCommandEvent) -> Option<&str> {
     match event {
-        PlatformOrderCommandEvent::ChallengeResult { request_id, .. }
+        PlatformOrderCommandEvent::ProbeResult { request_id, .. }
+        | PlatformOrderCommandEvent::ChallengeResult { request_id, .. }
         | PlatformOrderCommandEvent::PrepareResult { request_id, .. }
         | PlatformOrderCommandEvent::SubmitResult { request_id, .. }
         | PlatformOrderCommandEvent::StatusResult { request_id, .. }
@@ -1113,6 +1445,60 @@ mod tests {
         )
         .unwrap();
         assert_eq!(batch.len(), 2);
+        let compact = serde_json::json!({
+            "type": "event_batch",
+            "schema_version": 2,
+            "contract_version": "2.0",
+            "market_id": "market_11111111111111111111111111111111",
+            "stream_id": "order_command_stream_11111111111111111111111111111111",
+            "first_sequence": "2",
+            "previous_sequence": "1",
+            "server_time_ms": 1_786_810_000_000u64,
+            "events": [
+                {
+                    "type": "probe_result",
+                    "request_id": "probe-1",
+                    "nonce": "health-1"
+                },
+                {"type": "heartbeat"}
+            ]
+        });
+        let compact = parse_order_command_events(&compact.to_string()).unwrap();
+        assert_eq!(compact.len(), 2);
+        assert!(matches!(
+            &compact[0],
+            PlatformOrderCommandEvent::ProbeResult {
+                sequence,
+                previous_sequence,
+                request_id,
+                nonce,
+                ..
+            } if sequence == "2"
+                && previous_sequence == "1"
+                && request_id == "probe-1"
+                && nonce == "health-1"
+        ));
+        assert!(matches!(
+            &compact[1],
+            PlatformOrderCommandEvent::Heartbeat { sequence, previous_sequence, .. }
+                if sequence == "3" && previous_sequence == "2"
+        ));
         assert!(parse_order_command_events("[]").is_err());
+    }
+
+    #[test]
+    fn encodes_single_commands_compatibly_and_concurrent_commands_as_one_batch() {
+        let frame = |request_id: &str, sequence: &str| PlatformOrderCommandClientFrame::Command {
+            request_id: request_id.to_owned(),
+            sequence: sequence.to_owned(),
+            command: PlatformOrderCommand::DeadManStatus,
+        };
+        let singleton = encode_order_command_frames(&[frame("one", "1")]).unwrap();
+        assert!(serde_json::from_str::<serde_json::Value>(&singleton)
+            .unwrap()
+            .is_object());
+        let batch = encode_order_command_frames(&[frame("two", "2"), frame("three", "3")]).unwrap();
+        let decoded = serde_json::from_str::<Vec<PlatformOrderCommandClientFrame>>(&batch).unwrap();
+        assert_eq!(decoded.len(), 2);
     }
 }
