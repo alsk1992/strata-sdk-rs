@@ -22,10 +22,12 @@ use thiserror::Error;
 pub use strata_public_contract::platform::{
     PlatformDeadManState, PlatformDeadManStatus, PlatformOrderAction, PlatformOrderBatchOperation,
     PlatformOrderChallengeRequest, PlatformOrderChallengeResponse, PlatformOrderCommand,
-    PlatformOrderCommandClientFrame, PlatformOrderCommandEvent, PlatformOrderControlStatus,
-    PlatformOrderPrepareRequest, PlatformOrderPrepareResponse, PlatformOrderStatusRequest,
-    PlatformOrderStatusResponse, PlatformOrderSubmissionStatus, PlatformOrderSubmitRequest,
-    PlatformOrderSubmitResponse, PlatformOrderType, PlatformSelfTradePrevention, PlatformTradeSide,
+    PlatformOrderCommandBatchEvent, PlatformOrderCommandBatchFormat,
+    PlatformOrderCommandClientFrame, PlatformOrderCommandEvent, PlatformOrderCommandServerFrame,
+    PlatformOrderControlStatus, PlatformOrderPrepareRequest, PlatformOrderPrepareResponse,
+    PlatformOrderStatusRequest, PlatformOrderStatusResponse, PlatformOrderSubmissionStatus,
+    PlatformOrderSubmitRequest, PlatformOrderSubmitResponse, PlatformOrderType,
+    PlatformSelfTradePrevention, PlatformTradeSide,
 };
 pub use strata_public_contract::{
     ActionAuthorityModel, ActionEdge, ActionGraph, ActionNode, ActionNodeKind, ActionOperation,

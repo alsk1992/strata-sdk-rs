@@ -586,6 +586,10 @@ pub enum PlatformSelfTradePrevention {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PlatformOrderCommand {
+    /// Authenticated non-trading round trip used for latency certification.
+    Probe {
+        nonce: String,
+    },
     Challenge {
         request: PlatformOrderChallengeRequest,
         self_trade_prevention: PlatformSelfTradePrevention,
@@ -610,7 +614,10 @@ pub enum PlatformOrderCommand {
 
 /// Frames sent by an external agent. Authentication proves possession of the
 /// declared session key; individual order authorizations and transactions keep
-/// their existing exact external-signing boundaries.
+/// their existing exact external-signing boundaries. Authentication is a
+/// singleton frame. After authentication, the transport accepts either one
+/// command or a bounded array of commands; every command retains its own
+/// request ID and contiguous sequence.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PlatformOrderCommandClientFrame {
@@ -619,11 +626,76 @@ pub enum PlatformOrderCommandClientFrame {
         session_public_key: String,
         /// Base58 Ed25519 signature over the stream authentication payload.
         signature: String,
+        /// Optional negotiated result framing. Omitted clients retain the
+        /// complete-event array format.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        batch_format: Option<PlatformOrderCommandBatchFormat>,
     },
     Command {
         request_id: String,
         sequence: String,
         command: PlatformOrderCommand,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlatformOrderCommandBatchFormat {
+    CompactV1,
+}
+
+/// One result inside a compact event batch. Shared stream identity, time and
+/// sequence metadata live on the enclosing frame; request correlation and
+/// command-specific results remain independent.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PlatformOrderCommandBatchEvent {
+    ProbeResult {
+        request_id: String,
+        nonce: String,
+    },
+    ChallengeResult {
+        request_id: String,
+        self_trade_prevention: PlatformSelfTradePrevention,
+        prevented_order_ids: Vec<String>,
+        effective_request: PlatformOrderChallengeRequest,
+        response: PlatformOrderChallengeResponse,
+    },
+    PrepareResult {
+        request_id: String,
+        response: PlatformOrderPrepareResponse,
+    },
+    SubmitResult {
+        request_id: String,
+        response: PlatformOrderSubmitResponse,
+    },
+    StatusResult {
+        request_id: String,
+        response: PlatformOrderStatusResponse,
+    },
+    DeadManResult {
+        request_id: String,
+        state: PlatformDeadManState,
+    },
+    CommandError {
+        request_id: String,
+        error: PublicOperationError,
+    },
+    Heartbeat,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PlatformOrderCommandServerFrame {
+    EventBatch {
+        schema_version: u16,
+        contract_version: String,
+        market_id: String,
+        stream_id: String,
+        first_sequence: String,
+        previous_sequence: String,
+        server_time_ms: u64,
+        events: Vec<PlatformOrderCommandBatchEvent>,
     },
 }
 
@@ -672,6 +744,17 @@ pub enum PlatformOrderCommandEvent {
         market_id: String,
         stream_id: String,
         sequence: String,
+        server_time_ms: u64,
+    },
+    ProbeResult {
+        schema_version: u16,
+        contract_version: String,
+        market_id: String,
+        stream_id: String,
+        sequence: String,
+        previous_sequence: String,
+        request_id: String,
+        nonce: String,
         server_time_ms: u64,
     },
     ChallengeResult {
