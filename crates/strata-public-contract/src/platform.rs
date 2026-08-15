@@ -650,9 +650,11 @@ pub struct PlatformDeadManState {
     pub updated_at_ms: u64,
 }
 
-/// Sequenced frames emitted by the persistent order-control connection. Every
-/// command result is correlated by the caller's request ID; terminal chain
-/// status may arrive later without blocking command submission.
+/// One sequenced event emitted by the persistent order-control connection.
+/// After authentication, the transport carries bounded arrays of these events
+/// so concurrent results share frame overhead without weakening per-event
+/// sequence or request correlation. Terminal chain status may arrive later
+/// without blocking command submission.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PlatformOrderCommandEvent {
