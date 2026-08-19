@@ -3011,12 +3011,14 @@ mod tests {
             PlatformOrderPrepareRequest::Direct(PlatformOrderChallengeRequest::CancelAll { .. })
         ));
         // Neither shape tolerates a stray field.
-        assert!(serde_json::from_value::<PlatformOrderPrepareRequest>(serde_json::json!({
-            "challenge_id": "oc_0123456789abcdef0123456789abcdef",
-            "authorization_signature": "1111",
-            "extra": true,
-        }))
-        .is_err());
+        assert!(
+            serde_json::from_value::<PlatformOrderPrepareRequest>(serde_json::json!({
+                "challenge_id": "oc_0123456789abcdef0123456789abcdef",
+                "authorization_signature": "1111",
+                "extra": true,
+            }))
+            .is_err()
+        );
         let twap: PlatformTwapPrepareRequest = serde_json::from_value(serde_json::json!({
             "action": "cancel",
             "owner_wallet": "5Ji61Fbeb22Yntgv1hhHeSSLgdEdZchHeM1Tv1MjGhSL",
@@ -3031,6 +3033,9 @@ mod tests {
             "session_public_key": "9Uu7cLBgfMk233BAjMvTS8XJy6KbZK7oQ7NXuCTi3Fg2",
         }))
         .unwrap();
-        assert!(matches!(execution, crate::ExecutionPrepareRequest::Direct(_)));
+        assert!(matches!(
+            execution,
+            crate::ExecutionPrepareRequest::Direct(_)
+        ));
     }
 }
