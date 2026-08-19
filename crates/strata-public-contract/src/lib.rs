@@ -11,8 +11,11 @@ pub mod platform;
 
 pub const CONTRACT_MAJOR: u16 = 1;
 pub const CONTRACT_VERSION: &str = "1.1";
-/// Exact-output default for the current read-only quote surface.
-pub const DEFAULT_SLIPPAGE_BPS: u16 = 0;
+/// Default maximum tolerance: zero, so a quote is exact unless the caller opts
+/// into a lower floor. Tolerance is the caller's choice; it is not price impact.
+pub const DEFAULT_MAXIMUM_TOLERANCE_BPS: u16 = 0;
+/// Legacy name for [`DEFAULT_MAXIMUM_TOLERANCE_BPS`].
+pub const DEFAULT_SLIPPAGE_BPS: u16 = DEFAULT_MAXIMUM_TOLERANCE_BPS;
 
 /// Canonical v1 examples used to prove cross-language contract parity.
 ///
@@ -108,12 +111,26 @@ pub enum QuoteSide {
 pub struct QuoteRequest {
     pub market_id: String,
     pub side: QuoteSide,
-    /// Atomic input amount encoded as a base-10 string. Public money values
-    /// never cross JSON as floating-point numbers.
-    pub amount_in_atoms: String,
-    /// Maximum execution tolerance. Use [`DEFAULT_SLIPPAGE_BPS`] for an exact
-    /// read-only quote.
-    pub slippage_bps: u16,
+    /// Exact-input quote: atomic input amount encoded as a base-10 string.
+    /// Public money values never cross JSON as floating-point numbers. Provide
+    /// exactly one of `amount_in_atoms` and `amount_out_atoms`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amount_in_atoms: Option<String>,
+    /// Exact-output quote: the atomic output the caller wants. Strata inverts
+    /// its best route at quote time and returns the input that delivers it as
+    /// `amount_in_atoms` (no cushion of its own); `minimum_output_atoms` is
+    /// this amount lowered by `maximum_tolerance_bps` exactly as for exact
+    /// input — zero by default, so execution delivers the requested amount or
+    /// fails.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amount_out_atoms: Option<String>,
+    /// The most the caller accepts below the quoted output, in basis points.
+    /// This is the caller's choice and has nothing to do with
+    /// `price_impact_pct`, which is measured from the book. Zero (the
+    /// default) means the quoted output exactly. `slippage_bps` is accepted
+    /// as a legacy spelling.
+    #[serde(alias = "slippage_bps")]
+    pub maximum_tolerance_bps: u16,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -131,19 +148,28 @@ pub struct QuoteResponse {
     pub amount_in_atoms: String,
     /// Requested input actually consumed by the quoted execution.
     pub amount_in_consumed_atoms: String,
-    /// User-net output after `output_fee_atoms`. Gross route output for
-    /// external route-quality comparison is their exact atomic sum.
+    /// User-net output after `output_fee_atoms`. Gross pre-fee output is their
+    /// exact atomic sum.
     pub amount_out_atoms: String,
-    /// User-net execution floor after fees and requested tolerance.
+    /// User-net execution floor: `amount_out_atoms` lowered by
+    /// `maximum_tolerance_bps` (after fees). Execution delivers at least this
+    /// or does not happen.
     pub minimum_output_atoms: String,
     /// Fees charged in the request's input asset. Sonar can charge fees on
     /// either side, so a single unlabelled fee is unsafe.
     pub input_fee_atoms: String,
     /// Strata fee charged in the response's output asset. It is reported
-    /// separately so route quality and all-in user economics cannot be mixed.
+    /// separately so pre-fee and all-in user economics cannot be mixed.
     pub output_fee_atoms: String,
+    /// The caller's tolerance echoed back: the most they accept below
+    /// `amount_out_atoms`, already applied in `minimum_output_atoms`. It is a
+    /// choice, not a measurement — compare `price_impact_pct`.
+    pub maximum_tolerance_bps: u16,
     /// Display-only decimal strings. SDKs may parse these for presentation but
     /// must not use them for settlement or signing bounds.
+    /// `reference_price` is the best price before the order; `price_impact_pct`
+    /// is how far the quoted fills' average price sits from it, measured from
+    /// the book. It is not a setting and is unrelated to `maximum_tolerance_bps`.
     pub reference_price: String,
     pub price_impact_pct: String,
     pub provider: String,
@@ -160,7 +186,10 @@ pub struct ExecutionChallengeRequest {
     pub session_public_key: String,
     /// Vault-owned Market account sequence encoded as an unsigned decimal
     /// string. It prevents a prepared internal fill from targeting stale state.
-    pub account_sequence: String,
+    /// Omit it and Strata resolves the next sequence from the Vault's confirmed
+    /// market account when the challenge is issued.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_sequence: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -181,12 +210,24 @@ pub struct ExecutionChallengeResponse {
     pub expires_at_ms: u64,
 }
 
+/// A prepared execution challenge, signed: the two-step path.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct ExecutionPrepareRequest {
+pub struct ExecutionPrepareAuthorization {
     pub challenge_id: String,
     /// Base58 Ed25519 signature over `authorization_payload_base64`.
     pub authorization_signature: String,
+}
+
+/// Prepare a quote-bound execution transaction: a signed challenge
+/// (`Authorized`) or the quote binding itself (`Direct`, one signature — the
+/// session's transaction signature is the authorization). The response is
+/// identical.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum ExecutionPrepareRequest {
+    Authorized(ExecutionPrepareAuthorization),
+    Direct(ExecutionChallengeRequest),
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -840,6 +881,7 @@ mod tests {
             "expires_at_ms",
             "input_fee_atoms",
             "market_id",
+            "maximum_tolerance_bps",
             "minimum_output_atoms",
             "output_fee_atoms",
             "price_impact_pct",
@@ -854,7 +896,22 @@ mod tests {
         assert_eq!(actual, expected, "public quote fields must remain sealed");
         assert_eq!(object["amount_out_atoms"], "1990000");
         assert_eq!(object["minimum_output_atoms"], "1980050");
+        assert_eq!(object["maximum_tolerance_bps"], 50);
         assert_eq!(object["provider"], "Sonar");
+
+        // The request field is `maximum_tolerance_bps`; the legacy spelling
+        // still deserializes so older clients keep working.
+        let legacy: QuoteRequest = serde_json::from_value(serde_json::json!({
+            "market_id": "11111111111111111111111111111111",
+            "side": "sell",
+            "amount_in_atoms": "10000000",
+            "slippage_bps": 25
+        }))
+        .unwrap();
+        assert_eq!(legacy.maximum_tolerance_bps, 25);
+        assert!(serde_json::to_string(&legacy)
+            .unwrap()
+            .contains("\"maximum_tolerance_bps\":25"));
     }
 
     #[test]
