@@ -8,10 +8,11 @@ use clap::{Parser, Subcommand, ValueEnum};
 use std::error::Error;
 use std::time::Duration;
 use strata_sdk::{
-    ExecutionChallengeRequest, ExecutionPrepareRequest, ExecutionSubmitRequest,
-    PlatformOrderBatchOperation, PlatformOrderChallengeRequest, PlatformOrderPrepareRequest,
-    PlatformOrderStatusRequest, PlatformOrderSubmitRequest, PlatformOrderType, PlatformTradeSide,
-    QuoteRequest, QuoteSide, StrataClient, DEFAULT_API_BASE, DEFAULT_SLIPPAGE_BPS,
+    ExecutionChallengeRequest, ExecutionPrepareAuthorization, ExecutionPrepareRequest,
+    ExecutionSubmitRequest, PlatformOrderBatchOperation, PlatformOrderChallengeRequest,
+    PlatformOrderPrepareAuthorization, PlatformOrderPrepareRequest, PlatformOrderStatusRequest,
+    PlatformOrderSubmitRequest, PlatformOrderType, PlatformTradeSide, QuoteRequest, QuoteSide,
+    StrataClient, DEFAULT_API_BASE, DEFAULT_MAXIMUM_TOLERANCE_BPS,
 };
 
 #[derive(Debug, Parser)]
@@ -50,12 +51,23 @@ enum Command {
         market: String,
         #[arg(long, value_enum)]
         side: Side,
-        /// Input amount in the input token's smallest atomic unit.
-        #[arg(long)]
-        amount_atoms: String,
-        /// Optional maximum execution tolerance. The default requires exact output.
-        #[arg(long, default_value_t = DEFAULT_SLIPPAGE_BPS)]
-        slippage_bps: u16,
+        /// Exact-input quote: input amount in the input token's smallest atomic
+        /// unit. Give this or `--amount-out-atoms`.
+        #[arg(long, conflicts_with = "amount_out_atoms")]
+        amount_atoms: Option<String>,
+        /// Exact-output quote: the output amount to receive at least, in the
+        /// output token's smallest atomic unit. Strata resolves the input.
+        #[arg(long, conflicts_with = "amount_atoms")]
+        amount_out_atoms: Option<String>,
+        /// The most you accept below the quoted output, in basis points. This
+        /// is your choice and unrelated to the measured price impact the quote
+        /// reports. The default 0 requires the quoted output.
+        #[arg(
+            long,
+            visible_alias = "slippage-bps",
+            default_value_t = DEFAULT_MAXIMUM_TOLERANCE_BPS
+        )]
+        tolerance_bps: u16,
     },
     /// Request quote-bound authorization bytes for an external signer.
     ExecutionChallenge {
@@ -67,8 +79,10 @@ enum Command {
         owner_wallet: String,
         #[arg(long)]
         session_public_key: String,
+        /// Vault market account sequence. Omit it and Strata resolves the next
+        /// sequence from the Vault's confirmed market account.
         #[arg(long)]
-        account_sequence: String,
+        account_sequence: Option<String>,
     },
     /// Exchange an external authorization signature for a prepared transaction.
     ExecutionPrepare {
@@ -107,8 +121,10 @@ enum OrderCommand {
         owner_wallet: String,
         #[arg(long)]
         session_public_key: String,
+        /// Vault market account sequence. Omit it and Strata resolves the next
+        /// sequence from the Vault's confirmed market account.
         #[arg(long)]
-        account_sequence: String,
+        account_sequence: Option<String>,
         #[arg(long)]
         client_order_id: String,
         #[arg(long, value_enum)]
@@ -150,8 +166,11 @@ enum OrderCommand {
         session_public_key: String,
         #[arg(long)]
         order_id: String,
+        /// Vault market account sequence for the replacement. Omit it and
+        /// Strata resolves the next sequence from the Vault's confirmed
+        /// market account.
         #[arg(long)]
-        account_sequence: String,
+        account_sequence: Option<String>,
         #[arg(long)]
         client_order_id: String,
         #[arg(long, value_enum)]
@@ -314,14 +333,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
             market,
             side,
             amount_atoms,
-            slippage_bps,
+            amount_out_atoms,
+            tolerance_bps,
         } => {
             let quote = client
                 .quote(QuoteRequest {
                     market_id: market,
                     side: side.into(),
                     amount_in_atoms: amount_atoms,
-                    slippage_bps,
+                    amount_out_atoms,
+                    maximum_tolerance_bps: tolerance_bps,
                 })
                 .await?;
             if cli.json {
@@ -335,7 +356,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 println!("  input fee:      {}", quote.input_fee_atoms);
                 println!("  output fee:     {}", quote.output_fee_atoms);
                 println!("  reference:      {}", quote.reference_price);
-                println!("  price impact:   {}%", quote.price_impact_pct);
+                println!(
+                    "  price impact:   {}%  (measured from the book)",
+                    quote.price_impact_pct
+                );
+                println!(
+                    "  tolerance:      {} bps  (yours; floor = minimum atoms)",
+                    quote.maximum_tolerance_bps
+                );
                 println!(
                     "  valid for:       {} ms",
                     quote.expires_at_ms.saturating_sub(quote.server_time_ms)
@@ -377,10 +405,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
             let prepared = client
                 .execution_prepare(
                     &market,
-                    ExecutionPrepareRequest {
+                    ExecutionPrepareRequest::Authorized(ExecutionPrepareAuthorization {
                         challenge_id,
                         authorization_signature,
-                    },
+                    }),
                 )
                 .await?;
             if cli.json {
@@ -536,10 +564,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 let prepared = client
                     .order_prepare(
                         &market_id,
-                        PlatformOrderPrepareRequest {
-                            challenge_id,
-                            authorization_signature,
-                        },
+                        PlatformOrderPrepareRequest::Authorized(
+                            PlatformOrderPrepareAuthorization {
+                                challenge_id,
+                                authorization_signature: Some(authorization_signature),
+                            },
+                        ),
                     )
                     .await?;
                 if cli.json {
@@ -644,10 +674,10 @@ mod tests {
         ])
         .expect("valid quote command");
 
-        let Command::Quote { slippage_bps, .. } = cli.command else {
+        let Command::Quote { tolerance_bps, .. } = cli.command else {
             panic!("expected quote command");
         };
-        assert_eq!(slippage_bps, DEFAULT_SLIPPAGE_BPS);
+        assert_eq!(tolerance_bps, DEFAULT_MAXIMUM_TOLERANCE_BPS);
     }
 
     #[test]

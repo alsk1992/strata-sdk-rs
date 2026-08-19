@@ -316,28 +316,42 @@ impl OrderCommandStream {
         }
     }
 
+    /// Prepare an order-control transaction over the socket. `Authorized`
+    /// hands back a challenge; because this socket already authenticated the
+    /// session and the challenge is bound to it, `authorization_signature` may
+    /// be `None` (one signature: the session signs only the transaction).
+    /// `Direct` sends the operation itself.
     pub async fn prepare(
         &self,
         request: PlatformOrderPrepareRequest,
     ) -> Result<PlatformOrderPrepareResponse, SdkError> {
-        if !valid_handle(&request.challenge_id, "oc_") {
-            return Err(SdkError::InvalidRequest(
-                "order challenge_id is invalid".to_owned(),
-            ));
-        }
-        let request = PlatformOrderPrepareRequest {
-            challenge_id: request.challenge_id,
-            authorization_signature: canonical_signature(
-                &request.authorization_signature,
-                "authorization_signature",
-            )?,
+        let request = match request {
+            PlatformOrderPrepareRequest::Authorized(authorization) => {
+                PlatformOrderPrepareRequest::Authorized(normalize_order_prepare_authorization(
+                    authorization,
+                )?)
+            }
+            PlatformOrderPrepareRequest::Direct(operation) => {
+                let operation = normalize_order_challenge_request(operation)?;
+                self.ensure_request_identity(&operation)?;
+                PlatformOrderPrepareRequest::Direct(operation)
+            }
         };
         match self
-            .command(PlatformOrderCommand::Prepare { request })
+            .command(PlatformOrderCommand::Prepare {
+                request: request.clone(),
+            })
             .await?
         {
             PlatformOrderCommandEvent::PrepareResult { response, .. } => {
                 validate_prepared(&self.market_id, &response)?;
+                if let PlatformOrderPrepareRequest::Direct(operation) = &request {
+                    if response.action != order_request_action(operation) {
+                        return Err(SdkError::InvalidResponse(
+                            "prepared order action does not match request".to_owned(),
+                        ));
+                    }
+                }
                 Ok(response)
             }
             _ => Err(SdkError::InvalidResponse(
@@ -594,6 +608,11 @@ impl OrderCommandStream {
         Ok((state, transaction_expires_at_ms))
     }
 
+    /// One signature: this socket already authenticated the session and the
+    /// challenge is bound to it, so no message signature is needed — the
+    /// challenge's authorization payload is still parsed to bind the prepared
+    /// blockhash and order set, then the session signs only the transaction,
+    /// after it has been verified.
     async fn authorize_and_prepare<S, V>(
         &self,
         challenged: &OrderChallengeResult,
@@ -606,25 +625,20 @@ impl OrderCommandStream {
     {
         let authorization =
             validate_order_authorization(&challenged.response, &challenged.effective_request)?;
-        let signature = signer
-            .sign_message(&authorization.bytes)
-            .await
-            .map_err(SdkError::Signer)?;
-        if signature.len() != 64 {
-            return Err(SdkError::Signer(
-                "order authorization signature must contain 64 bytes".to_owned(),
-            ));
-        }
         let prepared = self
-            .prepare(PlatformOrderPrepareRequest {
-                challenge_id: challenged.response.challenge_id.clone(),
-                authorization_signature: bs58::encode(signature).into_string(),
-            })
+            .prepare(PlatformOrderPrepareRequest::Authorized(
+                PlatformOrderPrepareAuthorization {
+                    challenge_id: challenged.response.challenge_id.clone(),
+                    authorization_signature: None,
+                },
+            ))
             .await?;
         validate_order_prepare_binding(&prepared, &challenged.response, &authorization)?;
         verifier
             .verify(&OrderVerificationContext {
-                challenge: &challenged.response,
+                challenge: Some(&challenged.response),
+                operation: &challenged.effective_request,
+                market_id: &self.market_id,
                 prepared: &prepared,
                 owner_wallet: &self.owner_wallet,
                 session_public_key: &self.session_public_key,

@@ -3,52 +3,193 @@
 //! It provides typed requests and responses and validates compatibility, quote
 //! binding, and economic fields before returning data to the application.
 
+mod account_stream;
+mod execution_stream;
+mod maker_stream;
+mod market_stream;
 mod order_stream;
+pub mod transaction_verifier;
+mod twap_stream;
 
+pub use account_stream::{account_stream_auth_message, AccountStream, ACCOUNT_STREAM_AUTH_DOMAIN};
+pub use execution_stream::{ExecutionStream, MAX_WATCHED_EXECUTIONS};
+pub use maker_stream::{maker_stream_auth_message, MakerStream, MAKER_STREAM_AUTH_DOMAIN};
+pub use market_stream::MarketDataStream;
 pub use order_stream::{
     DeadManGuard, OrderChallengeResult, OrderCommandStream, ORDER_STREAM_AUTH_DOMAIN,
 };
+pub use transaction_verifier::{
+    decode_transaction, verify_execution_transaction, verify_order_transaction,
+    verify_twap_transaction, DecodedInstruction, DecodedTransaction, DefaultTransactionVerifier,
+    TransactionVersion,
+};
+pub use twap_stream::TwapStream;
 
 use async_trait::async_trait;
 use base64::Engine as _;
+use reqwest::header::{HeaderMap, HeaderValue};
 use reqwest::{StatusCode, Url};
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use strata_public_contract::{ErrorResponse, CONTRACT_MAJOR, CONTRACT_VERSION};
 use thiserror::Error;
 
 pub use strata_public_contract::platform::{
-    PlatformDeadManState, PlatformDeadManStatus, PlatformOrderAction, PlatformOrderBatchOperation,
-    PlatformOrderChallengeRequest, PlatformOrderChallengeResponse, PlatformOrderCommand,
-    PlatformOrderCommandBatchEvent, PlatformOrderCommandBatchFormat,
+    LivePlatformCapability, PageInfo, PageRequest, PermissionSource, PlatformAccountEvent,
+    PlatformAccountFill, PlatformAccountOrder, PlatformAccountSnapshotResponse,
+    PlatformActionGraphResponse, PlatformAsset, PlatformAssetsResponse, PlatformAuthority,
+    PlatformBestBidAskResponse, PlatformBookChange, PlatformBookLevel, PlatformBookSide,
+    PlatformBookSnapshotResponse, PlatformBugReport, PlatformBugStatus, PlatformBugSubmitRequest,
+    PlatformBugSubmitResponse, PlatformBugsResponse, PlatformCandle, PlatformCandlesResponse,
+    PlatformDeadManState, PlatformDeadManStatus, PlatformDiscoveryResponse,
+    PlatformExecutionCommand, PlatformExecutionEvent, PlatformExecutionRow, PlatformExecutionState,
+    PlatformExecutionStatusResponse, PlatformFeeScheduleResponse, PlatformGraphModule,
+    PlatformGraphRelation, PlatformMakerEvent, PlatformMakerFill, PlatformMakerProduct,
+    PlatformMakerReputationResponse, PlatformMakerReputationTier, PlatformMakerStatusResponse,
+    PlatformMakerTierProgress, PlatformMarkResponse, PlatformMarket, PlatformMarketAction,
+    PlatformMarketDataEvent, PlatformMarketState, PlatformMarketStatusResponse,
+    PlatformMarketsResponse, PlatformOperation, PlatformOperationTransport, PlatformOrderAction,
+    PlatformOrderBatchOperation, PlatformOrderChallengeRequest, PlatformOrderChallengeResponse,
+    PlatformOrderCommand, PlatformOrderCommandBatchEvent, PlatformOrderCommandBatchFormat,
     PlatformOrderCommandClientFrame, PlatformOrderCommandEvent, PlatformOrderCommandServerFrame,
-    PlatformOrderControlStatus, PlatformOrderPrepareRequest, PlatformOrderPrepareResponse,
-    PlatformOrderStatusRequest, PlatformOrderStatusResponse, PlatformOrderSubmissionStatus,
-    PlatformOrderSubmitRequest, PlatformOrderSubmitResponse, PlatformOrderType,
-    PlatformSelfTradePrevention, PlatformTradeSide,
+    PlatformOrderControlStatus, PlatformOrderPrepareAuthorization, PlatformOrderPrepareRequest,
+    PlatformOrderPrepareResponse, PlatformOrderState, PlatformOrderStatusRequest,
+    PlatformOrderStatusResponse, PlatformOrderSubmissionStatus, PlatformOrderSubmitRequest,
+    PlatformOrderSubmitResponse, PlatformOrderType, PlatformOwnerRewards,
+    PlatformPortfolioHistoryPoint, PlatformPortfolioHistoryRange, PlatformPortfolioHistoryResponse,
+    PlatformPortfolioResponse, PlatformReferralClaimRequest, PlatformReferralClaimResponse,
+    PlatformReferralLinkRequest, PlatformReferralLinkResponse, PlatformReferralsResponse,
+    PlatformRewardStanding, PlatformRewardsResponse, PlatformSelfTradePrevention,
+    PlatformServiceState, PlatformServiceStatusResponse, PlatformSettlementState,
+    PlatformSwapQuoteRequest, PlatformSwapQuoteResponse, PlatformTrade, PlatformTradeSide,
+    PlatformTradesResponse, PlatformTransport, PlatformTwap, PlatformTwapChallengeRequest,
+    PlatformTwapChallengeResponse, PlatformTwapControlAction, PlatformTwapEvent, PlatformTwapFill,
+    PlatformTwapPrepareAuthorization, PlatformTwapPrepareRequest, PlatformTwapPrepareResponse,
+    PlatformTwapState, PlatformTwapSubmitRequest, PlatformTwapSubmitResponse,
+    PlatformTwapsResponse, PlatformVaultAction, PlatformVaultDelegateAction,
+    PlatformVaultDelegatePrepareRequest, PlatformVaultDelegatePrepareResponse,
+    PlatformVaultDepositPrepareRequest, PlatformVaultDepositPrepareResponse,
+    PlatformVaultPausePrepareRequest, PlatformVaultPausePrepareResponse,
+    PlatformVaultPolicyPrepareRequest, PlatformVaultPolicyPrepareResponse,
+    PlatformVaultSessionState, PlatformVaultSessionStatus, PlatformVaultSetupMode,
+    PlatformVaultSetupPrepareRequest, PlatformVaultSetupPrepareResponse,
+    PlatformVaultSpendingLimit, PlatformVaultState, PlatformVaultStatusResponse,
+    PlatformVaultSubmissionStatus, PlatformVaultSubmitRequest, PlatformVaultSubmitResponse,
+    PlatformVaultWithdrawPrepareRequest, PlatformVaultWithdrawPrepareResponse,
+    PlatformVaultWithdrawalAccess, PlatformVaultWithdrawalMode, PlatformWorkflow,
+    PlatformWorkflowEdge, PlatformWorkflowNode, SigningLocation,
+    PLATFORM_SESSION_DEFAULT_MAXIMUM_TOLERANCE_BPS,
+    PLATFORM_SESSION_DEFAULT_MINIMUM_INTERVAL_SECONDS, PLATFORM_SESSION_MAX_SPENDING_LIMITS,
 };
 pub use strata_public_contract::{
     ActionAuthorityModel, ActionEdge, ActionGraph, ActionNode, ActionNodeKind, ActionOperation,
     CapabilityCatalog, CapabilityDescriptor, CapabilityRisk, CapabilityStability,
-    ExecutionChallengeRequest, ExecutionChallengeResponse, ExecutionPrepareRequest,
-    ExecutionPrepareResponse, ExecutionStatus, ExecutionSubmitRequest, ExecutionSubmitResponse,
-    Market, MarketsResponse, McpExposure, QuoteRequest, QuoteResponse, QuoteSide,
-    DEFAULT_SLIPPAGE_BPS,
+    ExecutionChallengeRequest, ExecutionChallengeResponse, ExecutionPrepareAuthorization,
+    ExecutionPrepareRequest, ExecutionPrepareResponse, ExecutionStatus, ExecutionSubmitRequest,
+    ExecutionSubmitResponse, Market, MarketsResponse, McpExposure, QuoteRequest, QuoteResponse,
+    QuoteSide, DEFAULT_MAXIMUM_TOLERANCE_BPS, DEFAULT_SLIPPAGE_BPS,
 };
 
 pub const DEFAULT_API_BASE: &str = "https://api.stratabook.app";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
 const PUBLIC_EXECUTION_AUTH_DOMAIN: &[u8] = b"strata-sonar-execution:v1\0";
 const PUBLIC_ORDER_AUTH_DOMAIN: &[u8] = b"strata-platform-order-control:v1\0";
+const PUBLIC_TWAP_AUTH_DOMAIN: &[u8] = b"strata-twap-control:v1\0";
+const MAX_PLATFORM_PAGE_SIZE: u32 = 200;
+const DEFAULT_ACCOUNT_FILL_LIMIT: u16 = 100;
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PlatformBookRequest {
+    pub depth: Option<u16>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PlatformTradesRequest {
+    pub limit: Option<u16>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlatformCandlesRequest {
+    pub from_ms: u64,
+    pub to_ms: u64,
+    pub resolution_seconds: Option<u32>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PlatformRewardsRequest {
+    pub wallet_address: Option<String>,
+    pub limit: Option<u16>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PlatformVaultStatusRequest {
+    pub session_public_key: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PlatformAccountMarketRequest {
+    pub fill_limit: Option<u16>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PlatformAccountRequest {
+    pub fill_limit: Option<u16>,
+    /// Omit to read every currently discoverable public Strata market.
+    pub market_ids: Option<Vec<String>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlatformAccountSnapshot {
+    pub wallet_address: String,
+    pub server_time_ms: u64,
+    pub markets: Vec<PlatformAccountSnapshotResponse>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlatformMakerReputationAuthorizedRequest {
+    pub market_id: String,
+    pub wallet_address: String,
+    pub authorization_time_ms: u64,
+    pub authorization_signature: String,
+}
+
+/// Detached external authorization for the owner-scoped maker status read.
+pub type PlatformMakerStatusAuthorizedRequest = PlatformMakerReputationAuthorizedRequest;
+
+#[async_trait]
+pub trait AccountSigner: Send + Sync {
+    /// Canonical base58 wallet address whose account state is being read.
+    fn public_key(&self) -> &str;
+
+    /// Sign only the exact SDK-generated, short-lived account-read message.
+    async fn sign_message(&self, message: &[u8]) -> Result<Vec<u8>, String>;
+}
+
+/// Type-level placeholder for "no signer" (public reads).
+pub struct NoSigner;
+
+#[async_trait]
+impl AccountSigner for NoSigner {
+    fn public_key(&self) -> &str {
+        ""
+    }
+
+    async fn sign_message(&self, _message: &[u8]) -> Result<Vec<u8>, String> {
+        Err("no signer".to_owned())
+    }
+}
 
 #[async_trait]
 pub trait SessionSigner: Send + Sync {
     /// Canonical base58 Ed25519 public key registered as the Vault delegate.
     fn public_key(&self) -> &str;
 
-    /// Sign the exact SDK-validated public operation authorization.
+    /// Sign the exact SDK-validated public operation authorization. Only the
+    /// two-step challenge path needs it; the one-call `execute_*` helpers and
+    /// the order command channel are one signature over the transaction and
+    /// never call it.
     async fn sign_message(&self, message: &[u8]) -> Result<Vec<u8>, String>;
 
     /// Add only the session signature to an already-verified transaction.
@@ -59,7 +200,10 @@ pub trait SessionSigner: Send + Sync {
 pub enum OrderExecuteOperation {
     Place {
         owner_wallet: String,
-        account_sequence: String,
+        /// Vault market account sequence. `None` lets Strata resolve the next
+        /// sequence from the Vault's confirmed market account when the
+        /// transaction is prepared.
+        account_sequence: Option<String>,
         client_order_id: String,
         side: PlatformTradeSide,
         order_type: PlatformOrderType,
@@ -76,7 +220,7 @@ pub enum OrderExecuteOperation {
     Replace {
         owner_wallet: String,
         order_id: String,
-        account_sequence: String,
+        account_sequence: Option<String>,
         client_order_id: String,
         side: PlatformTradeSide,
         order_type: PlatformOrderType,
@@ -157,9 +301,16 @@ impl OrderExecuteOperation {
     }
 }
 
+/// Everything a verifier needs to decide whether the session may sign one
+/// prepared resting-order transaction.
 #[derive(Debug)]
 pub struct OrderVerificationContext<'a> {
-    pub challenge: &'a PlatformOrderChallengeResponse,
+    /// Present only on the two-step (challenge) path.
+    pub challenge: Option<&'a PlatformOrderChallengeResponse>,
+    /// The bound operation: exactly as sent (direct path) or as made
+    /// effective by the challenge (order command channel).
+    pub operation: &'a PlatformOrderChallengeRequest,
+    pub market_id: &'a str,
     pub prepared: &'a PlatformOrderPrepareResponse,
     pub owner_wallet: &'a str,
     pub session_public_key: &'a str,
@@ -172,10 +323,84 @@ pub trait OrderVerifier: Send + Sync {
     async fn verify(&self, context: &OrderVerificationContext<'_>) -> Result<(), String>;
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TwapExecuteOperation {
+    Place {
+        owner_wallet: String,
+        side: PlatformTradeSide,
+        total_size_atoms: String,
+        slices_total: u16,
+        maximum_tolerance_bps: u16,
+        interval_slots: u32,
+        limit_price_atoms: String,
+    },
+    Cancel {
+        owner_wallet: String,
+        twap_id: String,
+    },
+}
+
+impl TwapExecuteOperation {
+    fn challenge_request(&self, session_public_key: String) -> PlatformTwapChallengeRequest {
+        match self {
+            Self::Place {
+                owner_wallet,
+                side,
+                total_size_atoms,
+                slices_total,
+                maximum_tolerance_bps,
+                interval_slots,
+                limit_price_atoms,
+            } => PlatformTwapChallengeRequest::Place {
+                owner_wallet: owner_wallet.clone(),
+                session_public_key,
+                side: *side,
+                total_size_atoms: total_size_atoms.clone(),
+                slices_total: *slices_total,
+                maximum_tolerance_bps: *maximum_tolerance_bps,
+                interval_slots: *interval_slots,
+                limit_price_atoms: limit_price_atoms.clone(),
+            },
+            Self::Cancel {
+                owner_wallet,
+                twap_id,
+            } => PlatformTwapChallengeRequest::Cancel {
+                owner_wallet: owner_wallet.clone(),
+                session_public_key,
+                twap_id: twap_id.clone(),
+            },
+        }
+    }
+}
+
+/// Everything a verifier needs to decide whether the session may sign one
+/// prepared TWAP-control transaction.
+#[derive(Debug)]
+pub struct TwapVerificationContext<'a> {
+    /// Present only on the two-step (challenge) path.
+    pub challenge: Option<&'a PlatformTwapChallengeResponse>,
+    /// The requested action, exactly as sent.
+    pub operation: &'a PlatformTwapChallengeRequest,
+    pub market_id: &'a str,
+    pub prepared: &'a PlatformTwapPrepareResponse,
+    pub owner_wallet: &'a str,
+    pub session_public_key: &'a str,
+}
+
+#[async_trait]
+pub trait TwapVerifier: Send + Sync {
+    /// Reject unless the prepared transaction implements the exact bounded
+    /// TWAP action authorized by the external owner.
+    async fn verify(&self, context: &TwapVerificationContext<'_>) -> Result<(), String>;
+}
+
+/// Everything a verifier needs to decide whether the session may sign one
+/// prepared immediate execution.
 #[derive(Debug)]
 pub struct ExecutionVerificationContext<'a> {
     pub quote: &'a QuoteResponse,
-    pub challenge: &'a ExecutionChallengeResponse,
+    /// Present only on the two-step (challenge) path.
+    pub challenge: Option<&'a ExecutionChallengeResponse>,
     pub prepared: &'a ExecutionPrepareResponse,
     pub owner_wallet: &'a str,
     pub session_public_key: &'a str,
@@ -260,6 +485,1335 @@ impl StrataClient {
         OrderCommandStream::connect(self, market_id, owner_wallet, signer).await
     }
 
+    /// Open the sequenced Strata market-data stream. A sequence gap fails
+    /// closed so the caller can reconnect and recover from a new snapshot.
+    pub async fn connect_market_data(&self, market_id: &str) -> Result<MarketDataStream, SdkError> {
+        MarketDataStream::connect(self, market_id).await
+    }
+
+    /// Open the sequenced execution stream for one market, watching the opaque
+    /// handles issued by `execution.prepare`. It begins with a snapshot; a gap
+    /// fails closed so the caller reconnects and recovers.
+    pub async fn connect_executions(
+        &self,
+        market_id: &str,
+        execution_ids: &[String],
+    ) -> Result<ExecutionStream, SdkError> {
+        ExecutionStream::connect(self, market_id, execution_ids).await
+    }
+
+    /// Open the sequenced TWAP progress stream for a wallet in one market. It
+    /// begins with a snapshot and then delivers one complete sanitized TWAP row
+    /// per change; a gap fails closed so the caller reconnects and recovers.
+    pub async fn connect_twaps(
+        &self,
+        market_id: &str,
+        wallet_address: &str,
+    ) -> Result<TwapStream, SdkError> {
+        TwapStream::connect(self, market_id, wallet_address).await
+    }
+
+    /// Open the maker stream for one market by wallet address — public, no
+    /// signature: a maker snapshot followed by sequenced maker fills,
+    /// product/exposure changes, and heartbeats.
+    pub async fn connect_maker_for_wallet(
+        &self,
+        market_id: &str,
+        wallet_address: &str,
+    ) -> Result<MakerStream, SdkError> {
+        MakerStream::connect(self, market_id, wallet_address, None::<&NoSigner>).await
+    }
+
+    /// Same stream, addressed by a signer's public key; the server's
+    /// compatibility challenge is answered with the signer's signature.
+    pub async fn connect_maker<S: AccountSigner + ?Sized>(
+        &self,
+        market_id: &str,
+        signer: &S,
+    ) -> Result<MakerStream, SdkError> {
+        MakerStream::connect(self, market_id, signer.public_key(), Some(signer)).await
+    }
+
+    /// Open one externally authenticated private account stream. The signer
+    /// is used only for the server challenge and is not retained by the SDK.
+    pub async fn connect_account<S: AccountSigner + ?Sized>(
+        &self,
+        market_id: &str,
+        signer: &S,
+    ) -> Result<AccountStream, SdkError> {
+        AccountStream::connect(self, market_id, signer).await
+    }
+
+    /// Read the operations currently enabled through the public 2.0 product
+    /// contract. This response contains product capabilities only.
+    pub async fn platform_capabilities(&self) -> Result<PlatformDiscoveryResponse, SdkError> {
+        let discovery: PlatformDiscoveryResponse = self.get("v2/capabilities", &[]).await?;
+        validate_platform_discovery(&discovery)?;
+        Ok(discovery)
+    }
+
+    /// Read the complete customer-safe entity, operation, and workflow graph
+    /// projected against the capabilities that are live now.
+    pub async fn platform_action_graph(&self) -> Result<PlatformActionGraphResponse, SdkError> {
+        let graph: PlatformActionGraphResponse = self.get("v2/action-graph", &[]).await?;
+        validate_platform_action_graph(&graph)?;
+        Ok(graph)
+    }
+
+    /// Read product-level readiness without exposing internal services.
+    pub async fn platform_status(&self) -> Result<PlatformServiceStatusResponse, SdkError> {
+        let status: PlatformServiceStatusResponse = self.get("v2/status", &[]).await?;
+        validate_platform_version(status.schema_version, &status.contract_version)?;
+        Ok(status)
+    }
+
+    pub async fn platform_assets(
+        &self,
+        request: PageRequest,
+    ) -> Result<PlatformAssetsResponse, SdkError> {
+        let query = normalize_page_request(request)?;
+        let response: PlatformAssetsResponse = self.get("v2/assets", &query).await?;
+        validate_platform_version(response.schema_version, &response.contract_version)?;
+        validate_page_info(&response.page)?;
+        if response.assets.iter().any(|asset| {
+            asset.asset_id.trim().is_empty()
+                || asset.symbol.trim().is_empty()
+                || asset.name.trim().is_empty()
+                || asset.decimals > 18
+        }) {
+            return Err(SdkError::InvalidResponse(
+                "asset discovery contains an invalid public asset".to_owned(),
+            ));
+        }
+        Ok(response)
+    }
+
+    /// Request a short-lived exact-input quote between two assets returned by
+    /// [`Self::platform_assets`].
+    pub async fn platform_swap_quote(
+        &self,
+        request: PlatformSwapQuoteRequest,
+    ) -> Result<PlatformSwapQuoteResponse, SdkError> {
+        let input_asset_id = validate_platform_asset_id(&request.input_asset_id)?;
+        let output_asset_id = validate_platform_asset_id(&request.output_asset_id)?;
+        if input_asset_id == output_asset_id {
+            return Err(SdkError::InvalidRequest(
+                "input and output asset IDs must differ".to_owned(),
+            ));
+        }
+        let amount_in =
+            canonical_request_atoms(&request.amount_in_atoms, "amount_in_atoms", false)?
+                .parse::<u64>()
+                .expect("canonical atomic request was already range checked");
+        if request.maximum_tolerance_bps > 1_000 {
+            return Err(SdkError::InvalidRequest(
+                "maximum_tolerance_bps must be between 0 and 1,000".to_owned(),
+            ));
+        }
+        let quote: PlatformSwapQuoteResponse = self.post("v2/quotes", &request).await?;
+        validate_platform_version(quote.schema_version, &quote.contract_version)?;
+        if quote.provider != "Sonar"
+            || quote.input_asset_id != input_asset_id
+            || quote.output_asset_id != output_asset_id
+            || quote.amount_in_atoms != request.amount_in_atoms
+            || quote.maximum_tolerance_bps != request.maximum_tolerance_bps
+            || !valid_handle(&quote.quote_id, "sq_")
+            || quote.expires_at_ms <= quote.server_time_ms
+        {
+            return Err(SdkError::InvalidResponse(
+                "swap quote binding or lifetime is invalid".to_owned(),
+            ));
+        }
+        let consumed = validate_response_atoms(
+            &quote.amount_in_consumed_atoms,
+            "amount_in_consumed_atoms",
+            false,
+        )?;
+        let output = validate_response_atoms(&quote.amount_out_atoms, "amount_out_atoms", false)?;
+        let minimum =
+            validate_response_atoms(&quote.minimum_output_atoms, "minimum_output_atoms", true)?;
+        validate_response_atoms(&quote.input_fee_atoms, "input_fee_atoms", true)?;
+        validate_response_atoms(&quote.output_fee_atoms, "output_fee_atoms", true)?;
+        canonical_decimal(&quote.reference_price, "reference_price")?;
+        canonical_decimal(&quote.price_impact_pct, "price_impact_pct")?;
+        if consumed > amount_in || minimum > output {
+            return Err(SdkError::InvalidResponse(
+                "swap quote economics are internally inconsistent".to_owned(),
+            ));
+        }
+        Ok(quote)
+    }
+
+    pub async fn platform_markets(
+        &self,
+        request: PageRequest,
+    ) -> Result<PlatformMarketsResponse, SdkError> {
+        let query = normalize_page_request(request)?;
+        let response: PlatformMarketsResponse = self.get("v2/markets", &query).await?;
+        validate_platform_version(response.schema_version, &response.contract_version)?;
+        validate_page_info(&response.page)?;
+        let mut ids = HashSet::new();
+        if response.markets.iter().any(|market| {
+            validate_platform_market_id(&market.market_id).is_err()
+                || market.label.trim().is_empty()
+                || market.base_asset_id.trim().is_empty()
+                || market.quote_asset_id.trim().is_empty()
+                || !ids.insert(market.market_id.as_str())
+        }) {
+            return Err(SdkError::InvalidResponse(
+                "market discovery contains an invalid public market".to_owned(),
+            ));
+        }
+        Ok(response)
+    }
+
+    pub async fn platform_book(
+        &self,
+        market_id: &str,
+        request: PlatformBookRequest,
+    ) -> Result<PlatformBookSnapshotResponse, SdkError> {
+        let market_id = validate_platform_market_id(market_id)?;
+        let query = match request.depth {
+            Some(depth @ 1..=2_000) => vec![("depth".to_owned(), depth.to_string())],
+            Some(_) => {
+                return Err(SdkError::InvalidRequest(
+                    "depth must be between 1 and 2,000".to_owned(),
+                ))
+            }
+            None => Vec::new(),
+        };
+        let response: PlatformBookSnapshotResponse = self
+            .get(&format!("v2/markets/{market_id}/book"), &query)
+            .await?;
+        validate_platform_market_response(
+            response.schema_version,
+            &response.contract_version,
+            &response.market_id,
+            &market_id,
+        )?;
+        validate_book_levels(&response.bids, &response.asks)?;
+        validate_response_atoms(&response.sequence, "sequence", false)?;
+        if response.stream_id.trim().is_empty() || response.snapshot_id.trim().is_empty() {
+            return Err(SdkError::InvalidResponse(
+                "book snapshot identity is invalid".to_owned(),
+            ));
+        }
+        Ok(response)
+    }
+
+    pub async fn platform_best_bid_ask(
+        &self,
+        market_id: &str,
+    ) -> Result<PlatformBestBidAskResponse, SdkError> {
+        let market_id = validate_platform_market_id(market_id)?;
+        let response: PlatformBestBidAskResponse = self
+            .get(&format!("v2/markets/{market_id}/bbo"), &[])
+            .await?;
+        validate_platform_market_response(
+            response.schema_version,
+            &response.contract_version,
+            &response.market_id,
+            &market_id,
+        )?;
+        if let Some(level) = &response.best_bid {
+            validate_book_level(level)?;
+        }
+        if let Some(level) = &response.best_ask {
+            validate_book_level(level)?;
+        }
+        validate_response_atoms(&response.sequence, "sequence", false)?;
+        Ok(response)
+    }
+
+    pub async fn platform_fees(
+        &self,
+        market_id: &str,
+    ) -> Result<PlatformFeeScheduleResponse, SdkError> {
+        let market_id = validate_platform_market_id(market_id)?;
+        let response: PlatformFeeScheduleResponse = self
+            .get(&format!("v2/markets/{market_id}/fees"), &[])
+            .await?;
+        validate_platform_market_response(
+            response.schema_version,
+            &response.contract_version,
+            &response.market_id,
+            &market_id,
+        )?;
+        if response.passive_maker_fee_bps > 10_000
+            || response.maximum_immediate_execution_fee_bps > 10_000
+        {
+            return Err(SdkError::InvalidResponse(
+                "fee schedule is outside public bounds".to_owned(),
+            ));
+        }
+        Ok(response)
+    }
+
+    pub async fn platform_market_status(
+        &self,
+        market_id: &str,
+    ) -> Result<PlatformMarketStatusResponse, SdkError> {
+        let market_id = validate_platform_market_id(market_id)?;
+        let response: PlatformMarketStatusResponse = self
+            .get(&format!("v2/markets/{market_id}/status"), &[])
+            .await?;
+        validate_platform_market_response(
+            response.schema_version,
+            &response.contract_version,
+            &response.market_id,
+            &market_id,
+        )?;
+        validate_response_atoms(&response.tick_size_atoms, "tick_size_atoms", false)?;
+        validate_response_atoms(
+            &response.minimum_order_size_atoms,
+            "minimum_order_size_atoms",
+            false,
+        )?;
+        Ok(response)
+    }
+
+    pub async fn platform_trades(
+        &self,
+        market_id: &str,
+        request: PlatformTradesRequest,
+    ) -> Result<PlatformTradesResponse, SdkError> {
+        let market_id = validate_platform_market_id(market_id)?;
+        let query = match request.limit {
+            Some(limit @ 1..=500) => vec![("limit".to_owned(), limit.to_string())],
+            Some(_) => {
+                return Err(SdkError::InvalidRequest(
+                    "trade limit must be between 1 and 500".to_owned(),
+                ))
+            }
+            None => Vec::new(),
+        };
+        let response: PlatformTradesResponse = self
+            .get(&format!("v2/markets/{market_id}/trades"), &query)
+            .await?;
+        validate_platform_market_response(
+            response.schema_version,
+            &response.contract_version,
+            &response.market_id,
+            &market_id,
+        )?;
+        if response.trades.iter().any(|trade| {
+            trade.trade_id.trim().is_empty()
+                || validate_response_atoms(&trade.price_atoms, "price_atoms", false).is_err()
+                || validate_response_atoms(&trade.size_atoms, "size_atoms", false).is_err()
+        }) {
+            return Err(SdkError::InvalidResponse(
+                "trade history contains an invalid trade".to_owned(),
+            ));
+        }
+        Ok(response)
+    }
+
+    pub async fn platform_candles(
+        &self,
+        market_id: &str,
+        request: PlatformCandlesRequest,
+    ) -> Result<PlatformCandlesResponse, SdkError> {
+        let market_id = validate_platform_market_id(market_id)?;
+        if request.to_ms <= request.from_ms {
+            return Err(SdkError::InvalidRequest(
+                "candle timestamps must form an increasing range".to_owned(),
+            ));
+        }
+        let resolution = request.resolution_seconds.unwrap_or(300);
+        if !(60..=86_400).contains(&resolution) || !resolution.is_multiple_of(60) {
+            return Err(SdkError::InvalidRequest(
+                "candle resolution must be whole minutes up to one day".to_owned(),
+            ));
+        }
+        let query = vec![
+            ("from_ms".to_owned(), request.from_ms.to_string()),
+            ("to_ms".to_owned(), request.to_ms.to_string()),
+            ("resolution_seconds".to_owned(), resolution.to_string()),
+        ];
+        let response: PlatformCandlesResponse = self
+            .get(&format!("v2/markets/{market_id}/candles"), &query)
+            .await?;
+        validate_platform_market_response(
+            response.schema_version,
+            &response.contract_version,
+            &response.market_id,
+            &market_id,
+        )?;
+        if response.resolution_seconds != resolution
+            || response.candles.iter().any(|candle| {
+                candle.started_at_ms < request.from_ms
+                    || candle.started_at_ms >= request.to_ms
+                    || [
+                        &candle.open_price,
+                        &candle.high_price,
+                        &candle.low_price,
+                        &candle.close_price,
+                    ]
+                    .iter()
+                    .any(|price| canonical_decimal(price, "candle price").is_err())
+            })
+        {
+            return Err(SdkError::InvalidResponse(
+                "candle response does not match the requested range".to_owned(),
+            ));
+        }
+        Ok(response)
+    }
+
+    pub async fn platform_mark(&self, market_id: &str) -> Result<PlatformMarkResponse, SdkError> {
+        let market_id = validate_platform_market_id(market_id)?;
+        let response: PlatformMarkResponse = self
+            .get(&format!("v2/markets/{market_id}/marks"), &[])
+            .await?;
+        validate_platform_market_response(
+            response.schema_version,
+            &response.contract_version,
+            &response.market_id,
+            &market_id,
+        )?;
+        if let Some(price) = &response.price_atoms_per_base_unit {
+            validate_response_atoms(price, "price_atoms_per_base_unit", false)?;
+        }
+        if response.stale != response.price_atoms_per_base_unit.is_none()
+            || response.quote_decimals > 18
+        {
+            return Err(SdkError::InvalidResponse(
+                "mark staleness metadata is inconsistent".to_owned(),
+            ));
+        }
+        Ok(response)
+    }
+
+    pub async fn platform_execution_status(
+        &self,
+        market_id: &str,
+        execution_id: &str,
+    ) -> Result<PlatformExecutionStatusResponse, SdkError> {
+        let market_id = validate_platform_market_id(market_id)?;
+        let execution_id = execution_id.trim();
+        if !valid_handle(execution_id, "se_") {
+            return Err(SdkError::InvalidRequest(
+                "execution_id must be an opaque Strata execution ID".to_owned(),
+            ));
+        }
+        let response: PlatformExecutionStatusResponse = self
+            .get(
+                &format!("v2/markets/{market_id}/executions/{execution_id}"),
+                &[],
+            )
+            .await?;
+        validate_platform_market_response(
+            response.schema_version,
+            &response.contract_version,
+            &response.market_id,
+            &market_id,
+        )?;
+        if response.execution_id != execution_id
+            || (response.status == PlatformExecutionState::Confirmed
+                && response.signature.as_deref().is_none_or(str::is_empty))
+        {
+            return Err(SdkError::InvalidResponse(
+                "execution status does not match the requested execution".to_owned(),
+            ));
+        }
+        Ok(response)
+    }
+
+    pub async fn platform_twaps(
+        &self,
+        market_id: &str,
+        wallet_address: &str,
+    ) -> Result<PlatformTwapsResponse, SdkError> {
+        let market_id = validate_platform_market_id(market_id)?;
+        let wallet_address = canonical_public_key(wallet_address, "wallet_address")?;
+        let response: PlatformTwapsResponse = self
+            .get(
+                &format!("v2/markets/{market_id}/account/{wallet_address}/twaps"),
+                &[],
+            )
+            .await?;
+        validate_platform_market_response(
+            response.schema_version,
+            &response.contract_version,
+            &response.market_id,
+            &market_id,
+        )?;
+        if response.wallet_address != wallet_address
+            || response
+                .twaps
+                .iter()
+                .any(|twap| !valid_handle(&twap.twap_id, "twap_"))
+        {
+            return Err(SdkError::InvalidResponse(
+                "TWAP history identity does not match the request".to_owned(),
+            ));
+        }
+        Ok(response)
+    }
+
+    /// The whole account in one public read, by wallet address: balances
+    /// (total / available / locked, exact USD), positions, open orders, and
+    /// recent fills across every live market. No signature, no session key,
+    /// no market selection. `platform_account` is the same read.
+    pub async fn platform_portfolio(
+        &self,
+        wallet_address: &str,
+    ) -> Result<PlatformPortfolioResponse, SdkError> {
+        let wallet_address = canonical_public_key(wallet_address, "wallet_address")?;
+        let response: PlatformPortfolioResponse = self
+            .get(&format!("v2/account/{wallet_address}/portfolio"), &[])
+            .await?;
+        validate_platform_version(response.schema_version, &response.contract_version)?;
+        if response.wallet_address != wallet_address {
+            return Err(SdkError::InvalidResponse(
+                "portfolio identity does not match the request".to_owned(),
+            ));
+        }
+        validate_platform_portfolio(&response)?;
+        Ok(response)
+    }
+
+    /// Alias of `platform_portfolio`: the whole account in one public read.
+    pub async fn platform_account(
+        &self,
+        wallet_address: &str,
+    ) -> Result<PlatformPortfolioResponse, SdkError> {
+        self.platform_portfolio(wallet_address).await
+    }
+
+    pub async fn platform_portfolio_history(
+        &self,
+        wallet_address: &str,
+        range: PlatformPortfolioHistoryRange,
+    ) -> Result<PlatformPortfolioHistoryResponse, SdkError> {
+        let wallet_address = canonical_public_key(wallet_address, "wallet_address")?;
+        let range_value = platform_history_range(range);
+        let query = vec![("range".to_owned(), range_value.to_owned())];
+        let response: PlatformPortfolioHistoryResponse = self
+            .get(
+                &format!("v2/account/{wallet_address}/portfolio/history"),
+                &query,
+            )
+            .await?;
+        validate_platform_version(response.schema_version, &response.contract_version)?;
+        if response.wallet_address != wallet_address || response.range != range {
+            return Err(SdkError::InvalidResponse(
+                "portfolio history identity does not match the request".to_owned(),
+            ));
+        }
+        Ok(response)
+    }
+
+    /// Read sealed Vault owner state and, optionally, one external session.
+    pub async fn platform_vault_status(
+        &self,
+        wallet_address: &str,
+        request: PlatformVaultStatusRequest,
+    ) -> Result<PlatformVaultStatusResponse, SdkError> {
+        let wallet_address = canonical_public_key(wallet_address, "wallet_address")?;
+        let session_public_key = request
+            .session_public_key
+            .as_deref()
+            .map(|value| canonical_public_key(value, "session_public_key"))
+            .transpose()?;
+        let mut query = vec![("wallet_address".to_owned(), wallet_address.clone())];
+        if let Some(session_public_key) = &session_public_key {
+            query.push(("session_public_key".to_owned(), session_public_key.clone()));
+        }
+        let response: PlatformVaultStatusResponse = self.get("v2/vault/status", &query).await?;
+        validate_platform_version(response.schema_version, &response.contract_version)?;
+        if response.wallet_address != wallet_address
+            || match (&session_public_key, &response.session) {
+                (None, None) => false,
+                (Some(expected), Some(session)) => session.session_public_key != *expected,
+                _ => true,
+            }
+        {
+            return Err(SdkError::InvalidResponse(
+                "Vault status identity does not match the request".to_owned(),
+            ));
+        }
+        let mut asset_ids = HashSet::new();
+        if response.session.as_ref().is_some_and(|session| {
+            session.spending_limits.len() > 4
+                || session.maximum_tolerance_bps > 10_000
+                || session.spending_limits.iter().any(|limit| {
+                    validate_platform_asset_id(&limit.asset_id).is_err()
+                        || !asset_ids.insert(limit.asset_id.clone())
+                        || limit
+                            .maximum_per_execution_atoms
+                            .as_ref()
+                            .is_some_and(|atoms| {
+                                validate_response_atoms(atoms, "maximum_per_execution_atoms", false)
+                                    .is_err()
+                            })
+                })
+                || (session.state != PlatformVaultSessionState::Active
+                    && (session.market_execution_ready || session.price_protection_active))
+                || (response.state != PlatformVaultState::Active
+                    && (session.market_execution_ready || session.price_protection_active))
+                || (session.permanent
+                    != (session.expires_at_ms.is_none()
+                        && session.state != PlatformVaultSessionState::Absent))
+                || (session.state == PlatformVaultSessionState::Active
+                    && session
+                        .expires_at_ms
+                        .is_some_and(|expiry| expiry <= response.server_time_ms))
+                || (session.state == PlatformVaultSessionState::Expired
+                    && session
+                        .expires_at_ms
+                        .is_none_or(|expiry| expiry > response.server_time_ms))
+        }) {
+            return Err(SdkError::InvalidResponse(
+                "Vault session state is inconsistent".to_owned(),
+            ));
+        }
+        let mut allowed_wallets = HashSet::new();
+        if response.withdrawal_access.allowed_wallet_addresses.len() > 8
+            || response
+                .withdrawal_access
+                .allowed_wallet_addresses
+                .iter()
+                .any(|wallet| {
+                    canonical_public_key(wallet, "allowed_wallet_address").is_err()
+                        || !allowed_wallets.insert(wallet.clone())
+                })
+            || ((response.withdrawal_access.mode == PlatformVaultWithdrawalMode::Restricted)
+                != !response
+                    .withdrawal_access
+                    .allowed_wallet_addresses
+                    .is_empty())
+        {
+            return Err(SdkError::InvalidResponse(
+                "Vault withdrawal access is inconsistent".to_owned(),
+            ));
+        }
+        Ok(response)
+    }
+
+    /// Prepare an owner-authorized Vault pause or resume transaction. The
+    /// external owner verifies, signs, and broadcasts the returned bytes.
+    pub async fn platform_vault_pause_prepare(
+        &self,
+        request: PlatformVaultPausePrepareRequest,
+    ) -> Result<PlatformVaultPausePrepareResponse, SdkError> {
+        let request = PlatformVaultPausePrepareRequest {
+            wallet_address: canonical_public_key(&request.wallet_address, "wallet_address")?,
+            paused: request.paused,
+        };
+        let response: PlatformVaultPausePrepareResponse =
+            self.post("v2/vault/pause/prepare", &request).await?;
+        validate_platform_version(response.schema_version, &response.contract_version)?;
+        if response.wallet_address != request.wallet_address
+            || response.paused != request.paused
+            || !response.owner_signature_required
+        {
+            return Err(SdkError::InvalidResponse(
+                "Vault pause preparation does not match the request".to_owned(),
+            ));
+        }
+        canonical_base64(&response.transaction_base64, "transaction_base64")?;
+        canonical_public_key(&response.recent_blockhash, "recent_blockhash")?;
+        validate_vault_preparation(&response.preparation_id, response.submit_by_ms)?;
+        Ok(response)
+    }
+
+    /// Prepare one-signature Vault onboarding (or a further session) for
+    /// external owner verification, signing, and broadcast. Only the wallet
+    /// and the session key are required; the policy fields are optional and
+    /// take the product defaults when absent.
+    pub async fn platform_vault_setup_prepare(
+        &self,
+        request: PlatformVaultSetupPrepareRequest,
+    ) -> Result<PlatformVaultSetupPrepareResponse, SdkError> {
+        let wallet_address = canonical_public_key(&request.wallet_address, "wallet_address")?;
+        let session_public_key =
+            canonical_public_key(&request.session_public_key, "session_public_key")?;
+        if wallet_address == session_public_key {
+            return Err(SdkError::InvalidRequest(
+                "session_public_key must differ from wallet_address".to_owned(),
+            ));
+        }
+        let market_id = request
+            .market_id
+            .as_deref()
+            .map(validate_platform_market_id)
+            .transpose()?;
+        let minimum_interval_seconds = request
+            .minimum_interval_seconds
+            .unwrap_or(PLATFORM_SESSION_DEFAULT_MINIMUM_INTERVAL_SECONDS);
+        let maximum_tolerance_bps = request
+            .maximum_tolerance_bps
+            .unwrap_or(PLATFORM_SESSION_DEFAULT_MAXIMUM_TOLERANCE_BPS);
+        let now_ms = unix_ms()?;
+        if request
+            .expires_at_ms
+            .is_some_and(|expiry| expiry % 1_000 != 0 || expiry <= now_ms.saturating_add(60_000))
+            || !(1..=86_400).contains(&minimum_interval_seconds)
+            || !(1..=1_000).contains(&maximum_tolerance_bps)
+            || request.spending_limits.len() > PLATFORM_SESSION_MAX_SPENDING_LIMITS
+        {
+            return Err(SdkError::InvalidRequest(
+                "Vault setup policy is invalid".to_owned(),
+            ));
+        }
+        let mut asset_ids = HashSet::new();
+        for limit in &request.spending_limits {
+            validate_platform_asset_id(&limit.asset_id)?;
+            if !asset_ids.insert(limit.asset_id.clone())
+                || limit
+                    .maximum_per_execution_atoms
+                    .as_ref()
+                    .is_some_and(|atoms| {
+                        canonical_request_atoms(atoms, "maximum_per_execution_atoms", false)
+                            .is_err()
+                    })
+            {
+                return Err(SdkError::InvalidRequest(
+                    "Vault setup spending limits are invalid".to_owned(),
+                ));
+            }
+        }
+        let request = PlatformVaultSetupPrepareRequest {
+            wallet_address,
+            session_public_key,
+            market_id,
+            expires_at_ms: request.expires_at_ms,
+            minimum_interval_seconds: Some(minimum_interval_seconds),
+            maximum_tolerance_bps: Some(maximum_tolerance_bps),
+            spending_limits: request.spending_limits,
+        };
+        let response: PlatformVaultSetupPrepareResponse =
+            self.post("v2/vault/setup/prepare", &request).await?;
+        validate_platform_version(response.schema_version, &response.contract_version)?;
+        if response.wallet_address != request.wallet_address
+            || response.session_public_key != request.session_public_key
+            || response.market_id != request.market_id
+            || response.expires_at_ms != request.expires_at_ms
+            || response.permanent != request.expires_at_ms.is_none()
+            || response.minimum_interval_seconds != minimum_interval_seconds
+            || response.maximum_tolerance_bps != maximum_tolerance_bps
+            || response.spending_limits != request.spending_limits
+            || !response.owner_signature_required
+        {
+            return Err(SdkError::InvalidResponse(
+                "Vault setup preparation does not match the request".to_owned(),
+            ));
+        }
+        canonical_base64(&response.transaction_base64, "transaction_base64")?;
+        canonical_public_key(&response.recent_blockhash, "recent_blockhash")?;
+        validate_vault_preparation(&response.preparation_id, response.submit_by_ms)?;
+        Ok(response)
+    }
+
+    /// Prepare owner-authorized revocation of one external Vault session. The
+    /// SDK never signs or broadcasts this destructive action.
+    pub async fn platform_vault_delegate_prepare(
+        &self,
+        request: PlatformVaultDelegatePrepareRequest,
+    ) -> Result<PlatformVaultDelegatePrepareResponse, SdkError> {
+        let wallet_address = canonical_public_key(&request.wallet_address, "wallet_address")?;
+        let session_public_key =
+            canonical_public_key(&request.session_public_key, "session_public_key")?;
+        if wallet_address == session_public_key {
+            return Err(SdkError::InvalidRequest(
+                "session_public_key must differ from wallet_address".to_owned(),
+            ));
+        }
+        let request = PlatformVaultDelegatePrepareRequest {
+            wallet_address,
+            session_public_key,
+            action: request.action,
+        };
+        let response: PlatformVaultDelegatePrepareResponse =
+            self.post("v2/vault/delegates/prepare", &request).await?;
+        validate_platform_version(response.schema_version, &response.contract_version)?;
+        if response.wallet_address != request.wallet_address
+            || response.session_public_key != request.session_public_key
+            || response.action != request.action
+            || !response.owner_signature_required
+        {
+            return Err(SdkError::InvalidResponse(
+                "Vault delegate preparation does not match the request".to_owned(),
+            ));
+        }
+        canonical_base64(&response.transaction_base64, "transaction_base64")?;
+        canonical_public_key(&response.recent_blockhash, "recent_blockhash")?;
+        validate_vault_preparation(&response.preparation_id, response.submit_by_ms)?;
+        Ok(response)
+    }
+
+    /// Prepare blocked or restricted Vault withdrawal access. The external
+    /// owner verifies, signs, and broadcasts the returned transaction.
+    pub async fn platform_vault_policy_prepare(
+        &self,
+        request: PlatformVaultPolicyPrepareRequest,
+    ) -> Result<PlatformVaultPolicyPrepareResponse, SdkError> {
+        let wallet_address = canonical_public_key(&request.wallet_address, "wallet_address")?;
+        let allowed = &request.withdrawal_access.allowed_wallet_addresses;
+        let mut unique_wallets = HashSet::new();
+        if allowed.len() > 8
+            || allowed.iter().any(|wallet| {
+                canonical_public_key(wallet, "allowed_wallet_address").is_err()
+                    || !unique_wallets.insert(wallet.clone())
+            })
+            || match request.withdrawal_access.mode {
+                PlatformVaultWithdrawalMode::Unrestricted => true,
+                PlatformVaultWithdrawalMode::Blocked => !allowed.is_empty(),
+                PlatformVaultWithdrawalMode::Restricted => allowed.is_empty(),
+            }
+        {
+            return Err(SdkError::InvalidRequest(
+                "Vault withdrawal access policy is invalid".to_owned(),
+            ));
+        }
+        let request = PlatformVaultPolicyPrepareRequest {
+            wallet_address,
+            withdrawal_access: request.withdrawal_access,
+        };
+        let response: PlatformVaultPolicyPrepareResponse =
+            self.post("v2/vault/policies/prepare", &request).await?;
+        validate_platform_version(response.schema_version, &response.contract_version)?;
+        if response.wallet_address != request.wallet_address
+            || response.withdrawal_access != request.withdrawal_access
+            || !response.owner_signature_required
+        {
+            return Err(SdkError::InvalidResponse(
+                "Vault policy preparation does not match the request".to_owned(),
+            ));
+        }
+        canonical_base64(&response.transaction_base64, "transaction_base64")?;
+        canonical_public_key(&response.recent_blockhash, "recent_blockhash")?;
+        validate_vault_preparation(&response.preparation_id, response.submit_by_ms)?;
+        Ok(response)
+    }
+
+    /// Prepare an exact owner-funded Vault deposit. With `session_public_key`
+    /// set, a first deposit also registers that session in the same
+    /// transaction (one owner signature onboards and funds the wallet). The
+    /// SDK validates the echoed product intent and leaves signing and
+    /// broadcast external.
+    pub async fn platform_vault_deposit_prepare(
+        &self,
+        request: PlatformVaultDepositPrepareRequest,
+    ) -> Result<PlatformVaultDepositPrepareResponse, SdkError> {
+        let wallet_address = canonical_public_key(&request.wallet_address, "wallet_address")?;
+        let session_public_key = request
+            .session_public_key
+            .as_deref()
+            .map(|session| canonical_public_key(session, "session_public_key"))
+            .transpose()?;
+        if session_public_key.as_deref() == Some(wallet_address.as_str()) {
+            return Err(SdkError::InvalidRequest(
+                "session_public_key must differ from wallet_address".to_owned(),
+            ));
+        }
+        let request = PlatformVaultDepositPrepareRequest {
+            wallet_address,
+            market_id: validate_platform_market_id(&request.market_id)?,
+            asset_id: validate_platform_asset_id(&request.asset_id)?,
+            amount_atoms: canonical_request_atoms(&request.amount_atoms, "amount_atoms", false)?,
+            session_public_key,
+        };
+        let response: PlatformVaultDepositPrepareResponse =
+            self.post("v2/vault/deposits/prepare", &request).await?;
+        validate_platform_version(response.schema_version, &response.contract_version)?;
+        parse_atoms("network_cost_atoms", &response.network_cost_atoms)?;
+        if response.wallet_address != request.wallet_address
+            || response.market_id != request.market_id
+            || response.asset_id != request.asset_id
+            || response.amount_atoms != request.amount_atoms
+            || response.session_public_key != request.session_public_key
+            || (response.registers_session && response.session_public_key.is_none())
+            || !response.owner_signature_required
+        {
+            return Err(SdkError::InvalidResponse(
+                "Vault deposit preparation does not match the request".to_owned(),
+            ));
+        }
+        canonical_base64(&response.transaction_base64, "transaction_base64")?;
+        canonical_public_key(&response.recent_blockhash, "recent_blockhash")?;
+        validate_vault_preparation(&response.preparation_id, response.submit_by_ms)?;
+        Ok(response)
+    }
+
+    /// Prepare an exact owner-authorized Vault withdrawal to one destination
+    /// wallet. Signing and broadcast remain external.
+    pub async fn platform_vault_withdraw_prepare(
+        &self,
+        request: PlatformVaultWithdrawPrepareRequest,
+    ) -> Result<PlatformVaultWithdrawPrepareResponse, SdkError> {
+        let request = PlatformVaultWithdrawPrepareRequest {
+            wallet_address: canonical_public_key(&request.wallet_address, "wallet_address")?,
+            market_id: validate_platform_market_id(&request.market_id)?,
+            asset_id: validate_platform_asset_id(&request.asset_id)?,
+            destination_wallet_address: canonical_public_key(
+                &request.destination_wallet_address,
+                "destination_wallet_address",
+            )?,
+            amount_atoms: canonical_request_atoms(&request.amount_atoms, "amount_atoms", false)?,
+        };
+        let response: PlatformVaultWithdrawPrepareResponse =
+            self.post("v2/vault/withdrawals/prepare", &request).await?;
+        validate_platform_version(response.schema_version, &response.contract_version)?;
+        if response.wallet_address != request.wallet_address
+            || response.market_id != request.market_id
+            || response.asset_id != request.asset_id
+            || response.destination_wallet_address != request.destination_wallet_address
+            || response.amount_atoms != request.amount_atoms
+            || !response.owner_signature_required
+        {
+            return Err(SdkError::InvalidResponse(
+                "Vault withdrawal preparation does not match the request".to_owned(),
+            ));
+        }
+        canonical_base64(&response.transaction_base64, "transaction_base64")?;
+        canonical_public_key(&response.recent_blockhash, "recent_blockhash")?;
+        validate_vault_preparation(&response.preparation_id, response.submit_by_ms)?;
+        Ok(response)
+    }
+
+    /// Submit an owner-signed prepared Vault transaction. Strata verifies it is
+    /// exactly the prepared transaction, pays the fee (and any rent) when the
+    /// preparation was sponsored, and broadcasts it. Idempotent per
+    /// `idempotency_key`; read the outcome with `platform_vault_submission`.
+    pub async fn platform_vault_submit(
+        &self,
+        request: PlatformVaultSubmitRequest,
+    ) -> Result<PlatformVaultSubmitResponse, SdkError> {
+        if !valid_handle(&request.preparation_id, "vp_") {
+            return Err(SdkError::InvalidRequest(
+                "preparation_id is invalid".to_owned(),
+            ));
+        }
+        let request = PlatformVaultSubmitRequest {
+            preparation_id: request.preparation_id,
+            signed_transaction_base64: canonical_base64(
+                &request.signed_transaction_base64,
+                "signed_transaction_base64",
+            )?,
+            idempotency_key: normalize_idempotency_key(&request.idempotency_key)?,
+        };
+        let response: PlatformVaultSubmitResponse = self.post("v2/vault/submit", &request).await?;
+        validate_vault_submission(&response, &request.preparation_id)?;
+        Ok(response)
+    }
+
+    /// Durable outcome of a Vault submission (`submitted` → `confirmed` | `failed`).
+    pub async fn platform_vault_submission(
+        &self,
+        preparation_id: &str,
+    ) -> Result<PlatformVaultSubmitResponse, SdkError> {
+        let preparation_id = preparation_id.trim();
+        if !valid_handle(preparation_id, "vp_") {
+            return Err(SdkError::InvalidRequest(
+                "preparation_id is invalid".to_owned(),
+            ));
+        }
+        let response: PlatformVaultSubmitResponse = self
+            .get(&format!("v2/vault/submissions/{preparation_id}"), &[])
+            .await?;
+        validate_vault_submission(&response, preparation_id)?;
+        Ok(response)
+    }
+
+    pub async fn platform_rewards(
+        &self,
+        request: PlatformRewardsRequest,
+    ) -> Result<PlatformRewardsResponse, SdkError> {
+        let wallet = request
+            .wallet_address
+            .as_deref()
+            .map(|value| canonical_public_key(value, "wallet_address"))
+            .transpose()?;
+        let mut query = Vec::new();
+        if let Some(wallet) = &wallet {
+            query.push(("wallet_address".to_owned(), wallet.clone()));
+        }
+        if let Some(limit @ 1..=100) = request.limit {
+            query.push(("limit".to_owned(), limit.to_string()));
+        } else if request.limit.is_some() {
+            return Err(SdkError::InvalidRequest(
+                "reward standings limit must be between 1 and 100".to_owned(),
+            ));
+        }
+        let response: PlatformRewardsResponse = self.get("v2/rewards", &query).await?;
+        validate_platform_version(response.schema_version, &response.contract_version)?;
+        match (&wallet, &response.owner) {
+            (Some(expected), Some(owner)) if owner.wallet_address == *expected => {}
+            (None, None) => {}
+            _ => {
+                return Err(SdkError::InvalidResponse(
+                    "reward owner does not match the request".to_owned(),
+                ))
+            }
+        }
+        Ok(response)
+    }
+
+    pub async fn platform_referrals(
+        &self,
+        wallet_address: &str,
+    ) -> Result<PlatformReferralsResponse, SdkError> {
+        let wallet_address = canonical_public_key(wallet_address, "wallet_address")?;
+        let response: PlatformReferralsResponse = self
+            .get(&format!("v2/referrals/{wallet_address}"), &[])
+            .await?;
+        validate_platform_version(response.schema_version, &response.contract_version)?;
+        if response.wallet_address != wallet_address {
+            return Err(SdkError::InvalidResponse(
+                "referral owner does not match the request".to_owned(),
+            ));
+        }
+        Ok(response)
+    }
+
+    pub async fn platform_referral_link(
+        &self,
+        request: PlatformReferralLinkRequest,
+    ) -> Result<PlatformReferralLinkResponse, SdkError> {
+        let request = PlatformReferralLinkRequest {
+            wallet_address: canonical_public_key(&request.wallet_address, "wallet_address")?,
+            referral_code: normalize_referral_code(&request.referral_code)?,
+            authorization_signature: canonical_hex_signature(
+                &request.authorization_signature,
+                "authorization_signature",
+            )?,
+        };
+        let response: PlatformReferralLinkResponse =
+            self.post("v2/referrals/link", &request).await?;
+        validate_platform_version(response.schema_version, &response.contract_version)?;
+        if response.wallet_address != request.wallet_address
+            || response.referral_code != request.referral_code
+            || response.status != "pending_first_fill"
+        {
+            return Err(SdkError::InvalidResponse(
+                "referral link does not match the request".to_owned(),
+            ));
+        }
+        Ok(response)
+    }
+
+    pub async fn platform_referral_claim(
+        &self,
+        request: PlatformReferralClaimRequest,
+    ) -> Result<PlatformReferralClaimResponse, SdkError> {
+        let wallet_address = canonical_public_key(&request.wallet_address, "wallet_address")?;
+        let payout_wallet_address = request
+            .payout_wallet_address
+            .as_deref()
+            .map(|value| canonical_public_key(value, "payout_wallet_address"))
+            .transpose()?
+            .unwrap_or_else(|| wallet_address.clone());
+        let request = PlatformReferralClaimRequest {
+            wallet_address: wallet_address.clone(),
+            payout_wallet_address: Some(payout_wallet_address.clone()),
+            authorization_signature: canonical_hex_signature(
+                &request.authorization_signature,
+                "authorization_signature",
+            )?,
+        };
+        let response: PlatformReferralClaimResponse =
+            self.post("v2/referrals/claim", &request).await?;
+        validate_platform_version(response.schema_version, &response.contract_version)?;
+        validate_response_atoms(&response.claimable_atoms, "claimable_atoms", false)?;
+        if response.wallet_address != wallet_address
+            || response.payout_wallet_address != payout_wallet_address
+            || response.status != "requested"
+        {
+            return Err(SdkError::InvalidResponse(
+                "referral claim does not match the request".to_owned(),
+            ));
+        }
+        Ok(response)
+    }
+
+    pub async fn platform_bugs(
+        &self,
+        wallet_address: &str,
+    ) -> Result<PlatformBugsResponse, SdkError> {
+        let wallet_address = canonical_public_key(wallet_address, "wallet_address")?;
+        let response: PlatformBugsResponse =
+            self.get(&format!("v2/bugs/{wallet_address}"), &[]).await?;
+        validate_platform_version(response.schema_version, &response.contract_version)?;
+        if response.wallet_address != wallet_address {
+            return Err(SdkError::InvalidResponse(
+                "bug report owner does not match the request".to_owned(),
+            ));
+        }
+        Ok(response)
+    }
+
+    pub async fn platform_bug_submit(
+        &self,
+        request: PlatformBugSubmitRequest,
+    ) -> Result<PlatformBugSubmitResponse, SdkError> {
+        let request = PlatformBugSubmitRequest {
+            owner_wallet: canonical_public_key(&request.owner_wallet, "owner_wallet")?,
+            message: normalize_bug_message(&request.message)?,
+            authorization_signature: canonical_hex_signature(
+                &request.authorization_signature,
+                "authorization_signature",
+            )?,
+        };
+        let response: PlatformBugSubmitResponse = self.post("v2/bugs", &request).await?;
+        validate_platform_version(response.schema_version, &response.contract_version)?;
+        if !valid_handle(&response.bug_id, "bug_") {
+            return Err(SdkError::InvalidResponse(
+                "bug submission returned an invalid report ID".to_owned(),
+            ));
+        }
+        Ok(response)
+    }
+
+    /// Read one market's private account state after proving wallet control.
+    /// The wallet signs an exact, server-time-bound read message outside Strata.
+    pub async fn platform_account_market<S: AccountSigner + ?Sized>(
+        &self,
+        market_id: &str,
+        signer: &S,
+        request: PlatformAccountMarketRequest,
+    ) -> Result<PlatformAccountSnapshotResponse, SdkError> {
+        let market_id = validate_platform_market_id(market_id)?;
+        let wallet_address =
+            canonical_public_key(signer.public_key(), "account signer public key")?;
+        let fill_limit = normalize_fill_limit(request.fill_limit)?;
+        let timestamp_ms = self.platform_capabilities().await?.server_time_ms;
+        let message =
+            account_http_auth_message(&market_id, &wallet_address, timestamp_ms, fill_limit)?;
+        let signature = signer
+            .sign_message(&message)
+            .await
+            .map_err(SdkError::Signer)?;
+        if signature.len() != 64 {
+            return Err(SdkError::Signer(
+                "account signer must return a 64-byte Ed25519 signature".to_owned(),
+            ));
+        }
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-strata-auth-time",
+            HeaderValue::from_str(&timestamp_ms.to_string()).map_err(|_| {
+                SdkError::InvalidRequest("account authorization time is invalid".to_owned())
+            })?,
+        );
+        headers.insert(
+            "x-strata-auth-signature",
+            HeaderValue::from_str(&hex::encode(signature)).map_err(|_| {
+                SdkError::InvalidRequest("account authorization signature is invalid".to_owned())
+            })?,
+        );
+        let query = match request.fill_limit {
+            Some(_) => vec![("fill_limit".to_owned(), fill_limit.to_string())],
+            None => Vec::new(),
+        };
+        let response: PlatformAccountSnapshotResponse = self
+            .get_with_headers(
+                &format!("v2/markets/{market_id}/account/{wallet_address}"),
+                &query,
+                headers,
+            )
+            .await?;
+        validate_platform_market_response(
+            response.schema_version,
+            &response.contract_version,
+            &response.market_id,
+            &market_id,
+        )?;
+        if response.wallet_address != wallet_address {
+            return Err(SdkError::InvalidResponse(
+                "account response wallet does not match signed request".to_owned(),
+            ));
+        }
+        account_stream::validate_account_state(&response.orders, &response.fills)?;
+        Ok(response)
+    }
+
+    /// Read private order and fill state across selected markets, or across
+    /// every currently discoverable market when `market_ids` is omitted.
+    pub async fn platform_account_snapshot<S: AccountSigner + ?Sized>(
+        &self,
+        signer: &S,
+        request: PlatformAccountRequest,
+    ) -> Result<PlatformAccountSnapshot, SdkError> {
+        let wallet_address =
+            canonical_public_key(signer.public_key(), "account signer public key")?;
+        let market_ids = match request.market_ids {
+            Some(ids) => normalize_market_ids(ids)?,
+            None => self.all_platform_market_ids().await?,
+        };
+        if market_ids.is_empty() {
+            return Err(SdkError::OperationUnavailable(
+                "no public markets are currently discoverable".to_owned(),
+            ));
+        }
+        let mut markets = Vec::with_capacity(market_ids.len());
+        for market_id in market_ids {
+            markets.push(
+                self.platform_account_market(
+                    &market_id,
+                    signer,
+                    PlatformAccountMarketRequest {
+                        fill_limit: request.fill_limit,
+                    },
+                )
+                .await?,
+            );
+        }
+        let server_time_ms = markets
+            .iter()
+            .map(|market| market.server_time_ms)
+            .max()
+            .unwrap_or_default();
+        Ok(PlatformAccountSnapshot {
+            wallet_address,
+            server_time_ms,
+            markets,
+        })
+    }
+
+    /// A maker's products, exposure, health, and kill state in one market —
+    /// public by wallet address, no signature.
+    pub async fn platform_maker_status_for_wallet(
+        &self,
+        market_id: &str,
+        wallet_address: &str,
+    ) -> Result<PlatformMakerStatusResponse, SdkError> {
+        let market_id = validate_platform_market_id(market_id)?;
+        let wallet_address = canonical_public_key(wallet_address, "wallet_address")?;
+        self.read_platform_maker_status(&market_id, &wallet_address, None)
+            .await
+    }
+
+    /// Same read, addressed by a signer's public key. Reads are public, so the
+    /// signer is never asked to sign; kept so existing callers keep compiling.
+    pub async fn platform_maker_status<S: AccountSigner + ?Sized>(
+        &self,
+        market_id: &str,
+        signer: &S,
+    ) -> Result<PlatformMakerStatusResponse, SdkError> {
+        self.platform_maker_status_for_wallet(market_id, signer.public_key())
+            .await
+    }
+
+    /// Submit a detached external signature for the maker status read. Reads
+    /// are public now; a signed request is still accepted (deprecated path).
+    pub async fn platform_maker_status_authorized(
+        &self,
+        request: PlatformMakerStatusAuthorizedRequest,
+    ) -> Result<PlatformMakerStatusResponse, SdkError> {
+        let market_id = validate_platform_market_id(&request.market_id)?;
+        let wallet_address = canonical_public_key(&request.wallet_address, "wallet_address")?;
+        let signature =
+            canonical_hex_signature(&request.authorization_signature, "authorization_signature")?;
+        self.read_platform_maker_status(
+            &market_id,
+            &wallet_address,
+            Some((request.authorization_time_ms, signature.as_str())),
+        )
+        .await
+    }
+
+    async fn read_platform_maker_status(
+        &self,
+        market_id: &str,
+        wallet_address: &str,
+        authorization: Option<(u64, &str)>,
+    ) -> Result<PlatformMakerStatusResponse, SdkError> {
+        let headers = maker_auth_headers(authorization)?;
+        let response: PlatformMakerStatusResponse = self
+            .get_with_headers(
+                &format!("v2/markets/{market_id}/makers/{wallet_address}"),
+                &[],
+                headers,
+            )
+            .await?;
+        validate_platform_market_response(
+            response.schema_version,
+            &response.contract_version,
+            &response.market_id,
+            market_id,
+        )?;
+        if response.wallet_address != wallet_address {
+            return Err(SdkError::InvalidResponse(
+                "maker status wallet does not match signed request".to_owned(),
+            ));
+        }
+        validate_maker_status(&response)?;
+        Ok(response)
+    }
+
+    /// A maker's reliability record in one market — public by wallet address,
+    /// no signature.
+    pub async fn platform_maker_reputation_for_wallet(
+        &self,
+        market_id: &str,
+        wallet_address: &str,
+    ) -> Result<PlatformMakerReputationResponse, SdkError> {
+        let market_id = validate_platform_market_id(market_id)?;
+        let wallet_address = canonical_public_key(wallet_address, "wallet_address")?;
+        self.read_platform_maker_reputation(&market_id, &wallet_address, None)
+            .await
+    }
+
+    /// Same read, addressed by a signer's public key; the signer is never asked
+    /// to sign (reads are public). Kept so existing callers keep compiling.
+    pub async fn platform_maker_reputation<S: AccountSigner + ?Sized>(
+        &self,
+        market_id: &str,
+        signer: &S,
+    ) -> Result<PlatformMakerReputationResponse, SdkError> {
+        self.platform_maker_reputation_for_wallet(market_id, signer.public_key())
+            .await
+    }
+
+    /// Submit a detached external signature. Reads are public now; a signed
+    /// request is still accepted (deprecated path).
+    pub async fn platform_maker_reputation_authorized(
+        &self,
+        request: PlatformMakerReputationAuthorizedRequest,
+    ) -> Result<PlatformMakerReputationResponse, SdkError> {
+        let market_id = validate_platform_market_id(&request.market_id)?;
+        let wallet_address = canonical_public_key(&request.wallet_address, "wallet_address")?;
+        let signature =
+            canonical_hex_signature(&request.authorization_signature, "authorization_signature")?;
+        self.read_platform_maker_reputation(
+            &market_id,
+            &wallet_address,
+            Some((request.authorization_time_ms, signature.as_str())),
+        )
+        .await
+    }
+
+    async fn read_platform_maker_reputation(
+        &self,
+        market_id: &str,
+        wallet_address: &str,
+        authorization: Option<(u64, &str)>,
+    ) -> Result<PlatformMakerReputationResponse, SdkError> {
+        let headers = maker_auth_headers(authorization)?;
+        let response: PlatformMakerReputationResponse = self
+            .get_with_headers(
+                &format!("v2/markets/{market_id}/makers/{wallet_address}/reputation"),
+                &[],
+                headers,
+            )
+            .await?;
+        validate_platform_market_response(
+            response.schema_version,
+            &response.contract_version,
+            &response.market_id,
+            market_id,
+        )?;
+        if response.wallet_address != wallet_address {
+            return Err(SdkError::InvalidResponse(
+                "maker reputation wallet does not match signed request".to_owned(),
+            ));
+        }
+        validate_maker_reputation(&response)?;
+        Ok(response)
+    }
+
     pub async fn capabilities(&self) -> Result<CapabilityCatalog, SdkError> {
         let catalog: CapabilityCatalog = self.get("sonar/capabilities", &[]).await?;
         validate_version(catalog.schema_version, &catalog.contract_version)?;
@@ -292,16 +1846,16 @@ impl StrataClient {
     }
 
     /// Request a short-lived Sonar quote by human market label or market ID.
+    /// Give exactly one of `amount_in_atoms` (spend this much) or
+    /// `amount_out_atoms` (receive this much; Strata resolves the input).
+    /// `maximum_tolerance_bps` is the most you accept below the quoted output
+    /// (default 0); it is your choice and unrelated to the measured
+    /// `price_impact_pct` the response reports.
     pub async fn quote(&self, request: QuoteRequest) -> Result<QuoteResponse, SdkError> {
-        let amount_in = parse_atoms("amount_in_atoms", &request.amount_in_atoms)?;
-        if amount_in == 0 {
+        let target = quote_target(&request)?;
+        if request.maximum_tolerance_bps > 1_000 {
             return Err(SdkError::InvalidRequest(
-                "amount_in_atoms must be greater than zero".to_owned(),
-            ));
-        }
-        if request.slippage_bps > 1_000 {
-            return Err(SdkError::InvalidRequest(
-                "slippage_bps must be between 0 and 1,000".to_owned(),
+                "maximum_tolerance_bps must be between 0 and 1,000".to_owned(),
             ));
         }
 
@@ -329,11 +1883,14 @@ impl StrataClient {
         let wire = QuoteRequest {
             market_id: market_pda.to_owned(),
             side: request.side,
-            amount_in_atoms: request.amount_in_atoms.clone(),
-            slippage_bps: request.slippage_bps,
+            amount_in_atoms: matches!(target, QuoteTarget::ExactInput(_))
+                .then(|| target.amount().to_string()),
+            amount_out_atoms: matches!(target, QuoteTarget::ExactOutput(_))
+                .then(|| target.amount().to_string()),
+            maximum_tolerance_bps: request.maximum_tolerance_bps,
         };
         let quote: QuoteResponse = self.post(quote_path, &wire).await?;
-        validate_quote(&quote, market_pda, &request, amount_in)?;
+        validate_quote(&quote, market_pda, &request, target)?;
         Ok(quote)
     }
 
@@ -344,19 +1901,7 @@ impl StrataClient {
         market: &str,
         request: ExecutionChallengeRequest,
     ) -> Result<ExecutionChallengeResponse, SdkError> {
-        if !valid_handle(&request.quote_id, "sq_") {
-            return Err(SdkError::InvalidRequest("quote_id is invalid".to_owned()));
-        }
-        let request = ExecutionChallengeRequest {
-            quote_id: request.quote_id,
-            owner_wallet: canonical_public_key(&request.owner_wallet, "owner_wallet")?,
-            session_public_key: canonical_public_key(
-                &request.session_public_key,
-                "session_public_key",
-            )?,
-            account_sequence: parse_atoms("account_sequence", &request.account_sequence)?
-                .to_string(),
-        };
+        let request = normalize_execution_challenge_request(request)?;
         let execution_path = self.execution_path(market).await?;
         let challenge: ExecutionChallengeResponse = self
             .post(&format!("{execution_path}/challenge"), &request)
@@ -370,33 +1915,45 @@ impl StrataClient {
         Ok(challenge)
     }
 
-    /// Exchange an external authorization signature for a quote-bound,
-    /// partially signed transaction.
+    /// Prepare a quote-bound, partially signed transaction: either exchange
+    /// an external authorization signature (`Authorized`, two-step path) or
+    /// bind the quote directly (`Direct`, one signature — the session's
+    /// transaction signature is the authorization).
     pub async fn execution_prepare(
         &self,
         market: &str,
         request: ExecutionPrepareRequest,
     ) -> Result<ExecutionPrepareResponse, SdkError> {
-        if !valid_handle(&request.challenge_id, "sc_") {
-            return Err(SdkError::InvalidRequest(
-                "challenge_id is invalid".to_owned(),
-            ));
-        }
-        let signature = bs58::decode(request.authorization_signature.trim())
-            .into_vec()
-            .map_err(|_| {
-                SdkError::InvalidRequest("authorization_signature must be base58".to_owned())
-            })?;
-        if signature.len() != 64
-            || bs58::encode(&signature).into_string() != request.authorization_signature.trim()
-        {
-            return Err(SdkError::InvalidRequest(
-                "authorization_signature must be a canonical Ed25519 signature".to_owned(),
-            ));
-        }
-        let request = ExecutionPrepareRequest {
-            challenge_id: request.challenge_id,
-            authorization_signature: bs58::encode(signature).into_string(),
+        let request = match request {
+            ExecutionPrepareRequest::Authorized(authorization) => {
+                if !valid_handle(&authorization.challenge_id, "sc_") {
+                    return Err(SdkError::InvalidRequest(
+                        "challenge_id is invalid".to_owned(),
+                    ));
+                }
+                let signature = bs58::decode(authorization.authorization_signature.trim())
+                    .into_vec()
+                    .map_err(|_| {
+                        SdkError::InvalidRequest(
+                            "authorization_signature must be base58".to_owned(),
+                        )
+                    })?;
+                if signature.len() != 64
+                    || bs58::encode(&signature).into_string()
+                        != authorization.authorization_signature.trim()
+                {
+                    return Err(SdkError::InvalidRequest(
+                        "authorization_signature must be a canonical Ed25519 signature".to_owned(),
+                    ));
+                }
+                ExecutionPrepareRequest::Authorized(ExecutionPrepareAuthorization {
+                    challenge_id: authorization.challenge_id,
+                    authorization_signature: bs58::encode(signature).into_string(),
+                })
+            }
+            ExecutionPrepareRequest::Direct(binding) => {
+                ExecutionPrepareRequest::Direct(normalize_execution_challenge_request(binding)?)
+            }
         };
         let execution_path = self.execution_path(market).await?;
         let prepared: ExecutionPrepareResponse = self
@@ -407,6 +1964,13 @@ impl StrataClient {
             return Err(SdkError::InvalidResponse(
                 "prepared execution ID is invalid".to_owned(),
             ));
+        }
+        if let ExecutionPrepareRequest::Direct(binding) = &request {
+            if prepared.quote_id != binding.quote_id {
+                return Err(SdkError::InvalidResponse(
+                    "prepared execution does not match the requested quote".to_owned(),
+                ));
+            }
         }
         Ok(prepared)
     }
@@ -498,29 +2062,29 @@ impl StrataClient {
         Ok(challenge)
     }
 
-    /// Exchange a detached external authorization signature for a backend-
-    /// partially-signed v0 transaction.
+    /// Prepare a backend-partially-signed v0 order-control transaction:
+    /// either hand back a signed challenge (`Authorized`, two-step path) or
+    /// send the operation itself (`Direct`, one signature — Strata builds the
+    /// transaction from the operation and the session's signature over that
+    /// transaction is the whole authorization).
     pub async fn order_prepare(
         &self,
         market_id: &str,
         request: PlatformOrderPrepareRequest,
     ) -> Result<PlatformOrderPrepareResponse, SdkError> {
         let market_id = validate_platform_market_id(market_id)?;
-        if !valid_handle(&request.challenge_id, "oc_") {
-            return Err(SdkError::InvalidRequest(
-                "order challenge_id is invalid".to_owned(),
-            ));
-        }
-        let signature =
-            canonical_signature(&request.authorization_signature, "authorization_signature")?;
+        let request = match request {
+            PlatformOrderPrepareRequest::Authorized(authorization) => {
+                PlatformOrderPrepareRequest::Authorized(normalize_order_prepare_authorization(
+                    authorization,
+                )?)
+            }
+            PlatformOrderPrepareRequest::Direct(operation) => {
+                PlatformOrderPrepareRequest::Direct(normalize_order_challenge_request(operation)?)
+            }
+        };
         let prepared: PlatformOrderPrepareResponse = self
-            .post(
-                &format!("v2/markets/{market_id}/orders/prepare"),
-                &PlatformOrderPrepareRequest {
-                    challenge_id: request.challenge_id,
-                    authorization_signature: signature,
-                },
-            )
+            .post(&format!("v2/markets/{market_id}/orders/prepare"), &request)
             .await?;
         validate_platform_version(prepared.schema_version, &prepared.contract_version)?;
         if prepared.market_id != market_id
@@ -536,6 +2100,13 @@ impl StrataClient {
         }
         canonical_base64(&prepared.transaction_base64, "transaction_base64")?;
         canonical_base58_32(&prepared.recent_blockhash, "recent_blockhash")?;
+        if let PlatformOrderPrepareRequest::Direct(operation) = &request {
+            if prepared.action != order_request_action(operation) {
+                return Err(SdkError::InvalidResponse(
+                    "prepared order action does not match request".to_owned(),
+                ));
+            }
+        }
         Ok(prepared)
     }
 
@@ -621,10 +2192,201 @@ impl StrataClient {
         Ok(status)
     }
 
-    /// Execute one resting-order operation while all private keys and signing
-    /// policy remain in the caller's signer adapter. Authorization bytes are
-    /// parsed before message signing, and the mandatory verifier runs before
-    /// the transaction signature is requested.
+    /// Request exact authorization bytes for one bounded TWAP placement or
+    /// cancellation. The session private key remains outside Strata.
+    pub async fn twap_challenge(
+        &self,
+        market_id: &str,
+        request: PlatformTwapChallengeRequest,
+    ) -> Result<PlatformTwapChallengeResponse, SdkError> {
+        let market_id = validate_platform_market_id(market_id)?;
+        let request = normalize_twap_challenge_request(request)?;
+        let expected_action = twap_request_action(&request);
+        let challenge: PlatformTwapChallengeResponse = self
+            .post(&format!("v2/markets/{market_id}/twaps/challenge"), &request)
+            .await?;
+        validate_platform_version(challenge.schema_version, &challenge.contract_version)?;
+        if challenge.market_id != market_id
+            || challenge.action != expected_action
+            || !valid_handle(&challenge.challenge_id, "twc_")
+            || !valid_handle(&challenge.twap_id, "twap_")
+            || challenge.expires_at_ms <= challenge.server_time_ms
+        {
+            return Err(SdkError::InvalidResponse(
+                "TWAP challenge bindings are invalid".to_owned(),
+            ));
+        }
+        canonical_base64(
+            &challenge.authorization_payload_base64,
+            "authorization_payload_base64",
+        )?;
+        Ok(challenge)
+    }
+
+    /// Prepare a backend-partially-signed TWAP-control transaction that the
+    /// external session must verify: either the exact detached TWAP
+    /// authorization (`Authorized`, two-step path) or the action itself
+    /// (`Direct`, one signature — the transaction signature is the
+    /// authorization).
+    pub async fn twap_prepare(
+        &self,
+        market_id: &str,
+        request: PlatformTwapPrepareRequest,
+    ) -> Result<PlatformTwapPrepareResponse, SdkError> {
+        let market_id = validate_platform_market_id(market_id)?;
+        let request = match request {
+            PlatformTwapPrepareRequest::Authorized(authorization) => {
+                if !valid_handle(&authorization.challenge_id, "twc_") {
+                    return Err(SdkError::InvalidRequest(
+                        "TWAP challenge_id is invalid".to_owned(),
+                    ));
+                }
+                PlatformTwapPrepareRequest::Authorized(PlatformTwapPrepareAuthorization {
+                    challenge_id: authorization.challenge_id,
+                    authorization_signature: canonical_signature(
+                        &authorization.authorization_signature,
+                        "authorization_signature",
+                    )?,
+                })
+            }
+            PlatformTwapPrepareRequest::Direct(operation) => {
+                PlatformTwapPrepareRequest::Direct(normalize_twap_challenge_request(operation)?)
+            }
+        };
+        let prepared: PlatformTwapPrepareResponse = self
+            .post(&format!("v2/markets/{market_id}/twaps/prepare"), &request)
+            .await?;
+        validate_platform_version(prepared.schema_version, &prepared.contract_version)?;
+        if prepared.market_id != market_id
+            || !valid_handle(&prepared.twap_control_id, "twctl_")
+            || !valid_handle(&prepared.twap_id, "twap_")
+            || prepared.expires_at_ms == 0
+        {
+            return Err(SdkError::InvalidResponse(
+                "prepared TWAP control is invalid".to_owned(),
+            ));
+        }
+        canonical_base64(&prepared.transaction_base64, "transaction_base64")?;
+        canonical_base58_32(&prepared.recent_blockhash, "recent_blockhash")?;
+        if let PlatformTwapPrepareRequest::Direct(operation) = &request {
+            if prepared.action != twap_request_action(operation) {
+                return Err(SdkError::InvalidResponse(
+                    "prepared TWAP action does not match request".to_owned(),
+                ));
+            }
+        }
+        Ok(prepared)
+    }
+
+    /// Submit one externally signed TWAP transaction idempotently.
+    pub async fn twap_submit(
+        &self,
+        market_id: &str,
+        request: PlatformTwapSubmitRequest,
+    ) -> Result<PlatformTwapSubmitResponse, SdkError> {
+        let market_id = validate_platform_market_id(market_id)?;
+        if !valid_handle(&request.twap_control_id, "twctl_") {
+            return Err(SdkError::InvalidRequest(
+                "twap_control_id is invalid".to_owned(),
+            ));
+        }
+        let request = PlatformTwapSubmitRequest {
+            twap_control_id: request.twap_control_id,
+            signed_transaction_base64: canonical_base64(
+                &request.signed_transaction_base64,
+                "signed_transaction_base64",
+            )?,
+            idempotency_key: normalize_idempotency_key(&request.idempotency_key)?,
+        };
+        let submitted: PlatformTwapSubmitResponse = self
+            .post(&format!("v2/markets/{market_id}/twaps/submit"), &request)
+            .await?;
+        validate_platform_version(submitted.schema_version, &submitted.contract_version)?;
+        if submitted.market_id != market_id
+            || submitted.twap_control_id != request.twap_control_id
+            || !valid_handle(&submitted.twap_id, "twap_")
+            || submitted.status != PlatformOrderSubmissionStatus::Submitted
+        {
+            return Err(SdkError::InvalidResponse(
+                "TWAP control receipt is invalid".to_owned(),
+            ));
+        }
+        canonical_signature(&submitted.signature, "signature")?;
+        Ok(submitted)
+    }
+
+    /// Complete the externally signed TWAP flow with one signature: the
+    /// action is bound and built in one step (direct prepare), the prepared
+    /// bindings are checked against the request, the mandatory verifier runs
+    /// (see [`DefaultTransactionVerifier`]), and only then is the session's
+    /// transaction signature requested. `SessionSigner::sign_message` is not
+    /// called on this path.
+    pub async fn execute_twap<S, V>(
+        &self,
+        market_id: &str,
+        operation: &TwapExecuteOperation,
+        signer: &S,
+        verifier: &V,
+        idempotency_key: Option<&str>,
+    ) -> Result<PlatformTwapSubmitResponse, SdkError>
+    where
+        S: SessionSigner + ?Sized,
+        V: TwapVerifier + ?Sized,
+    {
+        let market_id = validate_platform_market_id(market_id)?;
+        let session_public_key = canonical_public_key(signer.public_key(), "session_public_key")?;
+        let request = normalize_twap_challenge_request(
+            operation.challenge_request(session_public_key.clone()),
+        )?;
+        let owner_wallet = twap_request_owner(&request).to_owned();
+        // One signature: the action is bound and built in one step and the
+        // session signs only the resulting transaction.
+        let prepared = self
+            .twap_prepare(
+                &market_id,
+                PlatformTwapPrepareRequest::Direct(request.clone()),
+            )
+            .await?;
+        validate_twap_direct_binding(&prepared, &request, &market_id)?;
+        verifier
+            .verify(&TwapVerificationContext {
+                challenge: None,
+                operation: &request,
+                market_id: &market_id,
+                prepared: &prepared,
+                owner_wallet: &owner_wallet,
+                session_public_key: &session_public_key,
+            })
+            .await
+            .map_err(SdkError::Verification)?;
+        let signed_transaction = signer
+            .sign_transaction(&prepared.transaction_base64)
+            .await
+            .map_err(SdkError::Signer)?;
+        self.twap_submit(
+            &market_id,
+            PlatformTwapSubmitRequest {
+                twap_control_id: prepared.twap_control_id.clone(),
+                signed_transaction_base64: canonical_base64(
+                    &signed_transaction,
+                    "signed_transaction_base64",
+                )?,
+                idempotency_key: normalize_idempotency_key(
+                    idempotency_key.unwrap_or(&prepared.twap_control_id),
+                )?,
+            },
+        )
+        .await
+    }
+
+    /// Execute one resting-order operation with one signature while all
+    /// private keys and signing policy remain in the caller's signer adapter.
+    /// The operation is bound and built in one step (direct prepare), the
+    /// prepared bindings are checked against the request, and the mandatory
+    /// verifier (see [`DefaultTransactionVerifier`], which decodes the
+    /// transaction and requires it to be exactly this operation) runs before
+    /// the transaction signature is requested. `SessionSigner::sign_message`
+    /// is not called on this path.
     pub async fn execute_order<S, V>(
         &self,
         market_id: &str,
@@ -648,35 +2410,21 @@ impl StrataClient {
                 "session_public_key must be distinct from owner_wallet".to_owned(),
             ));
         }
-        let challenge = self.order_challenge(&market_id, request.clone()).await?;
-        if challenge.action != order_request_action(&request) {
-            return Err(SdkError::InvalidResponse(
-                "order challenge action changed".to_owned(),
-            ));
-        }
-        let authorization = validate_order_authorization(&challenge, &request)?;
-        let signature = signer
-            .sign_message(&authorization.bytes)
-            .await
-            .map_err(SdkError::Signer)?;
-        if signature.len() != 64 {
-            return Err(SdkError::InvalidResponse(
-                "order authorization signature must contain 64 bytes".to_owned(),
-            ));
-        }
+        // One signature: the operation is bound and built in one step and the
+        // session signs only the resulting transaction, after the verifier
+        // has checked it is exactly this operation.
         let prepared = self
             .order_prepare(
                 &market_id,
-                PlatformOrderPrepareRequest {
-                    challenge_id: challenge.challenge_id.clone(),
-                    authorization_signature: bs58::encode(signature).into_string(),
-                },
+                PlatformOrderPrepareRequest::Direct(request.clone()),
             )
             .await?;
-        validate_order_prepare_binding(&prepared, &challenge, &authorization)?;
+        validate_order_direct_binding(&prepared, &request, &market_id)?;
         verifier
             .verify(&OrderVerificationContext {
-                challenge: &challenge,
+                challenge: None,
+                operation: &request,
+                market_id: &market_id,
                 prepared: &prepared,
                 owner_wallet: &owner_wallet,
                 session_public_key: &session_public_key,
@@ -702,14 +2450,18 @@ impl StrataClient {
         .await
     }
 
-    /// Execute one short-lived Sonar quote without giving the SDK custody of a
-    /// session private key. The transaction verifier always runs before the
-    /// session adapter is allowed to sign.
+    /// Execute one short-lived Sonar quote with one signature, without giving
+    /// the SDK custody of a session private key. The quote is bound and built
+    /// in one step (direct prepare), the prepared bindings are checked against
+    /// the quote, and the transaction verifier (see
+    /// [`DefaultTransactionVerifier`]) always runs before the session adapter
+    /// is allowed to sign. `SessionSigner::sign_message` is not called on this
+    /// path.
     pub async fn execute_quote<S, V>(
         &self,
         quote: &QuoteResponse,
         owner_wallet: &str,
-        account_sequence: u64,
+        account_sequence: Option<u64>,
         signer: &S,
         verifier: &V,
         idempotency_key: Option<&str>,
@@ -742,48 +2494,24 @@ impl StrataClient {
                 .strip_suffix("/quote")
                 .ok_or_else(|| SdkError::OperationUnavailable(market.label.clone()))?
         );
-        let challenge: ExecutionChallengeResponse = self
-            .post(
-                &format!("{execution_path}/challenge"),
-                &ExecutionChallengeRequest {
-                    quote_id: quote.quote_id.clone(),
-                    owner_wallet: owner_wallet.clone(),
-                    session_public_key: session_public_key.clone(),
-                    account_sequence: account_sequence.to_string(),
-                },
-            )
-            .await?;
-        validate_execution_challenge(&challenge, quote)?;
-        let authorization = validate_execution_authorization(
-            &challenge,
-            quote,
-            &owner_wallet,
-            &session_public_key,
-            account_sequence,
-        )?;
-        let signature = signer
-            .sign_message(&authorization.bytes)
-            .await
-            .map_err(SdkError::Signer)?;
-        if signature.len() != 64 {
-            return Err(SdkError::InvalidResponse(
-                "session authorization signature must contain 64 bytes".to_owned(),
-            ));
-        }
+        // One signature: the quote is bound and built in one step and the
+        // session signs only the resulting transaction.
         let prepared: ExecutionPrepareResponse = self
             .post(
                 &format!("{execution_path}/prepare"),
-                &ExecutionPrepareRequest {
-                    challenge_id: challenge.challenge_id.clone(),
-                    authorization_signature: bs58::encode(signature).into_string(),
-                },
+                &ExecutionPrepareRequest::Direct(ExecutionChallengeRequest {
+                    quote_id: quote.quote_id.clone(),
+                    owner_wallet: owner_wallet.clone(),
+                    session_public_key: session_public_key.clone(),
+                    account_sequence: account_sequence.map(|value| value.to_string()),
+                }),
             )
             .await?;
-        validate_execution_prepare(&prepared, quote, &challenge, &authorization)?;
+        validate_execution_direct_prepare(&prepared, quote)?;
         verifier
             .verify(&ExecutionVerificationContext {
                 quote,
-                challenge: &challenge,
+                challenge: None,
                 prepared: &prepared,
                 owner_wallet: &owner_wallet,
                 session_public_key: &session_public_key,
@@ -828,17 +2556,31 @@ impl StrataClient {
     async fn get<T: DeserializeOwned>(
         &self,
         path: &str,
-        query: &[(&str, &str)],
+        query: &[(String, String)],
+    ) -> Result<T, SdkError> {
+        self.get_with_headers(path, query, HeaderMap::new()).await
+    }
+
+    async fn get_with_headers<T: DeserializeOwned>(
+        &self,
+        path: &str,
+        query: &[(String, String)],
+        headers: HeaderMap,
     ) -> Result<T, SdkError> {
         let mut url = self.base_url.join(path).map_err(|error| {
             SdkError::InvalidBaseUrl(format!("could not join public operation: {error}"))
         })?;
-        url.query_pairs_mut().extend_pairs(query.iter().copied());
+        url.query_pairs_mut().extend_pairs(
+            query
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+        );
 
         let response = self
             .http
             .get(url)
             .header(reqwest::header::ACCEPT, "application/json")
+            .headers(headers)
             .send()
             .await?;
         let status = response.status();
@@ -860,6 +2602,36 @@ impl StrataClient {
             };
         }
         serde_json::from_slice(&bytes).map_err(|error| SdkError::InvalidResponse(error.to_string()))
+    }
+
+    async fn all_platform_market_ids(&self) -> Result<Vec<String>, SdkError> {
+        let mut market_ids = Vec::new();
+        let mut cursor = None;
+        let mut seen_cursors = HashSet::new();
+        loop {
+            let response = self
+                .platform_markets(PageRequest {
+                    cursor: cursor.clone(),
+                    limit: Some(MAX_PLATFORM_PAGE_SIZE),
+                })
+                .await?;
+            market_ids.extend(response.markets.into_iter().map(|market| market.market_id));
+            if !response.page.has_more {
+                break;
+            }
+            let next = response.page.next_cursor.ok_or_else(|| {
+                SdkError::InvalidResponse(
+                    "market pagination omitted the required next cursor".to_owned(),
+                )
+            })?;
+            if !seen_cursors.insert(next.clone()) {
+                return Err(SdkError::InvalidResponse(
+                    "market pagination repeated a cursor".to_owned(),
+                ));
+            }
+            cursor = Some(next);
+        }
+        normalize_market_ids(market_ids)
     }
 
     async fn post<T: DeserializeOwned, B: serde::Serialize>(
@@ -993,6 +2765,40 @@ fn validate_platform_version(schema_version: u16, contract_version: &str) -> Res
     Ok(())
 }
 
+fn validate_vault_preparation(preparation_id: &str, submit_by_ms: u64) -> Result<(), SdkError> {
+    if !valid_handle(preparation_id, "vp_") || submit_by_ms == 0 {
+        return Err(SdkError::InvalidResponse(
+            "Vault preparation identity is invalid".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_vault_submission(
+    response: &PlatformVaultSubmitResponse,
+    preparation_id: &str,
+) -> Result<(), SdkError> {
+    validate_platform_version(response.schema_version, &response.contract_version)?;
+    if response.preparation_id != preparation_id
+        || (response.status == PlatformVaultSubmissionStatus::Failed)
+            != response.failure_code.is_some()
+        || response.failure_code.as_deref().is_some_and(|code| {
+            code.len() < 3
+                || code.len() > 64
+                || !code
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_')
+        })
+    {
+        return Err(SdkError::InvalidResponse(
+            "Vault submission receipt is invalid".to_owned(),
+        ));
+    }
+    canonical_public_key(&response.wallet_address, "wallet_address")?;
+    canonical_signature(&response.signature, "signature")?;
+    Ok(())
+}
+
 fn validate_platform_market_id(value: &str) -> Result<String, SdkError> {
     let value = value.trim();
     if !valid_handle(value, "market_") {
@@ -1001,6 +2807,947 @@ fn validate_platform_market_id(value: &str) -> Result<String, SdkError> {
         ));
     }
     Ok(value.to_owned())
+}
+
+fn validate_platform_asset_id(value: &str) -> Result<String, SdkError> {
+    let value = value.trim();
+    if !valid_handle(value, "asset_") {
+        return Err(SdkError::InvalidRequest(
+            "asset_id must be an opaque Strata asset ID".to_owned(),
+        ));
+    }
+    Ok(value.to_owned())
+}
+
+fn validate_platform_authority(authority: &PlatformAuthority) -> Result<(), SdkError> {
+    if authority.permission_source != PermissionSource::ExternalAgentOwner
+        || authority.signing_location != SigningLocation::External
+        || authority.accepts_private_keys
+    {
+        return Err(SdkError::InvalidResponse(
+            "platform authority must remain with the external agent owner".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_platform_discovery(discovery: &PlatformDiscoveryResponse) -> Result<(), SdkError> {
+    validate_platform_version(discovery.schema_version, &discovery.contract_version)?;
+    validate_platform_authority(&discovery.authority)?;
+    let mut ids = HashSet::new();
+    if discovery.capabilities.iter().any(|capability| {
+        capability.id.trim().is_empty()
+            || capability.required_scope.trim().is_empty()
+            || capability.transports.is_empty()
+            || !ids.insert(capability.id.as_str())
+    }) {
+        return Err(SdkError::InvalidResponse(
+            "platform capability discovery is invalid".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_platform_action_graph(graph: &PlatformActionGraphResponse) -> Result<(), SdkError> {
+    validate_platform_version(graph.schema_version, &graph.contract_version)?;
+    validate_platform_authority(&graph.authority)?;
+    if graph.graph_version != "2.0" {
+        return Err(SdkError::InvalidResponse(
+            "unsupported platform action graph version".to_owned(),
+        ));
+    }
+
+    let entities = graph
+        .entities
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    if entities.len() != graph.entities.len()
+        || entities.contains("")
+        || graph.relations.iter().any(|relation| {
+            !entities.contains(relation.from.as_str())
+                || !entities.contains(relation.to.as_str())
+                || relation.kind.trim().is_empty()
+        })
+    {
+        return Err(SdkError::InvalidResponse(
+            "platform entity graph is invalid".to_owned(),
+        ));
+    }
+
+    let mut operation_ids = HashSet::new();
+    let mut operation_capabilities = HashMap::new();
+    if graph.operations.iter().any(|operation| {
+        operation.id.trim().is_empty()
+            || operation.capability_id.trim().is_empty()
+            || operation.summary.trim().is_empty()
+            || operation.transports.is_empty()
+            || !operation_ids.insert(operation.id.as_str())
+            || operation_capabilities
+                .insert(operation.id.as_str(), operation.capability_id.as_str())
+                .is_some()
+            || operation
+                .transports
+                .iter()
+                .any(|transport| match transport.transport {
+                    PlatformTransport::Http => {
+                        transport.method.as_deref().is_none_or(str::is_empty)
+                            || transport
+                                .path
+                                .as_deref()
+                                .is_none_or(|path| !valid_platform_operation_path(path))
+                            || transport.tool.is_some()
+                    }
+                    PlatformTransport::Websocket => {
+                        transport
+                            .path
+                            .as_deref()
+                            .is_none_or(|path| !valid_platform_operation_path(path))
+                            || transport.method.is_some()
+                            || transport.tool.is_some()
+                    }
+                    PlatformTransport::Mcp => {
+                        transport.tool.as_deref().is_none_or(str::is_empty)
+                            || transport.method.is_some()
+                            || transport.path.is_some()
+                    }
+                })
+    }) || !operation_ids.contains(graph.entry_operation_id.as_str())
+    {
+        return Err(SdkError::InvalidResponse(
+            "platform operation graph is invalid".to_owned(),
+        ));
+    }
+
+    let mut module_ids = HashSet::new();
+    if graph.modules.iter().any(|module| {
+        module.id.trim().is_empty()
+            || module.client_property.trim().is_empty()
+            || module.capability_ids.is_empty()
+            || !module_ids.insert(module.id.as_str())
+    }) {
+        return Err(SdkError::InvalidResponse(
+            "platform module graph is invalid".to_owned(),
+        ));
+    }
+
+    let mut workflow_ids = HashSet::new();
+    let mut covered_operation_ids = HashSet::new();
+    if graph.workflows.iter().any(|workflow| {
+        if workflow.id.trim().is_empty() || !workflow_ids.insert(workflow.id.as_str()) {
+            return true;
+        }
+        let node_ids = workflow
+            .nodes
+            .iter()
+            .map(|node| node.id.as_str())
+            .collect::<HashSet<_>>();
+        let mut outgoing = node_ids
+            .iter()
+            .copied()
+            .map(|node_id| (node_id, Vec::new()))
+            .collect::<HashMap<_, _>>();
+        let nodes_are_invalid = node_ids.len() != workflow.nodes.len()
+            || !node_ids.contains(workflow.entry_node.as_str())
+            || workflow.nodes.iter().any(|node| {
+                if node.id.trim().is_empty() {
+                    return true;
+                }
+                match node.capability_id.as_deref() {
+                    None => node.kind
+                        != strata_public_contract::platform::PlatformActionKind::ExternalSignature
+                        || !node.operation_ids.is_empty(),
+                    Some(capability_id) => node.kind
+                        == strata_public_contract::platform::PlatformActionKind::ExternalSignature
+                        || node.operation_ids.is_empty()
+                        || node.operation_ids.iter().any(|operation_id| {
+                            let Some(operation_capability) =
+                                operation_capabilities.get(operation_id.as_str())
+                            else {
+                                return true;
+                            };
+                            if *operation_capability != capability_id {
+                                return true;
+                            }
+                            covered_operation_ids.insert(operation_id.as_str());
+                            false
+                        }),
+                }
+            });
+        if nodes_are_invalid || workflow.edges.is_empty() {
+            return true;
+        }
+        if workflow.edges.iter().any(|edge| {
+            if !node_ids.contains(edge.from.as_str())
+                || !node_ids.contains(edge.to.as_str())
+                || edge.condition.trim().is_empty()
+            {
+                return true;
+            }
+            outgoing
+                .get_mut(edge.from.as_str())
+                .expect("validated workflow source node")
+                .push(edge.to.as_str());
+            false
+        }) {
+            return true;
+        }
+        let mut reached = HashSet::from([workflow.entry_node.as_str()]);
+        let mut pending = vec![workflow.entry_node.as_str()];
+        while let Some(node_id) = pending.pop() {
+            for target in outgoing.get(node_id).into_iter().flatten() {
+                if reached.insert(*target) {
+                    pending.push(*target);
+                }
+            }
+        }
+        reached.len() != node_ids.len()
+    }) {
+        return Err(SdkError::InvalidResponse(
+            "platform workflow graph is invalid".to_owned(),
+        ));
+    }
+    if covered_operation_ids.len() != operation_ids.len() {
+        return Err(SdkError::InvalidResponse(
+            "platform action graph contains an orphaned operation".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn valid_platform_operation_path(path: &str) -> bool {
+    path.starts_with('/')
+        && !path.starts_with("//")
+        && !path.contains("..")
+        && !path.to_ascii_lowercase().contains("/internal")
+        && !path.to_ascii_lowercase().contains("/admin")
+}
+
+fn validate_platform_market_response(
+    schema_version: u16,
+    contract_version: &str,
+    actual_market_id: &str,
+    expected_market_id: &str,
+) -> Result<(), SdkError> {
+    validate_platform_version(schema_version, contract_version)?;
+    if actual_market_id != expected_market_id {
+        return Err(SdkError::InvalidResponse(
+            "response market does not match request".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_page_request(request: PageRequest) -> Result<Vec<(String, String)>, SdkError> {
+    let mut query = Vec::new();
+    if let Some(limit) = request.limit {
+        if !(1..=MAX_PLATFORM_PAGE_SIZE).contains(&limit) {
+            return Err(SdkError::InvalidRequest(format!(
+                "page limit must be between 1 and {MAX_PLATFORM_PAGE_SIZE}"
+            )));
+        }
+        query.push(("limit".to_owned(), limit.to_string()));
+    }
+    if let Some(cursor) = request.cursor {
+        let cursor = cursor.trim();
+        if cursor.is_empty()
+            || cursor.len() > 512
+            || !cursor
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+        {
+            return Err(SdkError::InvalidRequest(
+                "cursor must be a non-empty opaque URL-safe value".to_owned(),
+            ));
+        }
+        query.push(("cursor".to_owned(), cursor.to_owned()));
+    }
+    Ok(query)
+}
+
+fn validate_page_info(page: &PageInfo) -> Result<(), SdkError> {
+    match (&page.next_cursor, page.has_more) {
+        (Some(cursor), true)
+            if !cursor.is_empty()
+                && cursor.len() <= 512
+                && cursor
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-') =>
+        {
+            Ok(())
+        }
+        (None, false) => Ok(()),
+        _ => Err(SdkError::InvalidResponse(
+            "pagination metadata is inconsistent".to_owned(),
+        )),
+    }
+}
+
+fn validate_response_atoms(value: &str, field: &str, allow_zero: bool) -> Result<u64, SdkError> {
+    if value.is_empty()
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+        || (value.len() > 1 && value.starts_with('0'))
+    {
+        return Err(SdkError::InvalidResponse(format!(
+            "{field} must be a canonical unsigned atomic decimal string"
+        )));
+    }
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|_| SdkError::InvalidResponse(format!("{field} exceeds u64")))?;
+    if !allow_zero && parsed == 0 {
+        return Err(SdkError::InvalidResponse(format!(
+            "{field} must be greater than zero"
+        )));
+    }
+    Ok(parsed)
+}
+
+fn validate_book_level(level: &PlatformBookLevel) -> Result<(u64, u64), SdkError> {
+    Ok((
+        validate_response_atoms(&level.price_atoms, "price_atoms", false)?,
+        validate_response_atoms(&level.size_atoms, "size_atoms", false)?,
+    ))
+}
+
+fn validate_book_levels(
+    bids: &[PlatformBookLevel],
+    asks: &[PlatformBookLevel],
+) -> Result<(), SdkError> {
+    let bid_prices = bids
+        .iter()
+        .map(validate_book_level)
+        .collect::<Result<Vec<_>, _>>()?;
+    let ask_prices = asks
+        .iter()
+        .map(validate_book_level)
+        .collect::<Result<Vec<_>, _>>()?;
+    if bid_prices
+        .windows(2)
+        .any(|levels| levels[0].0 <= levels[1].0)
+        || ask_prices
+            .windows(2)
+            .any(|levels| levels[0].0 >= levels[1].0)
+        || bid_prices
+            .first()
+            .zip(ask_prices.first())
+            .is_some_and(|(bid, ask)| bid.0 >= ask.0)
+    {
+        return Err(SdkError::InvalidResponse(
+            "book levels are not strictly ordered".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn canonical_decimal(value: &str, field: &str) -> Result<(), SdkError> {
+    let (mantissa, exponent) = value
+        .split_once(['e', 'E'])
+        .map_or((value, None), |(mantissa, exponent)| {
+            (mantissa, Some(exponent))
+        });
+    let (whole, fraction) = mantissa
+        .split_once('.')
+        .map_or((mantissa, None), |(whole, fraction)| {
+            (whole, Some(fraction))
+        });
+    let valid_whole = whole == "0"
+        || (!whole.starts_with('0') && whole.bytes().all(|byte| byte.is_ascii_digit()));
+    let valid_fraction = fraction.is_none_or(|fraction| {
+        !fraction.is_empty() && fraction.bytes().all(|byte| byte.is_ascii_digit())
+    });
+    let valid_exponent = exponent.is_none_or(|exponent| {
+        let digits = exponent.strip_prefix(['+', '-']).unwrap_or(exponent);
+        !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+    });
+    if !valid_whole
+        || !valid_fraction
+        || !valid_exponent
+        || value.parse::<f64>().is_err()
+        || !value.parse::<f64>().is_ok_and(f64::is_finite)
+    {
+        return Err(SdkError::InvalidResponse(format!(
+            "{field} must be a canonical non-negative decimal string"
+        )));
+    }
+    Ok(())
+}
+
+fn platform_history_range(range: PlatformPortfolioHistoryRange) -> &'static str {
+    match range {
+        PlatformPortfolioHistoryRange::Day => "24h",
+        PlatformPortfolioHistoryRange::Week => "7d",
+        PlatformPortfolioHistoryRange::Month => "30d",
+    }
+}
+
+fn normalize_fill_limit(value: Option<u16>) -> Result<u16, SdkError> {
+    match value {
+        Some(limit @ 1..=200) => Ok(limit),
+        Some(_) => Err(SdkError::InvalidRequest(
+            "fill limit must be between 1 and 200".to_owned(),
+        )),
+        None => Ok(DEFAULT_ACCOUNT_FILL_LIMIT),
+    }
+}
+
+fn normalize_market_ids(values: Vec<String>) -> Result<Vec<String>, SdkError> {
+    let mut ids = Vec::with_capacity(values.len());
+    let mut seen = HashSet::new();
+    for value in values {
+        let id = validate_platform_market_id(&value)?;
+        if seen.insert(id.clone()) {
+            ids.push(id);
+        }
+    }
+    Ok(ids)
+}
+
+pub fn account_http_auth_message(
+    market_id: &str,
+    wallet_address: &str,
+    timestamp_ms: u64,
+    fill_limit: u16,
+) -> Result<Vec<u8>, SdkError> {
+    let market_id = validate_platform_market_id(market_id)?;
+    let wallet_address = canonical_public_key(wallet_address, "wallet_address")?;
+    let fill_limit = normalize_fill_limit(Some(fill_limit))?;
+    Ok(format!(
+        "strata:account-read:v2\n{market_id}\n{wallet_address}\n{timestamp_ms}\n{fill_limit}"
+    )
+    .into_bytes())
+}
+
+/// Optional signed-read headers (deprecated path); public reads send none.
+fn maker_auth_headers(authorization: Option<(u64, &str)>) -> Result<HeaderMap, SdkError> {
+    let mut headers = HeaderMap::new();
+    if let Some((authorization_time_ms, authorization_signature)) = authorization {
+        headers.insert(
+            "x-strata-auth-time",
+            HeaderValue::from_str(&authorization_time_ms.to_string()).map_err(|_| {
+                SdkError::InvalidRequest("maker authorization time is invalid".to_owned())
+            })?,
+        );
+        headers.insert(
+            "x-strata-auth-signature",
+            HeaderValue::from_str(authorization_signature).map_err(|_| {
+                SdkError::InvalidRequest("maker authorization signature is invalid".to_owned())
+            })?,
+        );
+    }
+    Ok(headers)
+}
+
+pub fn maker_status_auth_message(
+    market_id: &str,
+    wallet_address: &str,
+    timestamp_ms: u64,
+) -> Result<Vec<u8>, SdkError> {
+    let market_id = validate_platform_market_id(market_id)?;
+    let wallet_address = canonical_public_key(wallet_address, "wallet_address")?;
+    Ok(
+        format!("strata:mm-status-read:v2\n{market_id}\n{wallet_address}\n{timestamp_ms}")
+            .into_bytes(),
+    )
+}
+
+fn validate_maker_status(response: &PlatformMakerStatusResponse) -> Result<(), SdkError> {
+    let invalid = |detail: &str| SdkError::InvalidResponse(format!("maker status {detail}"));
+    if !valid_handle(&response.maker_id, "maker_") {
+        return Err(invalid("maker_id is invalid"));
+    }
+    let current_slot = validate_response_u128(&response.current_slot, "current_slot")?;
+    let firm = &response.firm_orders;
+    if u64::from(firm.bid_orders) + u64::from(firm.ask_orders) != u64::from(firm.resting_orders) {
+        return Err(invalid("firm order counts are inconsistent"));
+    }
+    validate_response_u128(&firm.bid_size_atoms, "bid_size_atoms")?;
+    validate_response_u128(&firm.ask_size_atoms, "ask_size_atoms")?;
+    let mut expected_active: u32 = u32::from(firm.resting_orders > 0);
+    if let Some(intent) = &response.intent {
+        let minimum = validate_response_u128(&intent.minimum_price_atoms, "minimum_price_atoms")?;
+        let maximum = validate_response_u128(&intent.maximum_price_atoms, "maximum_price_atoms")?;
+        let maximum_fill =
+            validate_response_u128(&intent.maximum_fill_size_atoms, "maximum_fill_size_atoms")?;
+        let remaining = validate_response_u128(
+            &intent.remaining_fill_size_atoms,
+            "remaining_fill_size_atoms",
+        )?;
+        validate_response_u128(&intent.stake_atoms, "stake_atoms")?;
+        if minimum > maximum || remaining > maximum_fill || intent.minimum_spread_bps > 10_000 {
+            return Err(invalid("intent bounds are inconsistent"));
+        }
+        expected_active += u32::from(intent.active);
+    }
+    if response.signed_quotes.live_quotes.len() > 2 {
+        return Err(invalid("cannot hold more than one live quote per side"));
+    }
+    for quote in &response.signed_quotes.live_quotes {
+        validate_response_u128(&quote.price_atoms, "price_atoms")?;
+        validate_response_u128(&quote.size_atoms, "size_atoms")?;
+        validate_response_u128(&quote.nonce, "nonce")?;
+        if quote.expires_at_ms < quote.issued_at_ms {
+            return Err(invalid("signed quote expires before it was issued"));
+        }
+    }
+    if response.strands.len() > 256 || response.currents.len() > 256 {
+        return Err(invalid("maker product lists exceed the bounded size"));
+    }
+    for strand in &response.strands {
+        validate_response_u128(&strand.mid_price_atoms, "mid_price_atoms")?;
+        validate_response_u128(&strand.tick_size_atoms, "tick_size_atoms")?;
+        let maximum =
+            validate_response_u128(&strand.maximum_exposure_atoms, "maximum_exposure_atoms")?;
+        let remaining =
+            validate_response_u128(&strand.remaining_exposure_atoms, "remaining_exposure_atoms")?;
+        if remaining > maximum || strand.bids.len() > 16 || strand.asks.len() > 16 {
+            return Err(invalid("strand exposure or levels are inconsistent"));
+        }
+        for level in strand.bids.iter().chain(strand.asks.iter()) {
+            if let Some(price) = &level.price_atoms {
+                validate_response_u128(price, "price_atoms")?;
+            }
+            let size = validate_response_u128(&level.size_atoms, "size_atoms")?;
+            let remaining =
+                validate_response_u128(&level.remaining_size_atoms, "remaining_size_atoms")?;
+            if remaining > size {
+                return Err(invalid("strand level remaining exceeds size"));
+            }
+        }
+        let expected_expired = match &strand.valid_until_slot {
+            Some(slot) => current_slot > validate_response_u128(slot, "valid_until_slot")?,
+            None => false,
+        };
+        if strand.expired != expected_expired {
+            return Err(invalid("strand expiry disagrees with the current slot"));
+        }
+        expected_active += u32::from(strand.enabled && !strand.expired);
+    }
+    for current in &response.currents {
+        let maximum =
+            validate_response_u128(&current.maximum_exposure_atoms, "maximum_exposure_atoms")?;
+        let remaining = validate_response_u128(
+            &current.remaining_exposure_atoms,
+            "remaining_exposure_atoms",
+        )?;
+        if remaining > maximum
+            || current.bid_depth_atoms.len() > 8
+            || current.ask_depth_atoms.len() > 8
+            || current.half_spread_bps > 10_000
+            || current.band_step_bps > 10_000
+            || current.sync_spread_bps > 10_000
+        {
+            return Err(invalid("current exposure or bands are inconsistent"));
+        }
+        for depth in current
+            .bid_depth_atoms
+            .iter()
+            .chain(current.ask_depth_atoms.iter())
+        {
+            validate_response_u128(depth, "depth_atoms")?;
+        }
+        let expected_expired = match &current.valid_until_slot {
+            Some(slot) => current_slot > validate_response_u128(slot, "valid_until_slot")?,
+            None => false,
+        };
+        if current.expired != expected_expired {
+            return Err(invalid("current expiry disagrees with the current slot"));
+        }
+        expected_active += u32::from(current.enabled && !current.expired);
+    }
+    if response.dead_man_guards.len() > 32 {
+        return Err(invalid("dead-man guard list exceeds the bounded size"));
+    }
+    for guard in &response.dead_man_guards {
+        canonical_public_key(&guard.session_public_key, "session_public_key")?;
+    }
+    if u32::from(response.active_products) != expected_active {
+        return Err(invalid(
+            "active_products disagrees with the reported products",
+        ));
+    }
+    Ok(())
+}
+
+pub fn maker_reputation_auth_message(
+    market_id: &str,
+    wallet_address: &str,
+    timestamp_ms: u64,
+) -> Result<Vec<u8>, SdkError> {
+    let market_id = validate_platform_market_id(market_id)?;
+    let wallet_address = canonical_public_key(wallet_address, "wallet_address")?;
+    Ok(
+        format!("strata:mm-reputation-read:v2\n{market_id}\n{wallet_address}\n{timestamp_ms}")
+            .into_bytes(),
+    )
+}
+
+fn validate_response_u128(value: &str, field: &str) -> Result<u128, SdkError> {
+    if value.is_empty()
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+        || (value.len() > 1 && value.starts_with('0'))
+    {
+        return Err(SdkError::InvalidResponse(format!(
+            "{field} must be a canonical unsigned atomic decimal string"
+        )));
+    }
+    value
+        .parse::<u128>()
+        .map_err(|_| SdkError::InvalidResponse(format!("{field} exceeds u128")))
+}
+
+fn validate_platform_portfolio(response: &PlatformPortfolioResponse) -> Result<(), SdkError> {
+    let invalid = |detail: &str| SdkError::InvalidResponse(format!("portfolio {detail}"));
+    validate_response_u128(&response.observed_slot, "observed_slot")?;
+    if response.observed_at_ms > response.server_time_ms {
+        return Err(invalid("cannot be observed after server time"));
+    }
+    if response.balances.len() > 10_000
+        || response.positions.len() > 10_000
+        || response.open_orders.len() > 10_000
+        || response.recent_fills.len() > 10_000
+        || response.unavailable_market_ids.len() > 10_000
+        || response.unpriced_asset_ids.len() > 10_000
+    {
+        return Err(invalid("collections exceed the bounded size"));
+    }
+    let mut seen_orders = std::collections::BTreeSet::new();
+    for order in &response.open_orders {
+        validate_platform_market_id(&order.market_id)?;
+        if !valid_handle(&order.order_id, "order_") || !seen_orders.insert(order.order_id.as_str())
+        {
+            return Err(invalid("open orders must carry unique opaque order IDs"));
+        }
+        let original = validate_response_u128(&order.original_size_atoms, "original_size_atoms")?;
+        let remaining =
+            validate_response_u128(&order.remaining_size_atoms, "remaining_size_atoms")?;
+        if remaining > original || original == 0 {
+            return Err(invalid("open order sizes are inconsistent"));
+        }
+    }
+    let mut seen_fills = std::collections::BTreeSet::new();
+    for fill in &response.recent_fills {
+        validate_platform_market_id(&fill.market_id)?;
+        if !valid_handle(&fill.fill_id, "fill_") || !seen_fills.insert(fill.fill_id.as_str()) {
+            return Err(invalid("recent fills must carry unique opaque fill IDs"));
+        }
+        validate_response_u128(&fill.price_atoms, "price_atoms")?;
+        validate_response_u128(&fill.size_atoms, "size_atoms")?;
+    }
+    for market_id in &response.unavailable_market_ids {
+        validate_platform_market_id(market_id)?;
+    }
+    let mut seen_assets = std::collections::BTreeSet::new();
+    let mut summed_value = 0u128;
+    for balance in &response.balances {
+        validate_platform_asset_id(&balance.asset_id)?;
+        if !seen_assets.insert(balance.asset_id.as_str()) {
+            return Err(invalid("balances must be unique per asset"));
+        }
+        let available = validate_response_u128(&balance.available_atoms, "available_atoms")?;
+        let locked = validate_response_u128(&balance.locked_atoms, "locked_atoms")?;
+        let total = validate_response_u128(&balance.total_atoms, "total_atoms")?;
+        if total == 0 || available.checked_add(locked) != Some(total) {
+            return Err(invalid("balance totals are inconsistent"));
+        }
+        let unpriced = response
+            .unpriced_asset_ids
+            .iter()
+            .any(|asset_id| asset_id == &balance.asset_id);
+        match &balance.value_usd_micros {
+            Some(value) if !unpriced => {
+                let value = validate_response_u128(value, "value_usd_micros")?;
+                summed_value = summed_value
+                    .checked_add(value)
+                    .ok_or_else(|| invalid("value overflow"))?;
+            }
+            None if unpriced => {}
+            _ => {
+                return Err(invalid(
+                    "balance valuation disagrees with unpriced_asset_ids",
+                ))
+            }
+        }
+    }
+    let mut seen_unpriced = std::collections::BTreeSet::new();
+    for asset_id in &response.unpriced_asset_ids {
+        validate_platform_asset_id(asset_id)?;
+        if !seen_unpriced.insert(asset_id.as_str()) || !seen_assets.contains(asset_id.as_str()) {
+            return Err(invalid("unpriced assets must be unique held assets"));
+        }
+    }
+    let mut seen_markets = std::collections::BTreeSet::new();
+    for position in &response.positions {
+        validate_platform_market_id(&position.market_id)?;
+        validate_platform_asset_id(&position.base_asset_id)?;
+        validate_platform_asset_id(&position.quote_asset_id)?;
+        if position.base_asset_id == position.quote_asset_id
+            || !seen_markets.insert(position.market_id.as_str())
+        {
+            return Err(invalid(
+                "positions must be unique markets with distinct assets",
+            ));
+        }
+        for (value, field) in [
+            (&position.base_available_atoms, "base_available_atoms"),
+            (&position.base_locked_atoms, "base_locked_atoms"),
+            (&position.quote_available_atoms, "quote_available_atoms"),
+            (&position.quote_locked_atoms, "quote_locked_atoms"),
+        ] {
+            validate_response_u128(value, field)?;
+        }
+    }
+    match (
+        response.valuation_complete,
+        &response.equity_usd_micros,
+        &response.available_usd_micros,
+        &response.locked_usd_micros,
+    ) {
+        (true, Some(equity), Some(available), Some(locked)) => {
+            if !response.unpriced_asset_ids.is_empty() {
+                return Err(invalid("complete valuation cannot list unpriced assets"));
+            }
+            let equity = validate_response_u128(equity, "equity_usd_micros")?;
+            let available = validate_response_u128(available, "available_usd_micros")?;
+            let locked = validate_response_u128(locked, "locked_usd_micros")?;
+            if available.checked_add(locked) != Some(equity) || summed_value != equity {
+                return Err(invalid("USD totals are inconsistent"));
+            }
+        }
+        (false, None, None, None) => {
+            if response.unpriced_asset_ids.is_empty() {
+                return Err(invalid("incomplete valuation must list unpriced assets"));
+            }
+        }
+        _ => return Err(invalid("valuation flags disagree with USD totals")),
+    }
+    Ok(())
+}
+
+fn validate_maker_reputation(response: &PlatformMakerReputationResponse) -> Result<(), SdkError> {
+    let expected_interval = if response.active {
+        match response.tier {
+            PlatformMakerReputationTier::Silver | PlatformMakerReputationTier::Gold => Some(100),
+            PlatformMakerReputationTier::Platinum => Some(10),
+            PlatformMakerReputationTier::Probation | PlatformMakerReputationTier::Bronze => None,
+        }
+    } else {
+        None
+    };
+    let expected_next_tier = match response.tier {
+        PlatformMakerReputationTier::Probation | PlatformMakerReputationTier::Bronze => {
+            Some(PlatformMakerReputationTier::Silver)
+        }
+        PlatformMakerReputationTier::Silver => Some(PlatformMakerReputationTier::Gold),
+        PlatformMakerReputationTier::Gold => Some(PlatformMakerReputationTier::Platinum),
+        PlatformMakerReputationTier::Platinum => None,
+    };
+    if !valid_handle(&response.maker_id, "maker_")
+        || response.reputation_score > 10_000
+        || response.fill_rate_bps > 10_000
+        || response.epoch_slashed_bps > 10_000
+        || response.minimum_quote_interval_ms != expected_interval
+        || response.signed_quote_stream_eligible != expected_interval.is_some()
+        || response.tier_progress.next_tier != expected_next_tier
+        || response
+            .tier_progress
+            .reputation_score_required
+            .is_some_and(|score| score > 10_000)
+    {
+        return Err(SdkError::InvalidResponse(
+            "maker reputation response violates its public contract".to_owned(),
+        ));
+    }
+    let total_quote_requests =
+        validate_response_atoms(&response.total_quote_requests, "total_quote_requests", true)?;
+    let stake_atoms = validate_response_atoms(&response.stake_atoms, "stake_atoms", true)?;
+    let tenure_slots = validate_response_atoms(&response.tenure_slots, "tenure_slots", true)?;
+    for (value, field) in [
+        (&response.successful_fills, "successful_fills"),
+        (&response.missed_quote_requests, "missed_quote_requests"),
+        (
+            &response.lifetime_filled_quote_atoms,
+            "lifetime_filled_quote_atoms",
+        ),
+        (&response.epoch_start_stake_atoms, "epoch_start_stake_atoms"),
+        (&response.epoch_slashed_atoms, "epoch_slashed_atoms"),
+        (
+            &response.lifetime_auto_slashed_atoms,
+            "lifetime_auto_slashed_atoms",
+        ),
+        (&response.registered_slot, "registered_slot"),
+        (&response.last_active_slot, "last_active_slot"),
+        (&response.last_settled_slot, "last_settled_slot"),
+    ] {
+        validate_response_atoms(value, field, true)?;
+    }
+    if let Some(value) = &response.revoked_at_slot {
+        validate_response_atoms(value, "revoked_at_slot", true)?;
+    }
+    let progress = &response.tier_progress;
+    let quote_requests_remaining = validate_response_atoms(
+        &progress.quote_requests_remaining,
+        "tier_progress.quote_requests_remaining",
+        true,
+    )?;
+    let stake_atoms_remaining = validate_response_atoms(
+        &progress.stake_atoms_remaining,
+        "tier_progress.stake_atoms_remaining",
+        true,
+    )?;
+    let tenure_slots_remaining = validate_response_atoms(
+        &progress.tenure_slots_remaining,
+        "tier_progress.tenure_slots_remaining",
+        true,
+    )?;
+    let quote_requests_required = progress
+        .quote_requests_required
+        .as_deref()
+        .map(|value| validate_response_atoms(value, "tier_progress.quote_requests_required", true))
+        .transpose()?;
+    let stake_atoms_required = progress
+        .stake_atoms_required
+        .as_deref()
+        .map(|value| validate_response_atoms(value, "tier_progress.stake_atoms_required", true))
+        .transpose()?;
+    let tenure_slots_required = progress
+        .tenure_slots_required
+        .as_deref()
+        .map(|value| validate_response_atoms(value, "tier_progress.tenure_slots_required", true))
+        .transpose()?;
+    let progress_shape_is_valid = match response.tier {
+        PlatformMakerReputationTier::Probation => {
+            progress.reputation_score_required == Some(5_000)
+                && quote_requests_required == Some(50)
+                && stake_atoms_required.is_none()
+                && tenure_slots_required.is_none()
+        }
+        PlatformMakerReputationTier::Bronze => {
+            progress.reputation_score_required == Some(5_000)
+                && quote_requests_required.is_none()
+                && stake_atoms_required.is_none()
+                && tenure_slots_required.is_none()
+        }
+        PlatformMakerReputationTier::Silver => {
+            progress.reputation_score_required == Some(7_500)
+                && quote_requests_required.is_none()
+                && stake_atoms_required.is_none()
+                && tenure_slots_required.is_none()
+        }
+        PlatformMakerReputationTier::Gold => {
+            progress.reputation_score_required == Some(9_000)
+                && quote_requests_required.is_none()
+                && stake_atoms_required.is_some()
+                && tenure_slots_required == Some(6_480_000)
+        }
+        PlatformMakerReputationTier::Platinum => {
+            progress.reputation_score_required.is_none()
+                && quote_requests_required.is_none()
+                && stake_atoms_required.is_none()
+                && tenure_slots_required.is_none()
+        }
+    };
+    let expected_reputation_remaining = progress
+        .reputation_score_required
+        .unwrap_or(response.reputation_score)
+        .saturating_sub(response.reputation_score);
+    if !progress_shape_is_valid
+        || progress.reputation_score_remaining != expected_reputation_remaining
+        || quote_requests_remaining
+            != quote_requests_required
+                .unwrap_or(total_quote_requests)
+                .saturating_sub(total_quote_requests)
+        || stake_atoms_remaining
+            != stake_atoms_required
+                .unwrap_or(stake_atoms)
+                .saturating_sub(stake_atoms)
+        || tenure_slots_remaining
+            != tenure_slots_required
+                .unwrap_or(tenure_slots)
+                .saturating_sub(tenure_slots)
+    {
+        return Err(SdkError::InvalidResponse(
+            "maker reputation tier progress is inconsistent".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_bug_message(value: &str) -> Result<String, SdkError> {
+    let message = value.trim();
+    if !(1..=2_000).contains(&message.chars().count()) {
+        return Err(SdkError::InvalidRequest(
+            "bug message must contain between 1 and 2,000 characters".to_owned(),
+        ));
+    }
+    Ok(message.to_owned())
+}
+
+pub fn bug_authorization_payload(message: &str) -> Result<Vec<u8>, SdkError> {
+    Ok(format!("strata-bug-report:v1:{}", normalize_bug_message(message)?).into_bytes())
+}
+
+fn normalize_referral_code(value: &str) -> Result<String, SdkError> {
+    let code = value.trim();
+    if code.is_empty()
+        || code.len() > 64
+        || !code
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        return Err(SdkError::InvalidRequest(
+            "referral_code must contain 1-64 letters, numbers, underscores, or dashes".to_owned(),
+        ));
+    }
+    Ok(code.to_owned())
+}
+
+pub fn referral_link_authorization_payload(referral_code: &str) -> Result<Vec<u8>, SdkError> {
+    Ok(format!(
+        "strata-referral:v1:{}",
+        normalize_referral_code(referral_code)?
+    )
+    .into_bytes())
+}
+
+pub fn referral_claim_authorization_payload(
+    payout_wallet_address: &str,
+) -> Result<Vec<u8>, SdkError> {
+    Ok(format!(
+        "strata-referral-claim:v1:{}",
+        canonical_public_key(payout_wallet_address, "payout_wallet_address")?
+    )
+    .into_bytes())
+}
+
+fn canonical_hex_signature(value: &str, field: &str) -> Result<String, SdkError> {
+    let signature = value
+        .trim()
+        .strip_prefix("0x")
+        .or_else(|| value.trim().strip_prefix("0X"))
+        .unwrap_or(value.trim())
+        .to_ascii_lowercase();
+    if signature.len() != 128
+        || !signature
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(SdkError::InvalidRequest(format!(
+            "{field} must be a 64-byte hexadecimal Ed25519 signature"
+        )));
+    }
+    Ok(signature)
+}
+
+/// Canonicalize an optional atomic value; `None` stays `None` so the server
+/// resolves it (the account sequence is the one such field today).
+fn canonical_optional_request_atoms(
+    value: Option<&str>,
+    field: &str,
+) -> Result<Option<String>, SdkError> {
+    value
+        .map(|value| canonical_request_atoms(value, field, true))
+        .transpose()
 }
 
 fn canonical_request_atoms(value: &str, field: &str, allow_zero: bool) -> Result<String, SdkError> {
@@ -1062,6 +3809,261 @@ fn canonical_base64(value: &str, field: &str) -> Result<String, SdkError> {
     Ok(value.to_owned())
 }
 
+fn normalize_twap_challenge_request(
+    request: PlatformTwapChallengeRequest,
+) -> Result<PlatformTwapChallengeRequest, SdkError> {
+    let request = match request {
+        PlatformTwapChallengeRequest::Place {
+            owner_wallet,
+            session_public_key,
+            side,
+            total_size_atoms,
+            slices_total,
+            maximum_tolerance_bps,
+            interval_slots,
+            limit_price_atoms,
+        } => {
+            if !(2..=120).contains(&slices_total)
+                || !(1..=1_000).contains(&maximum_tolerance_bps)
+                || !(25..=4_500).contains(&interval_slots)
+            {
+                return Err(SdkError::InvalidRequest(
+                    "TWAP schedule bounds are invalid".to_owned(),
+                ));
+            }
+            PlatformTwapChallengeRequest::Place {
+                owner_wallet: canonical_public_key(&owner_wallet, "owner_wallet")?,
+                session_public_key: canonical_public_key(
+                    &session_public_key,
+                    "session_public_key",
+                )?,
+                side,
+                total_size_atoms: canonical_request_atoms(
+                    &total_size_atoms,
+                    "total_size_atoms",
+                    false,
+                )?,
+                slices_total,
+                maximum_tolerance_bps,
+                interval_slots,
+                limit_price_atoms: canonical_request_atoms(
+                    &limit_price_atoms,
+                    "limit_price_atoms",
+                    false,
+                )?,
+            }
+        }
+        PlatformTwapChallengeRequest::Cancel {
+            owner_wallet,
+            session_public_key,
+            twap_id,
+        } => {
+            if !valid_handle(twap_id.trim(), "twap_") {
+                return Err(SdkError::InvalidRequest("twap_id is invalid".to_owned()));
+            }
+            PlatformTwapChallengeRequest::Cancel {
+                owner_wallet: canonical_public_key(&owner_wallet, "owner_wallet")?,
+                session_public_key: canonical_public_key(
+                    &session_public_key,
+                    "session_public_key",
+                )?,
+                twap_id: twap_id.trim().to_owned(),
+            }
+        }
+    };
+    if twap_request_owner(&request) == twap_request_session(&request) {
+        return Err(SdkError::InvalidRequest(
+            "session_public_key must be distinct from owner_wallet".to_owned(),
+        ));
+    }
+    Ok(request)
+}
+
+fn twap_request_action(request: &PlatformTwapChallengeRequest) -> PlatformTwapControlAction {
+    match request {
+        PlatformTwapChallengeRequest::Place { .. } => PlatformTwapControlAction::Place,
+        PlatformTwapChallengeRequest::Cancel { .. } => PlatformTwapControlAction::Cancel,
+    }
+}
+
+fn twap_request_owner(request: &PlatformTwapChallengeRequest) -> &str {
+    match request {
+        PlatformTwapChallengeRequest::Place { owner_wallet, .. }
+        | PlatformTwapChallengeRequest::Cancel { owner_wallet, .. } => owner_wallet,
+    }
+}
+
+fn twap_request_session(request: &PlatformTwapChallengeRequest) -> &str {
+    match request {
+        PlatformTwapChallengeRequest::Place {
+            session_public_key, ..
+        }
+        | PlatformTwapChallengeRequest::Cancel {
+            session_public_key, ..
+        } => session_public_key,
+    }
+}
+
+/// A parsed two-step TWAP authorization: the exact bytes to sign and the
+/// blockhash lease they bind.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TwapAuthorization {
+    pub bytes: Vec<u8>,
+    pub recent_blockhash: String,
+    pub last_valid_block_height: u64,
+}
+
+fn opaque_twap_id(pda: &[u8]) -> String {
+    opaque_product_id("twap", &bs58::encode(pda).into_string())
+}
+
+/// Two-step path helper: check a TWAP challenge's authorization payload
+/// binds exactly this request before signing it. The one-call
+/// [`StrataClient::execute_twap`] no longer needs it (one signature over the
+/// transaction).
+pub fn validate_twap_authorization(
+    challenge: &PlatformTwapChallengeResponse,
+    request: &PlatformTwapChallengeRequest,
+) -> Result<TwapAuthorization, SdkError> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(challenge.authorization_payload_base64.trim())
+        .map_err(|_| SdkError::InvalidResponse("TWAP authorization is not base64".to_owned()))?;
+    let owner = decode_public_key(twap_request_owner(request), "owner_wallet")?;
+    let session = decode_public_key(twap_request_session(request), "session_public_key")?;
+    let mut cursor = 0usize;
+    take_expected(
+        &bytes,
+        &mut cursor,
+        PUBLIC_TWAP_AUTH_DOMAIN,
+        "TWAP authorization domain",
+    )?;
+    take_bytes(&bytes, &mut cursor, 64, "TWAP authorization product")?;
+    take_expected(&bytes, &mut cursor, &owner, "TWAP authorization owner")?;
+    take_expected(&bytes, &mut cursor, &session, "TWAP authorization session")?;
+    let action = take_bytes(&bytes, &mut cursor, 1, "TWAP authorization action")?[0];
+    let expected_action = twap_request_action(request);
+    if action
+        != match expected_action {
+            PlatformTwapControlAction::Place => 0,
+            PlatformTwapControlAction::Cancel => 1,
+        }
+        || challenge.action != expected_action
+    {
+        return Err(SdkError::InvalidResponse(
+            "TWAP authorization action changed".to_owned(),
+        ));
+    }
+    let pda = match request {
+        PlatformTwapChallengeRequest::Place {
+            side,
+            total_size_atoms,
+            slices_total,
+            maximum_tolerance_bps,
+            interval_slots,
+            limit_price_atoms,
+            ..
+        } => {
+            let encoded_side = take_bytes(&bytes, &mut cursor, 1, "TWAP side")?[0];
+            let expected_side = match side {
+                PlatformTradeSide::Buy => 0,
+                PlatformTradeSide::Sell => 1,
+            };
+            if encoded_side != expected_side {
+                return Err(SdkError::InvalidResponse("TWAP side changed".to_owned()));
+            }
+            take_u64_eq(
+                &bytes,
+                &mut cursor,
+                parse_request_u64(total_size_atoms, "total_size_atoms")?,
+                "TWAP total size",
+            )?;
+            if take_u16(&bytes, &mut cursor, "TWAP slices")? != *slices_total
+                || take_u16(&bytes, &mut cursor, "TWAP tolerance")? != *maximum_tolerance_bps
+            {
+                return Err(SdkError::InvalidResponse(
+                    "TWAP schedule bounds changed".to_owned(),
+                ));
+            }
+            let interval_bytes: [u8; 4] = take_bytes(&bytes, &mut cursor, 4, "TWAP interval")?
+                .try_into()
+                .map_err(|_| SdkError::InvalidResponse("TWAP interval is invalid".to_owned()))?;
+            if u32::from_le_bytes(interval_bytes) != *interval_slots {
+                return Err(SdkError::InvalidResponse(
+                    "TWAP interval changed".to_owned(),
+                ));
+            }
+            take_u64_eq(
+                &bytes,
+                &mut cursor,
+                parse_request_u64(limit_price_atoms, "limit_price_atoms")?,
+                "TWAP limit price",
+            )?;
+            take_bytes(&bytes, &mut cursor, 8, "TWAP schedule nonce")?;
+            take_bytes(&bytes, &mut cursor, 32, "TWAP identity")?.to_vec()
+        }
+        PlatformTwapChallengeRequest::Cancel { twap_id, .. } => {
+            let pda = take_bytes(&bytes, &mut cursor, 32, "TWAP identity")?.to_vec();
+            if opaque_twap_id(&pda) != *twap_id {
+                return Err(SdkError::InvalidResponse(
+                    "TWAP cancellation identity changed".to_owned(),
+                ));
+            }
+            pda
+        }
+    };
+    if opaque_twap_id(&pda) != challenge.twap_id {
+        return Err(SdkError::InvalidResponse(
+            "TWAP authorization identity changed".to_owned(),
+        ));
+    }
+    let blockhash = take_bytes(&bytes, &mut cursor, 32, "TWAP recent blockhash")?;
+    let recent_blockhash = bs58::encode(blockhash).into_string();
+    let last_valid_block_height = take_u64(&bytes, &mut cursor, "TWAP block height")?;
+    take_u64_eq(
+        &bytes,
+        &mut cursor,
+        challenge.expires_at_ms,
+        "TWAP authorization expiry",
+    )?;
+    let nonce = take_bytes(&bytes, &mut cursor, 16, "TWAP authorization nonce")?;
+    if hex::encode(nonce) != challenge.challenge_id[4..] {
+        return Err(SdkError::InvalidResponse(
+            "TWAP challenge nonce changed".to_owned(),
+        ));
+    }
+    if cursor != bytes.len() {
+        return Err(SdkError::InvalidResponse(
+            "TWAP authorization contains unrecognized fields".to_owned(),
+        ));
+    }
+    Ok(TwapAuthorization {
+        bytes,
+        recent_blockhash,
+        last_valid_block_height,
+    })
+}
+
+/// Two-step path helper: check a prepared TWAP control preserved the signed
+/// challenge bindings.
+pub fn validate_twap_prepare_binding(
+    prepared: &PlatformTwapPrepareResponse,
+    challenge: &PlatformTwapChallengeResponse,
+    authorization: &TwapAuthorization,
+) -> Result<(), SdkError> {
+    if prepared.market_id != challenge.market_id
+        || prepared.action != challenge.action
+        || prepared.twap_id != challenge.twap_id
+        || prepared.recent_blockhash != authorization.recent_blockhash
+        || prepared.last_valid_block_height != authorization.last_valid_block_height
+        || prepared.expires_at_ms != challenge.expires_at_ms
+    {
+        return Err(SdkError::InvalidResponse(
+            "prepared TWAP control changed the signed bindings".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn normalize_order_challenge_request(
     request: PlatformOrderChallengeRequest,
 ) -> Result<PlatformOrderChallengeRequest, SdkError> {
@@ -1097,10 +4099,9 @@ fn normalize_order_challenge_request(
                     &session_public_key,
                     "session_public_key",
                 )?,
-                account_sequence: canonical_request_atoms(
-                    &account_sequence,
+                account_sequence: canonical_optional_request_atoms(
+                    account_sequence.as_deref(),
                     "account_sequence",
-                    true,
                 )?,
                 client_order_id,
                 side,
@@ -1228,10 +4229,9 @@ fn normalize_order_batch_operation(
         } => {
             let client_order_id = normalize_order_client_id(client_order_id, order_type)?;
             Ok(PlatformOrderBatchOperation::Place {
-                account_sequence: canonical_request_atoms(
-                    &account_sequence,
+                account_sequence: canonical_optional_request_atoms(
+                    account_sequence.as_deref(),
                     "account_sequence",
-                    true,
                 )?,
                 client_order_id,
                 side,
@@ -1267,10 +4267,9 @@ fn normalize_order_batch_operation(
             let client_order_id = normalize_order_client_id(client_order_id, order_type)?;
             Ok(PlatformOrderBatchOperation::Replace {
                 order_id: order_id.trim().to_owned(),
-                account_sequence: canonical_request_atoms(
-                    &account_sequence,
+                account_sequence: canonical_optional_request_atoms(
+                    account_sequence.as_deref(),
                     "account_sequence",
-                    true,
                 )?,
                 client_order_id,
                 side,
@@ -1348,10 +4347,31 @@ fn order_request_session(request: &PlatformOrderChallengeRequest) -> &str {
     }
 }
 
-struct OrderAuthorization {
-    bytes: Vec<u8>,
-    recent_blockhash: String,
-    last_valid_block_height: u64,
+/// A parsed two-step order authorization: the exact bytes to sign and the
+/// blockhash lease they bind.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OrderAuthorization {
+    pub bytes: Vec<u8>,
+    pub recent_blockhash: String,
+    pub last_valid_block_height: u64,
+}
+
+/// A supplied account sequence must match the signed authorization exactly; a
+/// sequence left to Strata is read from it (the server resolved it from the
+/// Vault's confirmed market account) and every other binding is still checked.
+fn take_order_account_sequence(
+    bytes: &[u8],
+    cursor: &mut usize,
+    account_sequence: Option<&str>,
+) -> Result<u64, SdkError> {
+    match account_sequence {
+        Some(expected) => {
+            let expected = parse_request_u64(expected, "account_sequence")?;
+            take_u64_eq(bytes, cursor, expected, "order account sequence")?;
+            Ok(expected)
+        }
+        None => take_u64(bytes, cursor, "order account sequence"),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1359,19 +4379,14 @@ fn validate_order_place_authorization(
     bytes: &[u8],
     cursor: &mut usize,
     challenge: &PlatformOrderChallengeResponse,
-    account_sequence: &str,
+    account_sequence: Option<&str>,
     client_order_id: &str,
     side: PlatformTradeSide,
     order_type: PlatformOrderType,
     limit_price_atoms: &str,
     size_atoms: &str,
 ) -> Result<String, SdkError> {
-    take_u64_eq(
-        bytes,
-        cursor,
-        parse_request_u64(account_sequence, "account_sequence")?,
-        "order account sequence",
-    )?;
+    take_order_account_sequence(bytes, cursor, account_sequence)?;
     let client_length = take_u16(bytes, cursor, "client order ID length")? as usize;
     if client_length != client_order_id.len() {
         return Err(SdkError::InvalidResponse(
@@ -1435,7 +4450,13 @@ fn validate_order_cancel_authorization(
     Ok(order_id)
 }
 
-fn validate_order_authorization(
+/// Two-step path helper: check an order challenge's authorization payload
+/// binds exactly this operation (every field, opaque order identity, and
+/// replay value) before signing it. The one-call
+/// [`StrataClient::execute_order`] no longer needs it (one signature over the
+/// transaction); the order command channel still uses it to bind the
+/// challenge without a message signature.
+pub fn validate_order_authorization(
     challenge: &PlatformOrderChallengeResponse,
     request: &PlatformOrderChallengeRequest,
 ) -> Result<OrderAuthorization, SdkError> {
@@ -1478,12 +4499,7 @@ fn validate_order_authorization(
             size_atoms,
             ..
         } => {
-            take_u64_eq(
-                &bytes,
-                &mut cursor,
-                parse_request_u64(account_sequence, "account_sequence")?,
-                "order account sequence",
-            )?;
+            take_order_account_sequence(&bytes, &mut cursor, account_sequence.as_deref())?;
             let client_length = take_u16(&bytes, &mut cursor, "client order ID length")? as usize;
             if client_length != client_order_id.len() {
                 return Err(SdkError::InvalidResponse(
@@ -1587,7 +4603,7 @@ fn validate_order_authorization(
                 &bytes,
                 &mut cursor,
                 challenge,
-                account_sequence,
+                account_sequence.as_deref(),
                 client_order_id,
                 *side,
                 *order_type,
@@ -1616,7 +4632,7 @@ fn validate_order_authorization(
                         &bytes,
                         &mut cursor,
                         challenge,
-                        account_sequence,
+                        account_sequence.as_deref(),
                         client_order_id,
                         *side,
                         *order_type,
@@ -1650,7 +4666,7 @@ fn validate_order_authorization(
                             &bytes,
                             &mut cursor,
                             challenge,
-                            account_sequence,
+                            account_sequence.as_deref(),
                             client_order_id,
                             *side,
                             *order_type,
@@ -1709,7 +4725,105 @@ fn validate_order_authorization(
     })
 }
 
-fn validate_order_prepare_binding(
+/// Direct-path binding: the prepared control must be for this market and
+/// action, and its echoed order IDs must follow the request — every
+/// requested cancel ID in request order (replace: old then new; batch
+/// flattened in request order) with one fresh ID per place. `cancel_all`
+/// only requires at least one order.
+fn validate_order_direct_binding(
+    prepared: &PlatformOrderPrepareResponse,
+    request: &PlatformOrderChallengeRequest,
+    market_id: &str,
+) -> Result<(), SdkError> {
+    let bound = prepared.market_id == market_id
+        && prepared.action == order_request_action(request)
+        && prepared
+            .order_ids
+            .iter()
+            .all(|order_id| valid_handle(order_id, "order_"))
+        && match request {
+            PlatformOrderChallengeRequest::Place { .. } => prepared.order_ids.len() == 1,
+            PlatformOrderChallengeRequest::Cancel { order_id, .. } => {
+                prepared.order_ids.len() == 1 && prepared.order_ids[0] == *order_id
+            }
+            PlatformOrderChallengeRequest::CancelAll { .. } => !prepared.order_ids.is_empty(),
+            PlatformOrderChallengeRequest::Replace { order_id, .. } => {
+                prepared.order_ids.len() == 2 && prepared.order_ids[0] == *order_id
+            }
+            PlatformOrderChallengeRequest::Batch { operations, .. } => {
+                let mut expected: Vec<Option<&str>> = Vec::new();
+                for operation in operations {
+                    match operation {
+                        PlatformOrderBatchOperation::Place { .. } => expected.push(None),
+                        PlatformOrderBatchOperation::Cancel { order_id } => {
+                            expected.push(Some(order_id))
+                        }
+                        PlatformOrderBatchOperation::Replace { order_id, .. } => {
+                            expected.push(Some(order_id));
+                            expected.push(None);
+                        }
+                    }
+                }
+                expected.len() == prepared.order_ids.len()
+                    && expected
+                        .iter()
+                        .zip(&prepared.order_ids)
+                        .all(|(expected, actual)| expected.is_none_or(|id| id == actual))
+            }
+        };
+    if !bound {
+        return Err(SdkError::InvalidResponse(
+            "prepared order control does not match the request".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// Direct-path binding: the prepared TWAP control must be for this market and
+/// action and, for a cancellation, the requested TWAP.
+fn validate_twap_direct_binding(
+    prepared: &PlatformTwapPrepareResponse,
+    request: &PlatformTwapChallengeRequest,
+    market_id: &str,
+) -> Result<(), SdkError> {
+    let bound = prepared.market_id == market_id
+        && prepared.action == twap_request_action(request)
+        && match request {
+            PlatformTwapChallengeRequest::Place { .. } => valid_handle(&prepared.twap_id, "twap_"),
+            PlatformTwapChallengeRequest::Cancel { twap_id, .. } => prepared.twap_id == *twap_id,
+        };
+    if !bound {
+        return Err(SdkError::InvalidResponse(
+            "prepared TWAP control does not match the request".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// The order-control prepare authorization, checked: a valid challenge handle
+/// and, when present, a canonical detached signature. `None` is sent as-is;
+/// only the session-authenticated order command channel accepts it.
+fn normalize_order_prepare_authorization(
+    authorization: PlatformOrderPrepareAuthorization,
+) -> Result<PlatformOrderPrepareAuthorization, SdkError> {
+    if !valid_handle(&authorization.challenge_id, "oc_") {
+        return Err(SdkError::InvalidRequest(
+            "order challenge_id is invalid".to_owned(),
+        ));
+    }
+    Ok(PlatformOrderPrepareAuthorization {
+        challenge_id: authorization.challenge_id,
+        authorization_signature: authorization
+            .authorization_signature
+            .as_deref()
+            .map(|signature| canonical_signature(signature, "authorization_signature"))
+            .transpose()?,
+    })
+}
+
+/// Two-step path helper: check a prepared order control preserved the signed
+/// challenge bindings.
+pub fn validate_order_prepare_binding(
     prepared: &PlatformOrderPrepareResponse,
     challenge: &PlatformOrderChallengeResponse,
     authorization: &OrderAuthorization,
@@ -1741,15 +4855,27 @@ fn take_u16(source: &[u8], cursor: &mut usize, field: &str) -> Result<u16, SdkEr
     Ok(u16::from_le_bytes(bytes))
 }
 
-fn opaque_order_id(market_id: &str, order: &[u8]) -> String {
+/// Opaque product identity: `{kind}_` + hex of the first 16 bytes of
+/// `sha256("strata-sdk-product:v1\0{kind}\0{value}")`.
+pub(crate) fn opaque_product_id(kind: &str, value: &str) -> String {
     let mut digest = Sha256::new();
     digest.update(b"strata-sdk-product:v1\0");
-    digest.update(b"order");
+    digest.update(kind.as_bytes());
     digest.update([0]);
-    digest.update(market_id.as_bytes());
-    digest.update(b":");
-    digest.update(bs58::encode(order).into_string().as_bytes());
-    format!("order_{}", hex::encode(&digest.finalize()[..16]))
+    digest.update(value.as_bytes());
+    format!("{kind}_{}", hex::encode(&digest.finalize()[..16]))
+}
+
+/// The opaque market ID for a base58 market account key.
+pub(crate) fn opaque_market_id(market_key: &str) -> String {
+    opaque_product_id("market", market_key)
+}
+
+pub(crate) fn opaque_order_id(market_id: &str, order: &[u8]) -> String {
+    opaque_product_id(
+        "order",
+        &format!("{market_id}:{}", bs58::encode(order).into_string()),
+    )
 }
 
 fn parse_atoms(field: &str, value: &str) -> Result<u64, SdkError> {
@@ -1778,17 +4904,85 @@ fn valid_public_operation_path(path: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
+/// Which amount a quote request fixes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QuoteTarget {
+    /// Spend exactly this input.
+    ExactInput(u64),
+    /// Receive at least this output; Strata resolves the input.
+    ExactOutput(u64),
+}
+
+impl QuoteTarget {
+    pub fn amount(self) -> u64 {
+        match self {
+            Self::ExactInput(amount) | Self::ExactOutput(amount) => amount,
+        }
+    }
+}
+
+/// The output floor an exact-output quote must carry: the requested amount
+/// lowered by `maximum_tolerance_bps` (truncating), zero tolerance meaning the
+/// requested amount itself.
+pub fn exact_output_floor(amount_out: u64, maximum_tolerance_bps: u16) -> u64 {
+    u64::try_from(
+        u128::from(amount_out) * u128::from(10_000u16.saturating_sub(maximum_tolerance_bps))
+            / 10_000,
+    )
+    .unwrap_or(0)
+}
+
+/// Exactly one of `amount_in_atoms` / `amount_out_atoms`, canonical and > 0.
+pub fn quote_target(request: &QuoteRequest) -> Result<QuoteTarget, SdkError> {
+    match (
+        request.amount_in_atoms.as_deref(),
+        request.amount_out_atoms.as_deref(),
+    ) {
+        (Some(amount_in), None) => {
+            let amount = parse_atoms("amount_in_atoms", amount_in)?;
+            if amount == 0 {
+                return Err(SdkError::InvalidRequest(
+                    "amount_in_atoms must be greater than zero".to_owned(),
+                ));
+            }
+            Ok(QuoteTarget::ExactInput(amount))
+        }
+        (None, Some(amount_out)) => {
+            let amount = parse_atoms("amount_out_atoms", amount_out)?;
+            if amount == 0 {
+                return Err(SdkError::InvalidRequest(
+                    "amount_out_atoms must be greater than zero".to_owned(),
+                ));
+            }
+            Ok(QuoteTarget::ExactOutput(amount))
+        }
+        _ => Err(SdkError::InvalidRequest(
+            "provide exactly one of amount_in_atoms or amount_out_atoms".to_owned(),
+        )),
+    }
+}
+
 fn validate_quote(
     quote: &QuoteResponse,
     market_id: &str,
     request: &QuoteRequest,
-    requested_amount: u64,
+    target: QuoteTarget,
 ) -> Result<(), SdkError> {
     validate_version(quote.schema_version, &quote.contract_version)?;
+    let bound_to_request = match target {
+        QuoteTarget::ExactInput(amount_in) => quote.amount_in_atoms == amount_in.to_string(),
+        // The floor is the requested output with the caller's tolerance
+        // applied the same way an exact-input quote applies it.
+        QuoteTarget::ExactOutput(amount_out) => {
+            quote.minimum_output_atoms
+                == exact_output_floor(amount_out, request.maximum_tolerance_bps).to_string()
+        }
+    };
     if quote.provider != "Sonar"
         || quote.market_id != market_id
         || quote.side != request.side
-        || quote.amount_in_atoms != request.amount_in_atoms
+        || quote.maximum_tolerance_bps != request.maximum_tolerance_bps
+        || !bound_to_request
         || quote.quote_id.len() != 35
         || !quote.quote_id.starts_with("sq_")
         || !quote.quote_id[3..]
@@ -1801,12 +4995,13 @@ fn validate_quote(
         ));
     }
 
+    let amount_in = parse_atoms("amount_in_atoms", &quote.amount_in_atoms)?;
     let consumed = parse_atoms("amount_in_consumed_atoms", &quote.amount_in_consumed_atoms)?;
     let output = parse_atoms("amount_out_atoms", &quote.amount_out_atoms)?;
     let minimum = parse_atoms("minimum_output_atoms", &quote.minimum_output_atoms)?;
     parse_atoms("input_fee_atoms", &quote.input_fee_atoms)?;
     parse_atoms("output_fee_atoms", &quote.output_fee_atoms)?;
-    if consumed > requested_amount || minimum > output {
+    if consumed > amount_in || minimum > output {
         return Err(SdkError::InvalidResponse(
             "quote economics are internally inconsistent".to_owned(),
         ));
@@ -1826,13 +5021,18 @@ fn validate_quote(
     Ok(())
 }
 
-struct ExecutionAuthorization {
-    bytes: Vec<u8>,
-    recent_blockhash: String,
-    last_valid_block_height: u64,
+/// A parsed two-step execution authorization: the exact bytes to sign and
+/// the blockhash lease they bind.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExecutionAuthorization {
+    pub bytes: Vec<u8>,
+    pub recent_blockhash: String,
+    pub last_valid_block_height: u64,
 }
 
-fn validate_execution_challenge(
+/// Two-step path helper: check an execution challenge is bound to this quote
+/// and still inside its lifetime.
+pub fn validate_execution_challenge(
     challenge: &ExecutionChallengeResponse,
     quote: &QuoteResponse,
 ) -> Result<(), SdkError> {
@@ -1856,7 +5056,9 @@ fn validate_execution_challenge(
     Ok(())
 }
 
-fn validate_execution_prepare(
+/// Two-step path helper: check a prepared execution preserved the signed
+/// challenge bindings.
+pub fn validate_execution_prepare(
     prepared: &ExecutionPrepareResponse,
     quote: &QuoteResponse,
     challenge: &ExecutionChallengeResponse,
@@ -1887,6 +5089,51 @@ fn validate_execution_prepare(
     Ok(())
 }
 
+fn normalize_execution_challenge_request(
+    request: ExecutionChallengeRequest,
+) -> Result<ExecutionChallengeRequest, SdkError> {
+    if !valid_handle(&request.quote_id, "sq_") {
+        return Err(SdkError::InvalidRequest("quote_id is invalid".to_owned()));
+    }
+    Ok(ExecutionChallengeRequest {
+        quote_id: request.quote_id,
+        owner_wallet: canonical_public_key(&request.owner_wallet, "owner_wallet")?,
+        session_public_key: canonical_public_key(
+            &request.session_public_key,
+            "session_public_key",
+        )?,
+        account_sequence: canonical_optional_request_atoms(
+            request.account_sequence.as_deref(),
+            "account_sequence",
+        )?,
+    })
+}
+
+/// Direct-path binding: a prepared execution must be bound to exactly this
+/// quote and carry a well-formed transaction envelope.
+fn validate_execution_direct_prepare(
+    prepared: &ExecutionPrepareResponse,
+    quote: &QuoteResponse,
+) -> Result<(), SdkError> {
+    validate_version(prepared.schema_version, &prepared.contract_version)?;
+    validate_execution_binding(
+        &prepared.quote_id,
+        &prepared.market_id,
+        prepared.side,
+        &prepared.amount_in_atoms,
+        &prepared.minimum_output_atoms,
+        quote,
+    )?;
+    if !valid_handle(&prepared.execution_id, "se_") || prepared.expires_at_ms == 0 {
+        return Err(SdkError::InvalidResponse(
+            "prepared execution does not match the requested quote".to_owned(),
+        ));
+    }
+    canonical_base64(&prepared.transaction_base64, "transaction_base64")?;
+    canonical_base58_32(&prepared.recent_blockhash, "recent_blockhash")?;
+    Ok(())
+}
+
 fn validate_execution_binding(
     quote_id: &str,
     market_id: &str,
@@ -1908,12 +5155,16 @@ fn validate_execution_binding(
     Ok(())
 }
 
-fn validate_execution_authorization(
+/// Two-step path helper: check a challenge's authorization payload binds
+/// exactly this quote, owner, and session before signing it. The one-call
+/// [`StrataClient::execute_quote`] no longer needs it (one signature over the
+/// transaction).
+pub fn validate_execution_authorization(
     challenge: &ExecutionChallengeResponse,
     quote: &QuoteResponse,
     owner_wallet: &str,
     session_public_key: &str,
-    account_sequence: u64,
+    account_sequence: Option<u64>,
 ) -> Result<ExecutionAuthorization, SdkError> {
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(challenge.authorization_payload_base64.trim())
@@ -1955,12 +5206,19 @@ fn validate_execution_authorization(
         parse_atoms("minimum_output_atoms", &quote.minimum_output_atoms)?,
         "authorization minimum output",
     )?;
-    take_u64_eq(
-        &bytes,
-        &mut cursor,
-        account_sequence,
-        "authorization account sequence",
-    )?;
+    match account_sequence {
+        Some(expected) => take_u64_eq(
+            &bytes,
+            &mut cursor,
+            expected,
+            "authorization account sequence",
+        )?,
+        // Left to Strata: the resolved sequence is whatever the signed
+        // authorization carries; every other binding is still checked.
+        None => {
+            take_u64(&bytes, &mut cursor, "authorization account sequence")?;
+        }
+    }
     let _output_balance = take_u64(&bytes, &mut cursor, "authorization output balance")?;
     let recent_blockhash = bs58::encode(take_bytes(
         &bytes,
@@ -2093,7 +5351,10 @@ fn unix_ms() -> Result<u64, SdkError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{body_json, method, path};
+    use futures_util::{SinkExt, StreamExt};
+    use tokio::net::TcpListener;
+    use tokio_tungstenite::tungstenite::Message;
+    use wiremock::matchers::{body_json, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn fixture(path: &str) -> serde_json::Value {
@@ -2102,13 +5363,83 @@ mod tests {
             "markets" => strata_public_contract::contract_fixtures::MARKETS,
             "quote" => strata_public_contract::contract_fixtures::QUOTE,
             "capabilities" => strata_public_contract::contract_fixtures::CAPABILITIES,
+            "execution-prepare" => strata_public_contract::contract_fixtures::EXECUTION_PREPARE,
+            "execution-submit" => strata_public_contract::contract_fixtures::EXECUTION_SUBMIT,
             "order-challenge" => strata_public_contract::platform::PLATFORM_ORDER_CHALLENGE_FIXTURE,
             "order-prepare" => strata_public_contract::platform::PLATFORM_ORDER_PREPARE_FIXTURE,
             "order-submit" => strata_public_contract::platform::PLATFORM_ORDER_SUBMIT_FIXTURE,
             "order-status" => strata_public_contract::platform::PLATFORM_ORDER_STATUS_FIXTURE,
+            "twap-challenge" => strata_public_contract::platform::PLATFORM_TWAP_CHALLENGE_FIXTURE,
+            "twap-prepare" => strata_public_contract::platform::PLATFORM_TWAP_PREPARE_FIXTURE,
+            "twap-submit" => strata_public_contract::platform::PLATFORM_TWAP_SUBMIT_FIXTURE,
+            "platform-capabilities" => {
+                strata_public_contract::platform::PLATFORM_CAPABILITIES_FIXTURE
+            }
+            "platform-action-graph" => strata_public_contract::platform::PLATFORM_ACTION_GRAPH,
+            "platform-status" => strata_public_contract::platform::PLATFORM_SERVICE_STATUS_FIXTURE,
+            "assets" => strata_public_contract::platform::PLATFORM_ASSETS_FIXTURE,
+            "swap-quote" => strata_public_contract::platform::PLATFORM_SWAP_QUOTE_FIXTURE,
+            "platform-markets" => strata_public_contract::platform::PLATFORM_MARKETS_FIXTURE,
+            "book" => strata_public_contract::platform::PLATFORM_BOOK_FIXTURE,
+            "bbo" => strata_public_contract::platform::PLATFORM_BBO_FIXTURE,
+            "fees" => strata_public_contract::platform::PLATFORM_FEES_FIXTURE,
+            "market-status" => strata_public_contract::platform::PLATFORM_STATUS_FIXTURE,
+            "trades" => strata_public_contract::platform::PLATFORM_TRADES_FIXTURE,
+            "candles" => strata_public_contract::platform::PLATFORM_CANDLES_FIXTURE,
+            "mark" => strata_public_contract::platform::PLATFORM_MARK_FIXTURE,
+            "execution-status" => {
+                strata_public_contract::platform::PLATFORM_EXECUTION_STATUS_FIXTURE
+            }
+            "twaps" => strata_public_contract::platform::PLATFORM_TWAPS_FIXTURE,
+            "portfolio" => strata_public_contract::platform::PLATFORM_PORTFOLIO_FIXTURE,
+            "maker-status" => strata_public_contract::platform::PLATFORM_MAKER_STATUS_FIXTURE,
+            "maker-stream" => strata_public_contract::platform::PLATFORM_MAKER_STREAM_FIXTURE,
+            "twap-stream" => strata_public_contract::platform::PLATFORM_TWAP_STREAM_FIXTURE,
+            "execution-stream" => {
+                strata_public_contract::platform::PLATFORM_EXECUTION_STREAM_FIXTURE
+            }
+            "portfolio-history" => {
+                strata_public_contract::platform::PLATFORM_PORTFOLIO_HISTORY_FIXTURE
+            }
+            "vault-status" => strata_public_contract::platform::PLATFORM_VAULT_STATUS_FIXTURE,
+            "vault-pause-prepare" => {
+                strata_public_contract::platform::PLATFORM_VAULT_PAUSE_PREPARE_FIXTURE
+            }
+            "vault-setup-prepare" => {
+                strata_public_contract::platform::PLATFORM_VAULT_SETUP_PREPARE_FIXTURE
+            }
+            "vault-delegate-prepare" => {
+                strata_public_contract::platform::PLATFORM_VAULT_DELEGATE_PREPARE_FIXTURE
+            }
+            "vault-policy-prepare" => {
+                strata_public_contract::platform::PLATFORM_VAULT_POLICY_PREPARE_FIXTURE
+            }
+            "vault-deposit-prepare" => {
+                strata_public_contract::platform::PLATFORM_VAULT_DEPOSIT_PREPARE_FIXTURE
+            }
+            "vault-withdraw-prepare" => {
+                strata_public_contract::platform::PLATFORM_VAULT_WITHDRAW_PREPARE_FIXTURE
+            }
+            "vault-submit" => strata_public_contract::platform::PLATFORM_VAULT_SUBMIT_FIXTURE,
+            "rewards" => strata_public_contract::platform::PLATFORM_REWARDS_FIXTURE,
+            "referrals" => strata_public_contract::platform::PLATFORM_REFERRALS_FIXTURE,
+            "referral-link" => strata_public_contract::platform::PLATFORM_REFERRAL_LINK_FIXTURE,
+            "referral-claim" => strata_public_contract::platform::PLATFORM_REFERRAL_CLAIM_FIXTURE,
+            "bugs" => strata_public_contract::platform::PLATFORM_BUGS_FIXTURE,
+            "bug-submit" => strata_public_contract::platform::PLATFORM_BUG_SUBMIT_FIXTURE,
+            "account" => strata_public_contract::platform::PLATFORM_ACCOUNT_FIXTURE,
             _ => unreachable!(),
         };
         serde_json::from_str(raw).unwrap()
+    }
+
+    async fn mount_get(server: &MockServer, operation_path: &str, fixture_name: &str) {
+        Mock::given(method("GET"))
+            .and(path(operation_path))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fixture(fixture_name)))
+            .expect(1)
+            .mount(server)
+            .await;
     }
 
     #[tokio::test]
@@ -2137,7 +5468,7 @@ mod tests {
                 "market_id": "11111111111111111111111111111111",
                 "side": "sell",
                 "amount_in_atoms": "10000000",
-                "slippage_bps": 50
+                "maximum_tolerance_bps": 50
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(fixture("quote")))
             .expect(1)
@@ -2159,14 +5490,1260 @@ mod tests {
             .quote(QuoteRequest {
                 market_id: "SOL/USDC".to_owned(),
                 side: QuoteSide::Sell,
-                amount_in_atoms: "10000000".to_owned(),
-                slippage_bps: 50,
+                amount_in_atoms: Some("10000000".to_owned()),
+                amount_out_atoms: None,
+                maximum_tolerance_bps: 50,
             })
             .await
             .unwrap();
         let public = serde_json::to_value(quote).unwrap();
         assert!(public.get("quote_id").is_some());
         assert!(public.get("unexpected_field").is_none());
+
+        // The request must fix exactly one amount.
+        for (amount_in, amount_out) in [(None, None), (Some("1"), Some("1")), (Some("0"), None)] {
+            let request = QuoteRequest {
+                market_id: "SOL/USDC".to_owned(),
+                side: QuoteSide::Sell,
+                amount_in_atoms: amount_in.map(str::to_owned),
+                amount_out_atoms: amount_out.map(str::to_owned),
+                maximum_tolerance_bps: 50,
+            };
+            assert!(matches!(
+                quote_target(&request),
+                Err(SdkError::InvalidRequest(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn exact_output_quotes_bind_to_the_requested_minimum_output() {
+        let raw: QuoteResponse = serde_json::from_str(include_str!(
+            "../../strata-public-contract/fixtures/v1/quote.json"
+        ))
+        .unwrap();
+        let market_id = raw.market_id.clone();
+        let mut quote = raw.clone();
+        // Zero tolerance: the floor is the requested amount itself and the
+        // best route delivers it (within a basis point) at quote time. The
+        // response echoes the tolerance next to the measured impact.
+        quote.minimum_output_atoms = "1000000000".to_owned();
+        quote.amount_out_atoms = "1000000004".to_owned();
+        quote.maximum_tolerance_bps = 0;
+        let request = QuoteRequest {
+            market_id: market_id.clone(),
+            side: quote.side,
+            amount_in_atoms: None,
+            amount_out_atoms: Some("1000000000".to_owned()),
+            maximum_tolerance_bps: 0,
+        };
+        let target = quote_target(&request).unwrap();
+        assert_eq!(target, QuoteTarget::ExactOutput(1_000_000_000));
+        // Serialization leaves the unused amount out so older servers reject
+        // rather than misread the request.
+        let wire = serde_json::to_string(&request).unwrap();
+        assert!(wire.contains("amount_out_atoms") && !wire.contains("amount_in_atoms"));
+        validate_quote(&quote, &market_id, &request, target).unwrap();
+        // A response whose floor is not the requested output is refused.
+        quote.minimum_output_atoms = "999999999".to_owned();
+        assert!(validate_quote(&quote, &market_id, &request, target).is_err());
+        // With a tolerance the floor is the requested amount lowered by it,
+        // exactly as an exact-input quote lowers its own floor.
+        assert_eq!(exact_output_floor(1_000_000_000, 25), 997_500_000);
+        let tolerant = QuoteRequest {
+            maximum_tolerance_bps: 25,
+            ..request.clone()
+        };
+        quote.minimum_output_atoms = "997500000".to_owned();
+        quote.maximum_tolerance_bps = 25;
+        validate_quote(
+            &quote,
+            &market_id,
+            &tolerant,
+            quote_target(&tolerant).unwrap(),
+        )
+        .unwrap();
+        // A quote that echoes a different tolerance than requested is foreign.
+        quote.maximum_tolerance_bps = 10;
+        assert!(validate_quote(
+            &quote,
+            &market_id,
+            &tolerant,
+            quote_target(&tolerant).unwrap()
+        )
+        .is_err());
+        // An exact-input request still binds on the input amount (the fixture
+        // carries a 50 bps tolerance).
+        let exact_input = QuoteRequest {
+            market_id: market_id.clone(),
+            side: raw.side,
+            amount_in_atoms: Some(raw.amount_in_atoms.clone()),
+            amount_out_atoms: None,
+            maximum_tolerance_bps: 50,
+        };
+        let input_target = quote_target(&exact_input).unwrap();
+        validate_quote(&raw, &market_id, &exact_input, input_target).unwrap();
+    }
+
+    #[test]
+    fn platform_graph_rejects_orphaned_operations() {
+        let mut graph = PlatformActionGraphResponse::foundation();
+        let mut orphan = graph.operations[0].clone();
+        orphan.id = "platform.unmapped.read".to_owned();
+        orphan.summary =
+            "This test operation is deliberately absent from every workflow.".to_owned();
+        graph.operations.push(orphan);
+
+        assert!(matches!(
+            validate_platform_action_graph(&graph),
+            Err(SdkError::InvalidResponse(message))
+                if message.contains("orphaned operation")
+        ));
+    }
+
+    #[tokio::test]
+    async fn platform_reads_map_the_complete_live_product_surface() {
+        let server = MockServer::start().await;
+        let market_id = "market_33333333333333333333333333333333";
+        let wallet = "5Ji61Fbeb22Yntgv1hhHeSSLgdEdZchHeM1Tv1MjGhSL";
+        mount_get(&server, "/v2/capabilities", "platform-capabilities").await;
+        mount_get(&server, "/v2/action-graph", "platform-action-graph").await;
+        mount_get(&server, "/v2/status", "platform-status").await;
+        mount_get(&server, "/v2/assets", "assets").await;
+        mount_get(&server, "/v2/markets", "platform-markets").await;
+        Mock::given(method("POST"))
+            .and(path("/v2/quotes"))
+            .and(body_json(serde_json::json!({
+                "input_asset_id": "asset_11111111111111111111111111111111",
+                "output_asset_id": "asset_22222222222222222222222222222222",
+                "amount_in_atoms": "10000000",
+                "maximum_tolerance_bps": 50
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fixture("swap-quote")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/markets/{market_id}/book")))
+            .and(query_param("depth", "50"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fixture("book")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_get(&server, &format!("/v2/markets/{market_id}/bbo"), "bbo").await;
+        mount_get(&server, &format!("/v2/markets/{market_id}/fees"), "fees").await;
+        mount_get(
+            &server,
+            &format!("/v2/markets/{market_id}/status"),
+            "market-status",
+        )
+        .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/markets/{market_id}/trades")))
+            .and(query_param("limit", "25"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fixture("trades")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/markets/{market_id}/candles")))
+            .and(query_param("from_ms", "1786549800000"))
+            .and(query_param("to_ms", "1786550400001"))
+            .and(query_param("resolution_seconds", "300"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fixture("candles")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_get(&server, &format!("/v2/markets/{market_id}/marks"), "mark").await;
+        mount_get(
+            &server,
+            &format!("/v2/markets/{market_id}/executions/se_0123456789abcdef0123456789abcdef"),
+            "execution-status",
+        )
+        .await;
+        mount_get(
+            &server,
+            &format!("/v2/markets/{market_id}/account/{wallet}/twaps"),
+            "twaps",
+        )
+        .await;
+
+        let client = StrataClient::new(server.uri()).unwrap();
+        assert!(!client
+            .platform_capabilities()
+            .await
+            .unwrap()
+            .capabilities
+            .is_empty());
+        assert_eq!(
+            client
+                .platform_action_graph()
+                .await
+                .unwrap()
+                .entry_operation_id,
+            "platform.capabilities.read"
+        );
+        assert_eq!(
+            client.platform_status().await.unwrap().available_operations,
+            59
+        );
+        assert!(!client
+            .platform_assets(PageRequest::default())
+            .await
+            .unwrap()
+            .assets
+            .is_empty());
+        assert!(!client
+            .platform_markets(PageRequest::default())
+            .await
+            .unwrap()
+            .markets
+            .is_empty());
+        assert_eq!(
+            client
+                .platform_swap_quote(PlatformSwapQuoteRequest {
+                    input_asset_id: "asset_11111111111111111111111111111111".to_owned(),
+                    output_asset_id: "asset_22222222222222222222222222222222".to_owned(),
+                    amount_in_atoms: "10000000".to_owned(),
+                    maximum_tolerance_bps: 50,
+                })
+                .await
+                .unwrap()
+                .amount_out_atoms,
+            "1990000"
+        );
+        assert_eq!(
+            client
+                .platform_book(market_id, PlatformBookRequest { depth: Some(50) },)
+                .await
+                .unwrap()
+                .bids
+                .len(),
+            2
+        );
+        assert!(client
+            .platform_best_bid_ask(market_id)
+            .await
+            .unwrap()
+            .best_bid
+            .is_some());
+        assert!(
+            client
+                .platform_fees(market_id)
+                .await
+                .unwrap()
+                .exact_fee_returned_by_quote
+        );
+        assert_eq!(
+            client
+                .platform_market_status(market_id)
+                .await
+                .unwrap()
+                .market_id,
+            market_id
+        );
+        assert!(!client
+            .platform_trades(market_id, PlatformTradesRequest { limit: Some(25) },)
+            .await
+            .unwrap()
+            .trades
+            .is_empty());
+        assert_eq!(
+            client
+                .platform_candles(
+                    market_id,
+                    PlatformCandlesRequest {
+                        from_ms: 1_786_549_800_000,
+                        to_ms: 1_786_550_400_001,
+                        resolution_seconds: Some(300),
+                    },
+                )
+                .await
+                .unwrap()
+                .resolution_seconds,
+            300
+        );
+        assert!(!client.platform_mark(market_id).await.unwrap().stale);
+        assert_eq!(
+            client
+                .platform_execution_status(market_id, "se_0123456789abcdef0123456789abcdef",)
+                .await
+                .unwrap()
+                .status,
+            PlatformExecutionState::Confirmed
+        );
+        assert!(!client
+            .platform_twaps(market_id, wallet)
+            .await
+            .unwrap()
+            .twaps
+            .is_empty());
+    }
+
+    struct TestAccountSigner {
+        wallet: String,
+        expected_message: Vec<u8>,
+        signature_byte: u8,
+    }
+
+    #[async_trait]
+    impl AccountSigner for TestAccountSigner {
+        fn public_key(&self) -> &str {
+            &self.wallet
+        }
+
+        async fn sign_message(&self, message: &[u8]) -> Result<Vec<u8>, String> {
+            assert_eq!(message, self.expected_message);
+            Ok(vec![self.signature_byte; 64])
+        }
+    }
+
+    #[tokio::test]
+    async fn platform_account_and_community_reads_preserve_external_authority() {
+        let server = MockServer::start().await;
+        let market_id = "market_33333333333333333333333333333333";
+        let wallet = "5Ji61Fbeb22Yntgv1hhHeSSLgdEdZchHeM1Tv1MjGhSL";
+        mount_get(&server, "/v2/capabilities", "platform-capabilities").await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/markets/{market_id}/account/{wallet}")))
+            .and(query_param("fill_limit", "25"))
+            .and(header("x-strata-auth-time", "1786550400000"))
+            .and(header("x-strata-auth-signature", "07".repeat(64)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fixture("account")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/account/{wallet}/portfolio")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fixture("portfolio")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/v2/markets/market_33333333333333333333333333333333/makers/{wallet}"
+            )))
+            .and(header("x-strata-auth-time", "1786550400000"))
+            .and(header("x-strata-auth-signature", "0a".repeat(64)))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fixture("maker-status")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/v2/account/{wallet}/portfolio/history")))
+            .and(query_param("range", "24h"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fixture("portfolio-history")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v2/vault/status"))
+            .and(query_param("wallet_address", wallet))
+            .and(query_param(
+                "session_public_key",
+                "9Uu7cLBgfMk233BAjMvTS8XJy6KbZK7oQ7NXuCTi3Fg2",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fixture("vault-status")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v2/vault/pause/prepare"))
+            .and(body_json(serde_json::json!({
+                "wallet_address": wallet,
+                "paused": true,
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fixture("vault-pause-prepare")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v2/vault/setup/prepare"))
+            .and(body_json(serde_json::json!({
+                "wallet_address": wallet,
+                "session_public_key": "9Uu7cLBgfMk233BAjMvTS8XJy6KbZK7oQ7NXuCTi3Fg2",
+                "market_id": "market_33333333333333333333333333333333",
+                "expires_at_ms": null,
+                "minimum_interval_seconds": 1,
+                "maximum_tolerance_bps": 100,
+                "spending_limits": [
+                    {
+                        "asset_id": "asset_0123456789abcdef0123456789abcdef",
+                        "maximum_per_execution_atoms": null,
+                    },
+                    {
+                        "asset_id": "asset_fedcba9876543210fedcba9876543210",
+                        "maximum_per_execution_atoms": "100000000",
+                    },
+                ],
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fixture("vault-setup-prepare")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v2/vault/deposits/prepare"))
+            .and(body_json(serde_json::json!({
+                "wallet_address": wallet,
+                "market_id": "market_33333333333333333333333333333333",
+                "asset_id": "asset_0123456789abcdef0123456789abcdef",
+                "amount_atoms": "10000000",
+                "session_public_key": "9Uu7cLBgfMk233BAjMvTS8XJy6KbZK7oQ7NXuCTi3Fg2",
+            })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(fixture("vault-deposit-prepare")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v2/vault/withdrawals/prepare"))
+            .and(body_json(serde_json::json!({
+                "wallet_address": wallet,
+                "market_id": "market_33333333333333333333333333333333",
+                "asset_id": "asset_fedcba9876543210fedcba9876543210",
+                "destination_wallet_address": wallet,
+                "amount_atoms": "5000000",
+            })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(fixture("vault-withdraw-prepare")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v2/vault/submit"))
+            .and(body_json(serde_json::json!({
+                "preparation_id": "vp_4d5e6f708192a3b4c5d6e7f8091a2b3c",
+                "signed_transaction_base64": "AQIDBA==",
+                "idempotency_key": "deposit-1",
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fixture("vault-submit")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/v2/vault/submissions/vp_4d5e6f708192a3b4c5d6e7f8091a2b3c",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fixture("vault-submit")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v2/vault/delegates/prepare"))
+            .and(body_json(serde_json::json!({
+                "wallet_address": wallet,
+                "session_public_key": "9Uu7cLBgfMk233BAjMvTS8XJy6KbZK7oQ7NXuCTi3Fg2",
+                "action": "revoke",
+            })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(fixture("vault-delegate-prepare")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v2/vault/policies/prepare"))
+            .and(body_json(serde_json::json!({
+                "wallet_address": wallet,
+                "withdrawal_access": {
+                    "mode": "restricted",
+                    "allowed_wallet_addresses": [wallet],
+                },
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fixture("vault-policy-prepare")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v2/rewards"))
+            .and(query_param("wallet_address", wallet))
+            .and(query_param("limit", "20"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fixture("rewards")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_get(&server, &format!("/v2/referrals/{wallet}"), "referrals").await;
+        Mock::given(method("POST"))
+            .and(path("/v2/referrals/link"))
+            .and(body_json(serde_json::json!({
+                "wallet_address": wallet,
+                "referral_code": "STRATA1",
+                "authorization_signature": "22".repeat(64),
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fixture("referral-link")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v2/referrals/claim"))
+            .and(body_json(serde_json::json!({
+                "wallet_address": wallet,
+                "payout_wallet_address": wallet,
+                "authorization_signature": "33".repeat(64),
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fixture("referral-claim")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_get(&server, &format!("/v2/bugs/{wallet}"), "bugs").await;
+        Mock::given(method("POST"))
+            .and(path("/v2/bugs"))
+            .and(body_json(serde_json::json!({
+                "owner_wallet": wallet,
+                "message": "public report",
+                "authorization_signature": "07".repeat(64),
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fixture("bug-submit")))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let signer = TestAccountSigner {
+            wallet: wallet.to_owned(),
+            expected_message: format!(
+                "strata:account-read:v2\n{market_id}\n{wallet}\n1786550400000\n25"
+            )
+            .into_bytes(),
+            signature_byte: 7,
+        };
+        let client = StrataClient::new(server.uri()).unwrap();
+        let account = client
+            .platform_account_market(
+                market_id,
+                &signer,
+                PlatformAccountMarketRequest {
+                    fill_limit: Some(25),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(account.wallet_address, wallet);
+        assert!(!account.orders.is_empty());
+        let maker_status = client
+            .platform_maker_status_authorized(PlatformMakerStatusAuthorizedRequest {
+                market_id: "market_33333333333333333333333333333333".to_owned(),
+                wallet_address: wallet.to_owned(),
+                authorization_time_ms: 1_786_550_400_000,
+                authorization_signature: "0a".repeat(64),
+            })
+            .await
+            .unwrap();
+        assert_eq!(maker_status.active_products, 3);
+        assert_eq!(maker_status.strands.len(), 1);
+        assert!(maker_status
+            .intent
+            .as_ref()
+            .is_some_and(|intent| intent.active));
+        assert_eq!(
+            maker_status_auth_message(
+                "market_33333333333333333333333333333333",
+                wallet,
+                1_786_550_400_000
+            )
+            .unwrap(),
+            format!(
+                "strata:mm-status-read:v2\nmarket_33333333333333333333333333333333\n{wallet}\n1786550400000"
+            )
+            .into_bytes()
+        );
+        let portfolio = client.platform_portfolio(wallet).await.unwrap();
+        assert_eq!(portfolio.wallet_address, wallet);
+        assert_eq!(portfolio.balances.len(), 2);
+        assert_eq!(portfolio.positions.len(), 1);
+        assert_eq!(portfolio.equity_usd_micros.as_deref(), Some("439989500"));
+        assert!(portfolio.valuation_complete);
+        assert_eq!(
+            client
+                .platform_portfolio_history(wallet, PlatformPortfolioHistoryRange::Day)
+                .await
+                .unwrap()
+                .range,
+            PlatformPortfolioHistoryRange::Day
+        );
+        assert!(client
+            .platform_vault_status(
+                wallet,
+                PlatformVaultStatusRequest {
+                    session_public_key: Some(
+                        "9Uu7cLBgfMk233BAjMvTS8XJy6KbZK7oQ7NXuCTi3Fg2".to_owned(),
+                    ),
+                },
+            )
+            .await
+            .unwrap()
+            .session
+            .is_some_and(|session| session.market_execution_ready));
+        assert!(
+            client
+                .platform_vault_pause_prepare(PlatformVaultPausePrepareRequest {
+                    wallet_address: wallet.to_owned(),
+                    paused: true,
+                })
+                .await
+                .unwrap()
+                .owner_signature_required
+        );
+        let setup = client
+            .platform_vault_setup_prepare(PlatformVaultSetupPrepareRequest {
+                wallet_address: wallet.to_owned(),
+                session_public_key: "9Uu7cLBgfMk233BAjMvTS8XJy6KbZK7oQ7NXuCTi3Fg2".to_owned(),
+                market_id: Some("market_33333333333333333333333333333333".to_owned()),
+                expires_at_ms: None,
+                minimum_interval_seconds: None,
+                maximum_tolerance_bps: None,
+                spending_limits: vec![
+                    PlatformVaultSpendingLimit {
+                        asset_id: "asset_0123456789abcdef0123456789abcdef".to_owned(),
+                        maximum_per_execution_atoms: None,
+                    },
+                    PlatformVaultSpendingLimit {
+                        asset_id: "asset_fedcba9876543210fedcba9876543210".to_owned(),
+                        maximum_per_execution_atoms: Some("100000000".to_owned()),
+                    },
+                ],
+            })
+            .await
+            .unwrap();
+        assert_eq!(setup.mode, PlatformVaultSetupMode::Create);
+        assert!(setup.owner_signature_required);
+        assert_eq!(
+            setup.minimum_interval_seconds,
+            PLATFORM_SESSION_DEFAULT_MINIMUM_INTERVAL_SECONDS
+        );
+        assert_eq!(
+            setup.maximum_tolerance_bps,
+            PLATFORM_SESSION_DEFAULT_MAXIMUM_TOLERANCE_BPS
+        );
+        // A first deposit that names the session key onboards in the same
+        // owner signature.
+        let deposit = client
+            .platform_vault_deposit_prepare(PlatformVaultDepositPrepareRequest {
+                wallet_address: wallet.to_owned(),
+                market_id: "market_33333333333333333333333333333333".to_owned(),
+                asset_id: "asset_0123456789abcdef0123456789abcdef".to_owned(),
+                amount_atoms: "10000000".to_owned(),
+                session_public_key: Some("9Uu7cLBgfMk233BAjMvTS8XJy6KbZK7oQ7NXuCTi3Fg2".to_owned()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(deposit.amount_atoms, "10000000");
+        assert!(deposit.owner_signature_required);
+        assert!(deposit.sponsored);
+        assert!(deposit.registers_session);
+        assert_eq!(
+            deposit.preparation_id,
+            "vp_4d5e6f708192a3b4c5d6e7f8091a2b3c"
+        );
+        // Owner signs, hands it back: Strata pays and broadcasts, then reports.
+        let receipt = client
+            .platform_vault_submit(PlatformVaultSubmitRequest {
+                preparation_id: deposit.preparation_id.clone(),
+                signed_transaction_base64: "AQIDBA==".to_owned(),
+                idempotency_key: "deposit-1".to_owned(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(receipt.action, PlatformVaultAction::Deposit);
+        assert_eq!(receipt.status, PlatformVaultSubmissionStatus::Submitted);
+        assert!(receipt.sponsored);
+        let outcome = client
+            .platform_vault_submission(&deposit.preparation_id)
+            .await
+            .unwrap();
+        assert_eq!(outcome.preparation_id, deposit.preparation_id);
+        assert!(client
+            .platform_vault_submission("or_4d5e6f708192a3b4c5d6e7f8091a2b3c")
+            .await
+            .is_err());
+        let withdrawal = client
+            .platform_vault_withdraw_prepare(PlatformVaultWithdrawPrepareRequest {
+                wallet_address: wallet.to_owned(),
+                market_id: "market_33333333333333333333333333333333".to_owned(),
+                asset_id: "asset_fedcba9876543210fedcba9876543210".to_owned(),
+                destination_wallet_address: wallet.to_owned(),
+                amount_atoms: "5000000".to_owned(),
+            })
+            .await
+            .unwrap();
+        assert_eq!(withdrawal.amount_atoms, "5000000");
+        assert!(withdrawal.owner_signature_required);
+        let delegate = client
+            .platform_vault_delegate_prepare(PlatformVaultDelegatePrepareRequest {
+                wallet_address: wallet.to_owned(),
+                session_public_key: "9Uu7cLBgfMk233BAjMvTS8XJy6KbZK7oQ7NXuCTi3Fg2".to_owned(),
+                action: PlatformVaultDelegateAction::Revoke,
+            })
+            .await
+            .unwrap();
+        assert_eq!(delegate.action, PlatformVaultDelegateAction::Revoke);
+        assert!(delegate.owner_signature_required);
+        let policy = client
+            .platform_vault_policy_prepare(PlatformVaultPolicyPrepareRequest {
+                wallet_address: wallet.to_owned(),
+                withdrawal_access: PlatformVaultWithdrawalAccess {
+                    mode: PlatformVaultWithdrawalMode::Restricted,
+                    allowed_wallet_addresses: vec![wallet.to_owned()],
+                },
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            policy.withdrawal_access.mode,
+            PlatformVaultWithdrawalMode::Restricted
+        );
+        assert!(policy.owner_signature_required);
+        assert!(client
+            .platform_rewards(PlatformRewardsRequest {
+                wallet_address: Some(wallet.to_owned()),
+                limit: Some(20),
+            })
+            .await
+            .unwrap()
+            .owner
+            .is_some());
+        assert_eq!(
+            client
+                .platform_referrals(wallet)
+                .await
+                .unwrap()
+                .wallet_address,
+            wallet
+        );
+        assert_eq!(
+            client
+                .platform_referral_link(PlatformReferralLinkRequest {
+                    wallet_address: wallet.to_owned(),
+                    referral_code: "STRATA1".to_owned(),
+                    authorization_signature: "22".repeat(64),
+                })
+                .await
+                .unwrap()
+                .status,
+            "pending_first_fill"
+        );
+        assert_eq!(
+            client
+                .platform_referral_claim(PlatformReferralClaimRequest {
+                    wallet_address: wallet.to_owned(),
+                    payout_wallet_address: None,
+                    authorization_signature: "33".repeat(64),
+                })
+                .await
+                .unwrap()
+                .status,
+            "requested"
+        );
+        assert_eq!(
+            client.platform_bugs(wallet).await.unwrap().wallet_address,
+            wallet
+        );
+        assert_eq!(
+            client
+                .platform_bug_submit(PlatformBugSubmitRequest {
+                    owner_wallet: wallet.to_owned(),
+                    message: " public report ".to_owned(),
+                    authorization_signature: format!("0x{}", "07".repeat(64)),
+                })
+                .await
+                .unwrap()
+                .status,
+            PlatformBugStatus::Pending
+        );
+        assert_eq!(
+            bug_authorization_payload(" public report ").unwrap(),
+            b"strata-bug-report:v1:public report"
+        );
+        assert_eq!(
+            referral_link_authorization_payload(" STRATA1 ").unwrap(),
+            b"strata-referral:v1:STRATA1"
+        );
+        assert_eq!(
+            referral_claim_authorization_payload(wallet).unwrap(),
+            format!("strata-referral-claim:v1:{wallet}").as_bytes()
+        );
+    }
+
+    #[tokio::test]
+    async fn market_data_stream_fails_closed_on_a_book_sequence_gap() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let market_id = "market_33333333333333333333333333333333";
+        let mut snapshot = fixture("book");
+        snapshot
+            .as_object_mut()
+            .unwrap()
+            .insert("type".to_owned(), serde_json::json!("book_snapshot"));
+        let gap = serde_json::json!({
+            "type": "book_delta",
+            "schema_version": 2,
+            "contract_version": "2.0",
+            "market_id": market_id,
+            "stream_id": "book:market_33333333333333333333333333333333",
+            "sequence": "44",
+            "previous_sequence": "42",
+            "server_time_ms": 1786550400100u64,
+            "changes": [{
+                "side": "bid",
+                "price_atoms": "149990000",
+                "size_atoms": "0"
+            }]
+        });
+        let server = tokio::spawn(async move {
+            let (connection, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(connection).await.unwrap();
+            socket
+                .send(Message::Text(snapshot.to_string().into()))
+                .await
+                .unwrap();
+            socket
+                .send(Message::Text(gap.to_string().into()))
+                .await
+                .unwrap();
+            let _ = socket.next().await;
+        });
+
+        let client = StrataClient::new(format!("http://{address}")).unwrap();
+        let mut stream = client.connect_market_data(market_id).await.unwrap();
+        assert!(matches!(
+            stream.next_event().await.unwrap(),
+            Some(PlatformMarketDataEvent::BookSnapshot { .. })
+        ));
+        assert!(matches!(
+            stream.next_event().await,
+            Err(SdkError::InvalidResponse(message))
+                if message == "market stream sequence gap detected"
+        ));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn account_stream_signs_the_exact_challenge_and_sequences_state() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let market_id = "market_33333333333333333333333333333333";
+        let wallet = "5Ji61Fbeb22Yntgv1hhHeSSLgdEdZchHeM1Tv1MjGhSL";
+        let challenge = "ab".repeat(32);
+        let challenge_for_server = challenge.clone();
+        let mut snapshot = fixture("account");
+        snapshot.as_object_mut().unwrap().extend([
+            ("type".to_owned(), serde_json::json!("account_snapshot")),
+            (
+                "stream_id".to_owned(),
+                serde_json::json!("account_stream_66666666666666666666666666666666"),
+            ),
+            ("sequence".to_owned(), serde_json::json!("1")),
+        ]);
+        let orders = serde_json::json!({
+            "type": "orders_snapshot",
+            "schema_version": 2,
+            "contract_version": "2.0",
+            "market_id": market_id,
+            "wallet_address": wallet,
+            "stream_id": "account_stream_66666666666666666666666666666666",
+            "sequence": "2",
+            "previous_sequence": "1",
+            "server_time_ms": 1786550400100u64,
+            "orders": []
+        });
+        let server = tokio::spawn(async move {
+            let (connection, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(connection).await.unwrap();
+            socket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "type": "auth_challenge",
+                        "schema_version": 2,
+                        "contract_version": "2.0",
+                        "market_id": market_id,
+                        "wallet_address": wallet,
+                        "challenge": challenge_for_server,
+                        "server_time_ms": 1786550400000u64,
+                        "expires_at_ms": 1786550405000u64
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            let Message::Text(authentication) = socket.next().await.unwrap().unwrap() else {
+                panic!("expected text authentication");
+            };
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&authentication).unwrap(),
+                serde_json::json!({
+                    "type": "authenticate",
+                    "signature": "09".repeat(64),
+                })
+            );
+            socket
+                .send(Message::Text(snapshot.to_string().into()))
+                .await
+                .unwrap();
+            socket
+                .send(Message::Text(orders.to_string().into()))
+                .await
+                .unwrap();
+            let _ = socket.next().await;
+        });
+
+        let signer = TestAccountSigner {
+            wallet: wallet.to_owned(),
+            expected_message: format!(
+                "strata:account-stream:v2\n{market_id}\n{wallet}\n{challenge}"
+            )
+            .into_bytes(),
+            signature_byte: 9,
+        };
+        let client = StrataClient::new(format!("http://{address}")).unwrap();
+        let mut stream = client.connect_account(market_id, &signer).await.unwrap();
+        assert!(matches!(
+            stream.next_event().await.unwrap(),
+            Some(PlatformAccountEvent::AccountSnapshot { .. })
+        ));
+        assert!(matches!(
+            stream.next_event().await.unwrap(),
+            Some(PlatformAccountEvent::OrdersSnapshot { .. })
+        ));
+        stream.close().await.unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn execution_stream_watches_handles_and_sequences_updates() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let snapshot = fixture("execution-stream");
+        let market_id = snapshot["market_id"].as_str().unwrap().to_owned();
+        let watched: Vec<String> = vec![
+            snapshot["executions"][0]["execution_id"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+            snapshot["executions"][1]["execution_id"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+            snapshot["unknown_execution_ids"][0]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        ];
+        let expected_watch = serde_json::json!({"type": "watch", "execution_ids": watched});
+        let mut confirmed = snapshot["executions"][1].clone();
+        confirmed["status"] = serde_json::json!("confirmed");
+        confirmed["signature"] = serde_json::json!("2".repeat(64));
+        confirmed["settlement"] = serde_json::json!("confirmed");
+        let update = serde_json::json!({
+            "type": "execution_update",
+            "schema_version": 2,
+            "contract_version": "2.0",
+            "market_id": market_id,
+            "stream_id": snapshot["stream_id"],
+            "sequence": "2",
+            "previous_sequence": "1",
+            "server_time_ms": 1786550400100u64,
+            "execution": confirmed,
+        });
+        let unknown = serde_json::json!({
+            "type": "execution_unknown",
+            "schema_version": 2,
+            "contract_version": "2.0",
+            "market_id": market_id,
+            "stream_id": snapshot["stream_id"],
+            "sequence": "3",
+            "previous_sequence": "2",
+            "server_time_ms": 1786550400200u64,
+            "execution_id": "se_abcdefabcdefabcdefabcdefabcdefab",
+        });
+        let gap = serde_json::json!({
+            "type": "heartbeat",
+            "schema_version": 2,
+            "contract_version": "2.0",
+            "market_id": market_id,
+            "stream_id": snapshot["stream_id"],
+            "sequence": "5",
+            "previous_sequence": "4",
+            "server_time_ms": 1786550400300u64,
+        });
+        let server = tokio::spawn(async move {
+            let (connection, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(connection).await.unwrap();
+            let Message::Text(watch) = socket.next().await.unwrap().unwrap() else {
+                panic!("expected a watch frame");
+            };
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&watch).unwrap(),
+                expected_watch
+            );
+            socket
+                .send(Message::Text(snapshot.to_string().into()))
+                .await
+                .unwrap();
+            socket
+                .send(Message::Text(update.to_string().into()))
+                .await
+                .unwrap();
+            let Message::Text(more) = socket.next().await.unwrap().unwrap() else {
+                panic!("expected a second watch frame");
+            };
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&more).unwrap(),
+                serde_json::json!({"type": "watch", "execution_ids": ["se_abcdefabcdefabcdefabcdefabcdefab"]})
+            );
+            for frame in [unknown, gap] {
+                socket
+                    .send(Message::Text(frame.to_string().into()))
+                    .await
+                    .unwrap();
+            }
+            let _ = socket.next().await;
+        });
+        let client = StrataClient::new(format!("http://{address}")).unwrap();
+        let ids: Vec<String> = vec![
+            "se_0123456789abcdef0123456789abcdef".to_owned(),
+            "se_fedcba9876543210fedcba9876543210".to_owned(),
+            "se_00000000000000000000000000000000".to_owned(),
+        ];
+        let mut stream = client
+            .connect_executions("market_33333333333333333333333333333333", &ids)
+            .await
+            .unwrap();
+        match stream.next_event().await.unwrap() {
+            Some(PlatformExecutionEvent::ExecutionsSnapshot {
+                executions,
+                unknown_execution_ids,
+                ..
+            }) => {
+                assert_eq!(executions.len(), 2);
+                assert_eq!(unknown_execution_ids.len(), 1);
+            }
+            other => panic!("expected execution snapshot, got {other:?}"),
+        }
+        match stream.next_event().await.unwrap() {
+            Some(PlatformExecutionEvent::ExecutionUpdate { execution, .. }) => {
+                assert_eq!(execution.status, PlatformExecutionState::Confirmed);
+            }
+            other => panic!("expected execution update, got {other:?}"),
+        }
+        stream
+            .watch(&["se_abcdefabcdefabcdefabcdefabcdefab".to_owned()])
+            .await
+            .unwrap();
+        match stream.next_event().await.unwrap() {
+            Some(PlatformExecutionEvent::ExecutionUnknown { execution_id, .. }) => {
+                assert_eq!(execution_id, "se_abcdefabcdefabcdefabcdefabcdefab");
+            }
+            other => panic!("expected execution unknown, got {other:?}"),
+        }
+        assert!(
+            stream.next_event().await.is_err(),
+            "a sequence gap must fail closed"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    #[allow(clippy::result_large_err)]
+    async fn twap_stream_sequences_progress_and_fails_closed_on_gaps() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let snapshot = fixture("twap-stream");
+        let market_id = snapshot["market_id"].as_str().unwrap().to_owned();
+        let wallet = snapshot["wallet_address"].as_str().unwrap().to_owned();
+        let mut update = serde_json::json!({
+            "type": "twap_update",
+            "schema_version": 2,
+            "contract_version": "2.0",
+            "market_id": market_id,
+            "wallet_address": wallet,
+            "stream_id": snapshot["stream_id"],
+            "sequence": "2",
+            "previous_sequence": "1",
+            "server_time_ms": 1786550400100u64,
+        });
+        let mut twap = snapshot["twaps"][0].clone();
+        let executed = twap["slices_executed"].as_u64().unwrap() + 1;
+        twap["slices_executed"] = serde_json::json!(executed);
+        update["twap"] = twap;
+        let gap = serde_json::json!({
+            "type": "heartbeat",
+            "schema_version": 2,
+            "contract_version": "2.0",
+            "market_id": market_id,
+            "wallet_address": wallet,
+            "stream_id": snapshot["stream_id"],
+            "sequence": "4",
+            "previous_sequence": "3",
+            "server_time_ms": 1786550400200u64,
+        });
+        let expected_path = format!("/v2/markets/{market_id}/account/{wallet}/twaps/stream");
+        let server = tokio::spawn(async move {
+            let (connection, _) = listener.accept().await.unwrap();
+            let mut requested_path = String::new();
+            let mut socket = tokio_tungstenite::accept_hdr_async(
+                connection,
+                |request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+                 response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                    requested_path = request.uri().path().to_owned();
+                    Ok(response)
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(requested_path, expected_path);
+            for frame in [snapshot, update, gap] {
+                socket
+                    .send(Message::Text(frame.to_string().into()))
+                    .await
+                    .unwrap();
+            }
+            let _ = socket.next().await;
+        });
+        let client = StrataClient::new(format!("http://{address}")).unwrap();
+        let mut stream = client.connect_twaps(&market_id, &wallet).await.unwrap();
+        match stream.next_event().await.unwrap() {
+            Some(PlatformTwapEvent::TwapsSnapshot { twaps, .. }) => assert_eq!(twaps.len(), 1),
+            other => panic!("expected TWAP snapshot, got {other:?}"),
+        }
+        match stream.next_event().await.unwrap() {
+            Some(PlatformTwapEvent::TwapUpdate { twap, .. }) => {
+                assert_eq!(u64::from(twap.slices_executed), executed);
+            }
+            other => panic!("expected TWAP update, got {other:?}"),
+        }
+        assert!(
+            stream.next_event().await.is_err(),
+            "a sequence gap must fail closed"
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn maker_stream_signs_the_exact_challenge_and_sequences_maker_state() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let market_id = "market_33333333333333333333333333333333";
+        let wallet = "5Ji61Fbeb22Yntgv1hhHeSSLgdEdZchHeM1Tv1MjGhSL";
+        let challenge = "cd".repeat(32);
+        let challenge_for_server = challenge.clone();
+        let snapshot = fixture("maker-stream");
+        let mut fill_event = serde_json::json!({
+            "type": "maker_fill",
+            "schema_version": 2,
+            "contract_version": "2.0",
+            "market_id": market_id,
+            "wallet_address": wallet,
+            "stream_id": snapshot["stream_id"],
+            "sequence": "2",
+            "previous_sequence": "1",
+            "server_time_ms": 1786896000100u64,
+        });
+        let mut fill = snapshot["fills"][0].clone();
+        fill["fill_id"] = serde_json::json!("fill_99999999999999999999999999999999");
+        fill["product"] = serde_json::json!("intent");
+        fill_event["fill"] = fill;
+        let mut status = snapshot["status"].clone();
+        status["intent"] = serde_json::Value::Null;
+        status["active_products"] = serde_json::json!(2);
+        let status_event = serde_json::json!({
+            "type": "maker_status",
+            "schema_version": 2,
+            "contract_version": "2.0",
+            "market_id": market_id,
+            "wallet_address": wallet,
+            "stream_id": snapshot["stream_id"],
+            "sequence": "3",
+            "previous_sequence": "2",
+            "server_time_ms": 1786896000200u64,
+            "status": status,
+        });
+        let gap = serde_json::json!({
+            "type": "heartbeat",
+            "schema_version": 2,
+            "contract_version": "2.0",
+            "market_id": market_id,
+            "wallet_address": wallet,
+            "stream_id": snapshot["stream_id"],
+            "sequence": "5",
+            "previous_sequence": "4",
+            "server_time_ms": 1786896000300u64,
+        });
+        let server = tokio::spawn(async move {
+            let (connection, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(connection).await.unwrap();
+            socket
+                .send(Message::Text(
+                    serde_json::json!({
+                        "type": "auth_challenge",
+                        "schema_version": 2,
+                        "contract_version": "2.0",
+                        "market_id": market_id,
+                        "wallet_address": wallet,
+                        "challenge": challenge_for_server,
+                        "server_time_ms": 1786896000000u64,
+                        "expires_at_ms": 1786896005000u64
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+            let Message::Text(authentication) = socket.next().await.unwrap().unwrap() else {
+                panic!("expected text authentication");
+            };
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&authentication).unwrap(),
+                serde_json::json!({
+                    "type": "authenticate",
+                    "signature": "07".repeat(64),
+                })
+            );
+            for frame in [snapshot, fill_event, status_event, gap] {
+                socket
+                    .send(Message::Text(frame.to_string().into()))
+                    .await
+                    .unwrap();
+            }
+            let _ = socket.next().await;
+        });
+
+        let signer = TestAccountSigner {
+            wallet: wallet.to_owned(),
+            expected_message: format!(
+                "strata:mm-fills-stream:v2\n{market_id}\n{wallet}\n{challenge}"
+            )
+            .into_bytes(),
+            signature_byte: 7,
+        };
+        let client = StrataClient::new(format!("http://{address}")).unwrap();
+        let mut stream = client.connect_maker(market_id, &signer).await.unwrap();
+        match stream.next_event().await.unwrap() {
+            Some(PlatformMakerEvent::MakerSnapshot { status, fills, .. }) => {
+                assert_eq!(status.active_products, 3);
+                assert_eq!(fills.len(), 1);
+            }
+            other => panic!("expected maker snapshot, got {other:?}"),
+        }
+        match stream.next_event().await.unwrap() {
+            Some(PlatformMakerEvent::MakerFill { fill, .. }) => {
+                assert_eq!(fill.product, PlatformMakerProduct::Intent);
+            }
+            other => panic!("expected maker fill, got {other:?}"),
+        }
+        match stream.next_event().await.unwrap() {
+            Some(PlatformMakerEvent::MakerStatus { status, .. }) => {
+                assert!(status.intent.is_none());
+                assert_eq!(status.active_products, 2);
+            }
+            other => panic!("expected maker status, got {other:?}"),
+        }
+        assert!(
+            stream.next_event().await.is_err(),
+            "a sequence gap must fail closed"
+        );
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -2232,7 +6809,7 @@ mod tests {
                 PlatformOrderChallengeRequest::Place {
                     owner_wallet,
                     session_public_key,
-                    account_sequence: "7".to_owned(),
+                    account_sequence: Some("7".to_owned()),
                     client_order_id: "agent-order-7".to_owned(),
                     side: PlatformTradeSide::Buy,
                     order_type: PlatformOrderType::PostOnly,
@@ -2245,10 +6822,10 @@ mod tests {
         let prepared = client
             .order_prepare(
                 market_id,
-                PlatformOrderPrepareRequest {
+                PlatformOrderPrepareRequest::Authorized(PlatformOrderPrepareAuthorization {
                     challenge_id: challenge.challenge_id,
-                    authorization_signature,
-                },
+                    authorization_signature: Some(authorization_signature),
+                }),
             )
             .await
             .unwrap();
@@ -2277,6 +6854,539 @@ mod tests {
         assert_eq!(status.status, PlatformOrderControlStatus::Submitting);
     }
 
+    #[tokio::test]
+    async fn twap_calls_use_only_product_paths_and_external_signatures() {
+        let server = MockServer::start().await;
+        let market_id = "market_22222222222222222222222222222222";
+        let owner_wallet = bs58::encode([1u8; 32]).into_string();
+        let session_public_key = bs58::encode([2u8; 32]).into_string();
+        let authorization_signature = bs58::encode([3u8; 64]).into_string();
+        Mock::given(method("POST"))
+            .and(path(format!("/v2/markets/{market_id}/twaps/challenge")))
+            .and(body_json(serde_json::json!({
+                "action": "place",
+                "owner_wallet": owner_wallet,
+                "session_public_key": session_public_key,
+                "side": "buy",
+                "total_size_atoms": "10000000",
+                "slices_total": 10,
+                "maximum_tolerance_bps": 100,
+                "interval_slots": 100,
+                "limit_price_atoms": "150000000"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fixture("twap-challenge")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/v2/markets/{market_id}/twaps/prepare")))
+            .and(body_json(serde_json::json!({
+                "challenge_id": "twc_0123456789abcdef0123456789abcdef",
+                "authorization_signature": authorization_signature
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fixture("twap-prepare")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/v2/markets/{market_id}/twaps/submit")))
+            .and(body_json(serde_json::json!({
+                "twap_control_id": "twctl_44444444444444444444444444444444",
+                "signed_transaction_base64": "AQIDBA==",
+                "idempotency_key": "twap-attempt-7"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fixture("twap-submit")))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = StrataClient::new(server.uri()).unwrap();
+        let challenge = client
+            .twap_challenge(
+                market_id,
+                PlatformTwapChallengeRequest::Place {
+                    owner_wallet,
+                    session_public_key,
+                    side: PlatformTradeSide::Buy,
+                    total_size_atoms: "10000000".to_owned(),
+                    slices_total: 10,
+                    maximum_tolerance_bps: 100,
+                    interval_slots: 100,
+                    limit_price_atoms: "150000000".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        let prepared = client
+            .twap_prepare(
+                market_id,
+                PlatformTwapPrepareRequest::Authorized(PlatformTwapPrepareAuthorization {
+                    challenge_id: challenge.challenge_id,
+                    authorization_signature,
+                }),
+            )
+            .await
+            .unwrap();
+        let receipt = client
+            .twap_submit(
+                market_id,
+                PlatformTwapSubmitRequest {
+                    twap_control_id: prepared.twap_control_id,
+                    signed_transaction_base64: "AQIDBA==".to_owned(),
+                    idempotency_key: "twap-attempt-7".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(receipt.status, PlatformOrderSubmissionStatus::Submitted);
+        assert_eq!(receipt.action, PlatformTwapControlAction::Place);
+    }
+
+    /// A session signer for the one-signature helpers: it signs transactions
+    /// only and fails the test if a message signature is ever requested.
+    struct OneSignatureSigner {
+        expected_transaction: String,
+    }
+
+    #[async_trait]
+    impl SessionSigner for OneSignatureSigner {
+        fn public_key(&self) -> &str {
+            transaction_verifier::test_support::SESSION_PUBLIC_KEY
+        }
+
+        async fn sign_message(&self, _message: &[u8]) -> Result<Vec<u8>, String> {
+            panic!("one-signature path must not sign a message");
+        }
+
+        async fn sign_transaction(&self, transaction_base64: &str) -> Result<String, String> {
+            assert_eq!(transaction_base64, self.expected_transaction);
+            Ok("BQYHCA==".to_owned())
+        }
+    }
+
+    /// Records what a custom verifier is handed on the direct path.
+    struct RecordingVerifier {
+        market_id: String,
+        seen: std::sync::Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl OrderVerifier for RecordingVerifier {
+        async fn verify(&self, context: &OrderVerificationContext<'_>) -> Result<(), String> {
+            assert!(context.challenge.is_none());
+            assert_eq!(context.market_id, self.market_id);
+            assert_eq!(context.prepared.market_id, self.market_id);
+            assert_eq!(
+                context.owner_wallet,
+                transaction_verifier::test_support::OWNER_WALLET
+            );
+            assert_eq!(
+                context.session_public_key,
+                transaction_verifier::test_support::SESSION_PUBLIC_KEY
+            );
+            assert_eq!(
+                order_request_action(context.operation),
+                context.prepared.action
+            );
+            self.seen.lock().unwrap().push("order".to_owned());
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl TwapVerifier for RecordingVerifier {
+        async fn verify(&self, context: &TwapVerificationContext<'_>) -> Result<(), String> {
+            assert!(context.challenge.is_none());
+            assert_eq!(context.market_id, self.market_id);
+            assert_eq!(context.prepared.market_id, self.market_id);
+            assert_eq!(
+                context.owner_wallet,
+                transaction_verifier::test_support::OWNER_WALLET
+            );
+            assert_eq!(
+                twap_request_action(context.operation),
+                context.prepared.action
+            );
+            self.seen.lock().unwrap().push("twap".to_owned());
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl ExecutionVerifier for RecordingVerifier {
+        async fn verify(&self, context: &ExecutionVerificationContext<'_>) -> Result<(), String> {
+            assert!(context.challenge.is_none());
+            assert_eq!(context.prepared.quote_id, context.quote.quote_id);
+            assert_eq!(context.prepared.market_id, self.market_id);
+            assert_eq!(
+                context.owner_wallet,
+                transaction_verifier::test_support::OWNER_WALLET
+            );
+            self.seen.lock().unwrap().push("execution".to_owned());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_order_uses_one_signature_over_a_verified_direct_prepare() {
+        use transaction_verifier::test_support::{
+            market_id, order_id, place_transaction, recent_blockhash, PlaceTransactionOptions,
+            OWNER_WALLET, PLACE_PRICE, PLACE_SIZE, SESSION_PUBLIC_KEY,
+        };
+        let server = MockServer::start().await;
+        let market_id = market_id();
+        let transaction = place_transaction(PlaceTransactionOptions::default());
+        let mut prepared = fixture("order-prepare");
+        prepared["market_id"] = serde_json::json!(market_id);
+        prepared["order_ids"] = serde_json::json!([order_id()]);
+        prepared["transaction_base64"] = serde_json::json!(transaction);
+        prepared["recent_blockhash"] = serde_json::json!(recent_blockhash());
+        let mut submitted = fixture("order-submit");
+        submitted["market_id"] = serde_json::json!(market_id);
+        submitted["order_ids"] = serde_json::json!([order_id()]);
+        // Direct prepare: the operation itself is the body — no challenge, no
+        // challenge_id, no message signature.
+        Mock::given(method("POST"))
+            .and(path(format!("/v2/markets/{market_id}/orders/prepare")))
+            .and(body_json(serde_json::json!({
+                "action": "place",
+                "owner_wallet": OWNER_WALLET,
+                "session_public_key": SESSION_PUBLIC_KEY,
+                "client_order_id": "agent-42",
+                "side": "buy",
+                "order_type": "post_only",
+                "limit_price_atoms": PLACE_PRICE.to_string(),
+                "size_atoms": PLACE_SIZE.to_string()
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(prepared))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/v2/markets/{market_id}/orders/submit")))
+            .and(body_json(serde_json::json!({
+                "order_control_id": "or_44444444444444444444444444444444",
+                "signed_transaction_base64": "BQYHCA==",
+                "idempotency_key": "or_44444444444444444444444444444444"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(submitted))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let client = StrataClient::new(server.uri()).unwrap();
+        let signer = OneSignatureSigner {
+            expected_transaction: transaction,
+        };
+        let operation = OrderExecuteOperation::Place {
+            owner_wallet: OWNER_WALLET.to_owned(),
+            account_sequence: None,
+            client_order_id: "agent-42".to_owned(),
+            side: PlatformTradeSide::Buy,
+            order_type: PlatformOrderType::PostOnly,
+            limit_price_atoms: PLACE_PRICE.to_string(),
+            size_atoms: PLACE_SIZE.to_string(),
+        };
+        // Built-in verifier: the SDK decodes the transaction and requires it
+        // to be exactly this operation before the one signature.
+        let receipt = client
+            .execute_order(
+                &market_id,
+                &operation,
+                &signer,
+                &DefaultTransactionVerifier,
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(receipt.status, PlatformOrderSubmissionStatus::Submitted);
+        assert_eq!(receipt.order_ids, vec![order_id()]);
+
+        // A custom verifier still receives the operation and prepared
+        // transaction, with no challenge.
+        let recording = RecordingVerifier {
+            market_id: market_id.clone(),
+            seen: std::sync::Mutex::new(Vec::new()),
+        };
+        client
+            .execute_order(&market_id, &operation, &signer, &recording, None)
+            .await
+            .unwrap();
+        assert_eq!(*recording.seen.lock().unwrap(), vec!["order".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn execute_order_refuses_a_transaction_that_is_not_the_operation() {
+        use transaction_verifier::test_support::{
+            market_id, order_id, place_transaction, recent_blockhash, PlaceTransactionOptions,
+            OWNER_WALLET, PLACE_PRICE, PLACE_SIZE,
+        };
+        let market_id = market_id();
+        let operation = OrderExecuteOperation::Place {
+            owner_wallet: OWNER_WALLET.to_owned(),
+            account_sequence: None,
+            client_order_id: "agent-42".to_owned(),
+            side: PlatformTradeSide::Buy,
+            order_type: PlatformOrderType::PostOnly,
+            limit_price_atoms: PLACE_PRICE.to_string(),
+            size_atoms: PLACE_SIZE.to_string(),
+        };
+        // Built-in verifier refusals: a different side, the session as fee
+        // payer, a session-signed system transfer, another market.
+        let cases = [
+            (
+                PlaceTransactionOptions {
+                    side: 1,
+                    ..PlaceTransactionOptions::default()
+                },
+                "exactly the requested orders",
+            ),
+            (
+                PlaceTransactionOptions {
+                    session_pays: true,
+                    ..PlaceTransactionOptions::default()
+                },
+                "fee payer",
+            ),
+            (
+                PlaceTransactionOptions {
+                    extra_system_transfer: true,
+                    ..PlaceTransactionOptions::default()
+                },
+                "system or token instruction",
+            ),
+            (
+                PlaceTransactionOptions {
+                    market: Some([7; 32]),
+                    ..PlaceTransactionOptions::default()
+                },
+                "another market",
+            ),
+        ];
+        for (options, expected) in cases {
+            let server = MockServer::start().await;
+            let transaction = place_transaction(options);
+            let mut prepared = fixture("order-prepare");
+            prepared["market_id"] = serde_json::json!(market_id);
+            prepared["order_ids"] = serde_json::json!([order_id()]);
+            prepared["transaction_base64"] = serde_json::json!(transaction);
+            prepared["recent_blockhash"] = serde_json::json!(recent_blockhash());
+            Mock::given(method("POST"))
+                .and(path(format!("/v2/markets/{market_id}/orders/prepare")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(prepared))
+                .expect(1)
+                .mount(&server)
+                .await;
+            // No submit mount: a refusal must stop before signing.
+            let client = StrataClient::new(server.uri()).unwrap();
+            let signer = OneSignatureSigner {
+                expected_transaction: "never signed".to_owned(),
+            };
+            let error = client
+                .execute_order(
+                    &market_id,
+                    &operation,
+                    &signer,
+                    &DefaultTransactionVerifier,
+                    None,
+                )
+                .await
+                .unwrap_err();
+            match error {
+                SdkError::Verification(message) => {
+                    assert!(message.contains(expected), "{message}")
+                }
+                other => panic!("expected a verification refusal, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_twap_uses_the_direct_prepare_body_and_one_signature() {
+        use transaction_verifier::test_support::{OWNER_WALLET, SESSION_PUBLIC_KEY};
+        let server = MockServer::start().await;
+        let market_id = "market_22222222222222222222222222222222";
+        Mock::given(method("POST"))
+            .and(path(format!("/v2/markets/{market_id}/twaps/prepare")))
+            .and(body_json(serde_json::json!({
+                "action": "place",
+                "owner_wallet": OWNER_WALLET,
+                "session_public_key": SESSION_PUBLIC_KEY,
+                "side": "buy",
+                "total_size_atoms": "10000000",
+                "slices_total": 10,
+                "maximum_tolerance_bps": 100,
+                "interval_slots": 100,
+                "limit_price_atoms": "150000000"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fixture("twap-prepare")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("/v2/markets/{market_id}/twaps/submit")))
+            .and(body_json(serde_json::json!({
+                "twap_control_id": "twctl_44444444444444444444444444444444",
+                "signed_transaction_base64": "BQYHCA==",
+                "idempotency_key": "twap-attempt-7"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fixture("twap-submit")))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = StrataClient::new(server.uri()).unwrap();
+        let signer = OneSignatureSigner {
+            expected_transaction: "AQ==".to_owned(),
+        };
+        let recording = RecordingVerifier {
+            market_id: market_id.to_owned(),
+            seen: std::sync::Mutex::new(Vec::new()),
+        };
+        let receipt = client
+            .execute_twap(
+                market_id,
+                &TwapExecuteOperation::Place {
+                    owner_wallet: OWNER_WALLET.to_owned(),
+                    side: PlatformTradeSide::Buy,
+                    total_size_atoms: "10000000".to_owned(),
+                    slices_total: 10,
+                    maximum_tolerance_bps: 100,
+                    interval_slots: 100,
+                    limit_price_atoms: "150000000".to_owned(),
+                },
+                &signer,
+                &recording,
+                Some("twap-attempt-7"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(receipt.status, PlatformOrderSubmissionStatus::Submitted);
+        assert_eq!(*recording.seen.lock().unwrap(), vec!["twap".to_owned()]);
+    }
+
+    #[tokio::test]
+    async fn execute_quote_uses_the_direct_prepare_body_and_one_signature() {
+        use transaction_verifier::test_support::{OWNER_WALLET, SESSION_PUBLIC_KEY};
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/sonar/markets"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fixture("markets")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut quote: QuoteResponse = serde_json::from_value(fixture("quote")).unwrap();
+        quote.expires_at_ms = unix_ms().unwrap() + 60_000;
+        let prepared = fixture("execution-prepare");
+        Mock::given(method("POST"))
+            .and(path("/sonar/markets/sol-usdc/execution/prepare"))
+            .and(body_json(serde_json::json!({
+                "quote_id": quote.quote_id,
+                "owner_wallet": OWNER_WALLET,
+                "session_public_key": SESSION_PUBLIC_KEY
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(prepared.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/sonar/markets/sol-usdc/execution/submit"))
+            .and(body_json(serde_json::json!({
+                "execution_id": prepared["execution_id"],
+                "signed_transaction_base64": "BQYHCA==",
+                "idempotency_key": prepared["execution_id"]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fixture("execution-submit")))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = StrataClient::new(server.uri()).unwrap();
+        let signer = OneSignatureSigner {
+            expected_transaction: prepared["transaction_base64"].as_str().unwrap().to_owned(),
+        };
+        let recording = RecordingVerifier {
+            market_id: quote.market_id.clone(),
+            seen: std::sync::Mutex::new(Vec::new()),
+        };
+        let receipt = client
+            .execute_quote(&quote, OWNER_WALLET, None, &signer, &recording, None)
+            .await
+            .unwrap();
+        assert_eq!(receipt.status, ExecutionStatus::Submitted);
+        assert_eq!(
+            *recording.seen.lock().unwrap(),
+            vec!["execution".to_owned()]
+        );
+    }
+
+    #[test]
+    fn twap_authorization_parser_binds_every_public_place_field() {
+        let owner = [1u8; 32];
+        let session = [2u8; 32];
+        let pda = [3u8; 32];
+        let blockhash = [4u8; 32];
+        let nonce = [5u8; 16];
+        let expires_at_ms = 1_786_550_460_000u64;
+        let request = PlatformTwapChallengeRequest::Place {
+            owner_wallet: bs58::encode(owner).into_string(),
+            session_public_key: bs58::encode(session).into_string(),
+            side: PlatformTradeSide::Buy,
+            total_size_atoms: "10000000".to_owned(),
+            slices_total: 10,
+            maximum_tolerance_bps: 100,
+            interval_slots: 100,
+            limit_price_atoms: "150000000".to_owned(),
+        };
+        let mut payload = Vec::new();
+        payload.extend_from_slice(PUBLIC_TWAP_AUTH_DOMAIN);
+        payload.extend_from_slice(&[9u8; 32]);
+        payload.extend_from_slice(&[8u8; 32]);
+        payload.extend_from_slice(&owner);
+        payload.extend_from_slice(&session);
+        payload.push(0);
+        payload.push(0);
+        payload.extend_from_slice(&10_000_000u64.to_le_bytes());
+        payload.extend_from_slice(&10u16.to_le_bytes());
+        payload.extend_from_slice(&100u16.to_le_bytes());
+        payload.extend_from_slice(&100u32.to_le_bytes());
+        payload.extend_from_slice(&150_000_000u64.to_le_bytes());
+        payload.extend_from_slice(&7u64.to_le_bytes());
+        payload.extend_from_slice(&pda);
+        payload.extend_from_slice(&blockhash);
+        payload.extend_from_slice(&123u64.to_le_bytes());
+        payload.extend_from_slice(&expires_at_ms.to_le_bytes());
+        payload.extend_from_slice(&nonce);
+        let challenge = PlatformTwapChallengeResponse {
+            schema_version: 2,
+            contract_version: "2.0".to_owned(),
+            challenge_id: format!("twc_{}", hex::encode(nonce)),
+            market_id: "market_22222222222222222222222222222222".to_owned(),
+            action: PlatformTwapControlAction::Place,
+            twap_id: opaque_twap_id(&pda),
+            authorization_payload_base64: base64::engine::general_purpose::STANDARD
+                .encode(&payload),
+            server_time_ms: expires_at_ms - 60_000,
+            expires_at_ms,
+        };
+        let authorization = validate_twap_authorization(&challenge, &request).unwrap();
+        assert_eq!(authorization.bytes, payload);
+        assert_eq!(authorization.last_valid_block_height, 123);
+        assert_eq!(
+            authorization.recent_blockhash,
+            bs58::encode(blockhash).into_string()
+        );
+
+        let mut changed = request.clone();
+        if let PlatformTwapChallengeRequest::Place {
+            total_size_atoms, ..
+        } = &mut changed
+        {
+            *total_size_atoms = "10000001".to_owned();
+        }
+        assert!(validate_twap_authorization(&challenge, &changed).is_err());
+    }
+
     #[test]
     fn order_authorization_parser_binds_every_public_place_field() {
         let owner = [1u8; 32];
@@ -2290,7 +7400,7 @@ mod tests {
         let request = PlatformOrderChallengeRequest::Place {
             owner_wallet: bs58::encode(owner).into_string(),
             session_public_key: bs58::encode(session).into_string(),
-            account_sequence: "7".to_owned(),
+            account_sequence: Some("7".to_owned()),
             client_order_id: "agent-order-7".to_owned(),
             side: PlatformTradeSide::Buy,
             order_type: PlatformOrderType::PostOnly,
@@ -2334,6 +7444,26 @@ mod tests {
         );
         assert_eq!(authorization.last_valid_block_height, 400_000_000);
 
+        // A sequence left to Strata is accepted from the signed authorization
+        // while every other binding is still enforced; a supplied sequence
+        // that differs from it is rejected.
+        let mut resolved = request.clone();
+        if let PlatformOrderChallengeRequest::Place {
+            account_sequence, ..
+        } = &mut resolved
+        {
+            *account_sequence = None;
+        }
+        assert!(validate_order_authorization(&challenge, &resolved).is_ok());
+        let mut pinned_elsewhere = request.clone();
+        if let PlatformOrderChallengeRequest::Place {
+            account_sequence, ..
+        } = &mut pinned_elsewhere
+        {
+            *account_sequence = Some("8".to_owned());
+        }
+        assert!(validate_order_authorization(&challenge, &pinned_elsewhere).is_err());
+
         let mut changed = request;
         if let PlatformOrderChallengeRequest::Place { size_atoms, .. } = &mut changed {
             *size_atoms = "1000001".to_owned();
@@ -2361,7 +7491,7 @@ mod tests {
                 },
                 PlatformOrderBatchOperation::Replace {
                     order_id: opaque_order_id(market_id, &replaced),
-                    account_sequence: "8".to_owned(),
+                    account_sequence: Some("8".to_owned()),
                     client_order_id: "replacement-8".to_owned(),
                     side: PlatformTradeSide::Sell,
                     order_type: PlatformOrderType::PostOnly,
