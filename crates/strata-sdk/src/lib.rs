@@ -820,7 +820,7 @@ impl StrataClient {
             ));
         }
         let resolution = request.resolution_seconds.unwrap_or(300);
-        if !(60..=86_400).contains(&resolution) || resolution % 60 != 0 {
+        if !(60..=86_400).contains(&resolution) || !resolution.is_multiple_of(60) {
             return Err(SdkError::InvalidRequest(
                 "candle resolution must be whole minutes up to one day".to_owned(),
             ));
@@ -6545,6 +6545,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::result_large_err)]
     async fn twap_stream_sequences_progress_and_fails_closed_on_gaps() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();

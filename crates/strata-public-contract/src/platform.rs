@@ -433,9 +433,10 @@ impl PlatformActionGraphResponse {
         }
         for workflow in &mut self.workflows {
             for node in &mut workflow.nodes {
-                node.available = node.capability_id.as_ref().map_or(true, |capability_id| {
-                    live_capability_ids.contains(capability_id)
-                });
+                node.available = node
+                    .capability_id
+                    .as_ref()
+                    .is_none_or(|capability_id| live_capability_ids.contains(capability_id));
             }
         }
     }
@@ -918,6 +919,7 @@ pub struct PlatformTwapSubmitResponse {
 /// advances the sequence on the same identity.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+#[allow(clippy::large_enum_variant)]
 pub enum PlatformTwapEvent {
     TwapsSnapshot {
         schema_version: u16,
