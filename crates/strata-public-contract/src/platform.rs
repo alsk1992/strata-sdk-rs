@@ -2397,6 +2397,127 @@ pub struct PlatformMakerStatusResponse {
     pub active_products: u16,
 }
 
+/// One maker-owned Strand mutation. Amounts that may exceed JavaScript's safe
+/// integer range remain canonical unsigned decimal strings on the wire.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PlatformMakerStrandPrepareRequest {
+    Upsert {
+        maker_wallet: String,
+        enabled: bool,
+        async_only: bool,
+        sync_spread_ticks: u16,
+        mid_price_atoms: String,
+        max_exposure_base_lots: String,
+        bid_offsets_ticks: Vec<u16>,
+        ask_offsets_ticks: Vec<u16>,
+        bid_sizes_base_lots: Vec<String>,
+        ask_sizes_base_lots: Vec<String>,
+        valid_until_slot: String,
+    },
+    Recenter {
+        maker_wallet: String,
+        new_mid_price_atoms: String,
+        valid_until_slot: String,
+    },
+    SetEnabled {
+        maker_wallet: String,
+        enabled: bool,
+    },
+    Cancel {
+        maker_wallet: String,
+    },
+}
+
+/// One maker-owned Current mutation. Current is parameterized around the
+/// market's configured on-chain reference and therefore has no recenter action.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PlatformMakerCurrentPrepareRequest {
+    Upsert {
+        maker_wallet: String,
+        enabled: bool,
+        async_only: bool,
+        half_spread_bps: u16,
+        band_step_bps: u16,
+        max_conf_bps: u16,
+        max_oracle_dev_bps: u16,
+        max_oracle_age_secs: u32,
+        sync_spread_bps: u16,
+        max_exposure_base_atoms: String,
+        bid_depth_base_atoms: Vec<String>,
+        ask_depth_base_atoms: Vec<String>,
+        valid_until_slot: String,
+    },
+    Cancel {
+        maker_wallet: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlatformMakerControlProduct {
+    Strand,
+    Current,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlatformMakerControlAction {
+    StrandUpsert,
+    StrandRecenter,
+    StrandSetEnabled,
+    StrandCancel,
+    CurrentUpsert,
+    CurrentCancel,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlatformMakerControlPrepareResponse {
+    pub schema_version: u16,
+    pub contract_version: String,
+    pub maker_control_id: String,
+    pub market_id: String,
+    pub maker_wallet: String,
+    pub product: PlatformMakerControlProduct,
+    pub action: PlatformMakerControlAction,
+    /// Unsigned legacy Solana transaction. The maker verifies the exact
+    /// instruction and fills its only signature slot externally.
+    pub transaction_base64: String,
+    pub recent_blockhash: String,
+    pub last_valid_block_height: u64,
+    pub expires_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlatformMakerControlSubmitRequest {
+    pub maker_control_id: String,
+    pub signed_transaction_base64: String,
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlatformMakerControlSubmissionStatus {
+    Submitted,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlatformMakerControlSubmitResponse {
+    pub schema_version: u16,
+    pub contract_version: String,
+    pub maker_control_id: String,
+    pub market_id: String,
+    pub maker_wallet: String,
+    pub product: PlatformMakerControlProduct,
+    pub action: PlatformMakerControlAction,
+    pub signature: String,
+    pub status: PlatformMakerControlSubmissionStatus,
+}
+
 /// Which Strata maker product produced a maker-side fill.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -2693,7 +2814,7 @@ mod tests {
         assert_eq!(service_status.status, PlatformServiceState::Operational);
         assert_eq!(service_status.available_operations, 59);
         assert_eq!(graph.entry_operation_id, "platform.capabilities.read");
-        assert_eq!(graph.operations.len(), 67);
+        assert_eq!(graph.operations.len(), 69);
         assert_eq!(maker_reputation.tier, PlatformMakerReputationTier::Gold);
         assert_eq!(maker_status.active_products, 3);
         match &maker_stream {
@@ -3039,5 +3160,39 @@ mod tests {
             execution,
             crate::ExecutionPrepareRequest::Direct(_)
         ));
+    }
+
+    #[test]
+    fn maker_control_requests_are_tagged_exact_and_amount_safe() {
+        let strand: PlatformMakerStrandPrepareRequest = serde_json::from_value(serde_json::json!({
+            "action": "recenter",
+            "maker_wallet": "5Ji61Fbeb22Yntgv1hhHeSSLgdEdZchHeM1Tv1MjGhSL",
+            "new_mid_price_atoms": "123000000",
+            "valid_until_slot": "0"
+        }))
+        .unwrap();
+        assert!(matches!(
+            strand,
+            PlatformMakerStrandPrepareRequest::Recenter { .. }
+        ));
+
+        let current: PlatformMakerCurrentPrepareRequest =
+            serde_json::from_value(serde_json::json!({
+                "action": "cancel",
+                "maker_wallet": "5Ji61Fbeb22Yntgv1hhHeSSLgdEdZchHeM1Tv1MjGhSL"
+            }))
+            .unwrap();
+        assert!(matches!(
+            current,
+            PlatformMakerCurrentPrepareRequest::Cancel { .. }
+        ));
+        assert!(
+            serde_json::from_value::<PlatformMakerCurrentPrepareRequest>(serde_json::json!({
+                "action": "cancel",
+                "maker_wallet": "5Ji61Fbeb22Yntgv1hhHeSSLgdEdZchHeM1Tv1MjGhSL",
+                "oracle_price": 123.45
+            }))
+            .is_err()
+        );
     }
 }

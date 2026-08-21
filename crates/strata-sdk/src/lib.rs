@@ -46,13 +46,17 @@ pub use strata_public_contract::platform::{
     PlatformDeadManState, PlatformDeadManStatus, PlatformDiscoveryResponse,
     PlatformExecutionCommand, PlatformExecutionEvent, PlatformExecutionRow, PlatformExecutionState,
     PlatformExecutionStatusResponse, PlatformFeeScheduleResponse, PlatformGraphModule,
-    PlatformGraphRelation, PlatformMakerEvent, PlatformMakerFill, PlatformMakerProduct,
-    PlatformMakerReputationResponse, PlatformMakerReputationTier, PlatformMakerStatusResponse,
-    PlatformMakerTierProgress, PlatformMarkResponse, PlatformMarket, PlatformMarketAction,
-    PlatformMarketDataEvent, PlatformMarketState, PlatformMarketStatusResponse,
-    PlatformMarketsResponse, PlatformOperation, PlatformOperationTransport, PlatformOrderAction,
-    PlatformOrderBatchOperation, PlatformOrderChallengeRequest, PlatformOrderChallengeResponse,
-    PlatformOrderCommand, PlatformOrderCommandBatchEvent, PlatformOrderCommandBatchFormat,
+    PlatformGraphRelation, PlatformMakerControlAction, PlatformMakerControlPrepareResponse,
+    PlatformMakerControlProduct, PlatformMakerControlSubmissionStatus,
+    PlatformMakerControlSubmitRequest, PlatformMakerControlSubmitResponse,
+    PlatformMakerCurrentPrepareRequest, PlatformMakerEvent, PlatformMakerFill,
+    PlatformMakerProduct, PlatformMakerReputationResponse, PlatformMakerReputationTier,
+    PlatformMakerStatusResponse, PlatformMakerStrandPrepareRequest, PlatformMakerTierProgress,
+    PlatformMarkResponse, PlatformMarket, PlatformMarketAction, PlatformMarketDataEvent,
+    PlatformMarketState, PlatformMarketStatusResponse, PlatformMarketsResponse, PlatformOperation,
+    PlatformOperationTransport, PlatformOrderAction, PlatformOrderBatchOperation,
+    PlatformOrderChallengeRequest, PlatformOrderChallengeResponse, PlatformOrderCommand,
+    PlatformOrderCommandBatchEvent, PlatformOrderCommandBatchFormat,
     PlatformOrderCommandClientFrame, PlatformOrderCommandEvent, PlatformOrderCommandServerFrame,
     PlatformOrderControlStatus, PlatformOrderPrepareAuthorization, PlatformOrderPrepareRequest,
     PlatformOrderPrepareResponse, PlatformOrderState, PlatformOrderStatusRequest,
@@ -1814,6 +1818,130 @@ impl StrataClient {
         Ok(response)
     }
 
+    /// Prepare one exact maker-signed Strand transaction. Strata never sees
+    /// the maker's private key and the returned packet has one signature slot.
+    pub async fn platform_maker_strand_prepare(
+        &self,
+        market_id: &str,
+        request: PlatformMakerStrandPrepareRequest,
+    ) -> Result<PlatformMakerControlPrepareResponse, SdkError> {
+        let market_id = validate_platform_market_id(market_id)?;
+        let expected_action = strand_prepare_action(&request);
+        let expected_wallet = strand_prepare_wallet(&request)?;
+        let request = normalize_strand_prepare_request(request)?;
+        let prepared: PlatformMakerControlPrepareResponse = self
+            .post(
+                &format!("v2/markets/{market_id}/makers/strands/prepare"),
+                &request,
+            )
+            .await?;
+        validate_maker_control_prepare(
+            &prepared,
+            &market_id,
+            &expected_wallet,
+            PlatformMakerControlProduct::Strand,
+            expected_action,
+        )?;
+        Ok(prepared)
+    }
+
+    /// Prepare one exact maker-signed Current transaction. Upsert fails closed
+    /// when the market has no verified on-chain reference; cancel stays usable.
+    pub async fn platform_maker_current_prepare(
+        &self,
+        market_id: &str,
+        request: PlatformMakerCurrentPrepareRequest,
+    ) -> Result<PlatformMakerControlPrepareResponse, SdkError> {
+        let market_id = validate_platform_market_id(market_id)?;
+        let expected_action = current_prepare_action(&request);
+        let expected_wallet = current_prepare_wallet(&request)?;
+        let request = normalize_current_prepare_request(request)?;
+        let prepared: PlatformMakerControlPrepareResponse = self
+            .post(
+                &format!("v2/markets/{market_id}/makers/currents/prepare"),
+                &request,
+            )
+            .await?;
+        validate_maker_control_prepare(
+            &prepared,
+            &market_id,
+            &expected_wallet,
+            PlatformMakerControlProduct::Current,
+            expected_action,
+        )?;
+        Ok(prepared)
+    }
+
+    pub async fn platform_maker_strand_submit(
+        &self,
+        market_id: &str,
+        request: PlatformMakerControlSubmitRequest,
+    ) -> Result<PlatformMakerControlSubmitResponse, SdkError> {
+        self.platform_maker_control_submit(
+            market_id,
+            "strands",
+            PlatformMakerControlProduct::Strand,
+            request,
+        )
+        .await
+    }
+
+    pub async fn platform_maker_current_submit(
+        &self,
+        market_id: &str,
+        request: PlatformMakerControlSubmitRequest,
+    ) -> Result<PlatformMakerControlSubmitResponse, SdkError> {
+        self.platform_maker_control_submit(
+            market_id,
+            "currents",
+            PlatformMakerControlProduct::Current,
+            request,
+        )
+        .await
+    }
+
+    async fn platform_maker_control_submit(
+        &self,
+        market_id: &str,
+        product_path: &str,
+        expected_product: PlatformMakerControlProduct,
+        request: PlatformMakerControlSubmitRequest,
+    ) -> Result<PlatformMakerControlSubmitResponse, SdkError> {
+        let market_id = validate_platform_market_id(market_id)?;
+        if !valid_handle(&request.maker_control_id, "mc_") {
+            return Err(SdkError::InvalidRequest(
+                "maker_control_id is invalid".to_owned(),
+            ));
+        }
+        let request = PlatformMakerControlSubmitRequest {
+            maker_control_id: request.maker_control_id,
+            signed_transaction_base64: canonical_base64(
+                &request.signed_transaction_base64,
+                "signed_transaction_base64",
+            )?,
+            idempotency_key: normalize_idempotency_key(&request.idempotency_key)?,
+        };
+        let submitted: PlatformMakerControlSubmitResponse = self
+            .post(
+                &format!("v2/markets/{market_id}/makers/{product_path}/submit"),
+                &request,
+            )
+            .await?;
+        validate_platform_version(submitted.schema_version, &submitted.contract_version)?;
+        if submitted.market_id != market_id
+            || submitted.maker_control_id != request.maker_control_id
+            || submitted.product != expected_product
+            || submitted.status != PlatformMakerControlSubmissionStatus::Submitted
+        {
+            return Err(SdkError::InvalidResponse(
+                "maker-control receipt is invalid".to_owned(),
+            ));
+        }
+        canonical_public_key(&submitted.maker_wallet, "maker_wallet")?;
+        canonical_signature(&submitted.signature, "signature")?;
+        Ok(submitted)
+    }
+
     pub async fn capabilities(&self) -> Result<CapabilityCatalog, SdkError> {
         let catalog: CapabilityCatalog = self.get("sonar/capabilities", &[]).await?;
         validate_version(catalog.schema_version, &catalog.contract_version)?;
@@ -2796,6 +2924,266 @@ fn validate_vault_submission(
     }
     canonical_public_key(&response.wallet_address, "wallet_address")?;
     canonical_signature(&response.signature, "signature")?;
+    Ok(())
+}
+
+fn strand_prepare_action(
+    request: &PlatformMakerStrandPrepareRequest,
+) -> PlatformMakerControlAction {
+    match request {
+        PlatformMakerStrandPrepareRequest::Upsert { .. } => {
+            PlatformMakerControlAction::StrandUpsert
+        }
+        PlatformMakerStrandPrepareRequest::Recenter { .. } => {
+            PlatformMakerControlAction::StrandRecenter
+        }
+        PlatformMakerStrandPrepareRequest::SetEnabled { .. } => {
+            PlatformMakerControlAction::StrandSetEnabled
+        }
+        PlatformMakerStrandPrepareRequest::Cancel { .. } => {
+            PlatformMakerControlAction::StrandCancel
+        }
+    }
+}
+
+fn current_prepare_action(
+    request: &PlatformMakerCurrentPrepareRequest,
+) -> PlatformMakerControlAction {
+    match request {
+        PlatformMakerCurrentPrepareRequest::Upsert { .. } => {
+            PlatformMakerControlAction::CurrentUpsert
+        }
+        PlatformMakerCurrentPrepareRequest::Cancel { .. } => {
+            PlatformMakerControlAction::CurrentCancel
+        }
+    }
+}
+
+fn strand_prepare_wallet(request: &PlatformMakerStrandPrepareRequest) -> Result<String, SdkError> {
+    let wallet = match request {
+        PlatformMakerStrandPrepareRequest::Upsert { maker_wallet, .. }
+        | PlatformMakerStrandPrepareRequest::Recenter { maker_wallet, .. }
+        | PlatformMakerStrandPrepareRequest::SetEnabled { maker_wallet, .. }
+        | PlatformMakerStrandPrepareRequest::Cancel { maker_wallet } => maker_wallet,
+    };
+    canonical_public_key(wallet, "maker_wallet")
+}
+
+fn current_prepare_wallet(
+    request: &PlatformMakerCurrentPrepareRequest,
+) -> Result<String, SdkError> {
+    let wallet = match request {
+        PlatformMakerCurrentPrepareRequest::Upsert { maker_wallet, .. }
+        | PlatformMakerCurrentPrepareRequest::Cancel { maker_wallet } => maker_wallet,
+    };
+    canonical_public_key(wallet, "maker_wallet")
+}
+
+fn normalize_strand_prepare_request(
+    request: PlatformMakerStrandPrepareRequest,
+) -> Result<PlatformMakerStrandPrepareRequest, SdkError> {
+    Ok(match request {
+        PlatformMakerStrandPrepareRequest::Upsert {
+            maker_wallet,
+            enabled,
+            async_only,
+            sync_spread_ticks,
+            mid_price_atoms,
+            max_exposure_base_lots,
+            bid_offsets_ticks,
+            ask_offsets_ticks,
+            bid_sizes_base_lots,
+            ask_sizes_base_lots,
+            valid_until_slot,
+        } => {
+            if bid_offsets_ticks.len() != 16
+                || ask_offsets_ticks.len() != 16
+                || bid_sizes_base_lots.len() != 16
+                || ask_sizes_base_lots.len() != 16
+            {
+                return Err(SdkError::InvalidRequest(
+                    "Strand requires exactly 16 bid and 16 ask levels".to_owned(),
+                ));
+            }
+            let bid_sizes_base_lots =
+                canonical_amounts(bid_sizes_base_lots, "bid_sizes_base_lots")?;
+            let ask_sizes_base_lots =
+                canonical_amounts(ask_sizes_base_lots, "ask_sizes_base_lots")?;
+            if !bid_sizes_base_lots
+                .iter()
+                .chain(&ask_sizes_base_lots)
+                .any(|size| size != "0")
+                || bid_offsets_ticks
+                    .iter()
+                    .zip(&bid_sizes_base_lots)
+                    .chain(ask_offsets_ticks.iter().zip(&ask_sizes_base_lots))
+                    .any(|(offset, size)| *offset == 0 && size != "0")
+            {
+                return Err(SdkError::InvalidRequest(
+                    "active Strand levels require positive offsets".to_owned(),
+                ));
+            }
+            PlatformMakerStrandPrepareRequest::Upsert {
+                maker_wallet: canonical_public_key(&maker_wallet, "maker_wallet")?,
+                enabled,
+                async_only,
+                sync_spread_ticks,
+                mid_price_atoms: canonical_request_atoms(
+                    &mid_price_atoms,
+                    "mid_price_atoms",
+                    false,
+                )?,
+                max_exposure_base_lots: canonical_request_atoms(
+                    &max_exposure_base_lots,
+                    "max_exposure_base_lots",
+                    false,
+                )?,
+                bid_offsets_ticks,
+                ask_offsets_ticks,
+                bid_sizes_base_lots,
+                ask_sizes_base_lots,
+                valid_until_slot: canonical_request_atoms(
+                    &valid_until_slot,
+                    "valid_until_slot",
+                    true,
+                )?,
+            }
+        }
+        PlatformMakerStrandPrepareRequest::Recenter {
+            maker_wallet,
+            new_mid_price_atoms,
+            valid_until_slot,
+        } => PlatformMakerStrandPrepareRequest::Recenter {
+            maker_wallet: canonical_public_key(&maker_wallet, "maker_wallet")?,
+            new_mid_price_atoms: canonical_request_atoms(
+                &new_mid_price_atoms,
+                "new_mid_price_atoms",
+                false,
+            )?,
+            valid_until_slot: canonical_request_atoms(&valid_until_slot, "valid_until_slot", true)?,
+        },
+        PlatformMakerStrandPrepareRequest::SetEnabled {
+            maker_wallet,
+            enabled,
+        } => PlatformMakerStrandPrepareRequest::SetEnabled {
+            maker_wallet: canonical_public_key(&maker_wallet, "maker_wallet")?,
+            enabled,
+        },
+        PlatformMakerStrandPrepareRequest::Cancel { maker_wallet } => {
+            PlatformMakerStrandPrepareRequest::Cancel {
+                maker_wallet: canonical_public_key(&maker_wallet, "maker_wallet")?,
+            }
+        }
+    })
+}
+
+fn normalize_current_prepare_request(
+    request: PlatformMakerCurrentPrepareRequest,
+) -> Result<PlatformMakerCurrentPrepareRequest, SdkError> {
+    Ok(match request {
+        PlatformMakerCurrentPrepareRequest::Upsert {
+            maker_wallet,
+            enabled,
+            async_only,
+            half_spread_bps,
+            band_step_bps,
+            max_conf_bps,
+            max_oracle_dev_bps,
+            max_oracle_age_secs,
+            sync_spread_bps,
+            max_exposure_base_atoms,
+            bid_depth_base_atoms,
+            ask_depth_base_atoms,
+            valid_until_slot,
+        } => {
+            if bid_depth_base_atoms.len() != 8 || ask_depth_base_atoms.len() != 8 {
+                return Err(SdkError::InvalidRequest(
+                    "Current requires exactly 8 bid and 8 ask bands".to_owned(),
+                ));
+            }
+            if half_spread_bps == 0
+                || max_conf_bps == 0
+                || max_conf_bps > 100
+                || max_oracle_dev_bps == 0
+                || max_oracle_dev_bps > 500
+            {
+                return Err(SdkError::InvalidRequest(
+                    "Current oracle and spread bounds are invalid".to_owned(),
+                ));
+            }
+            let bid_depth_base_atoms =
+                canonical_amounts(bid_depth_base_atoms, "bid_depth_base_atoms")?;
+            let ask_depth_base_atoms =
+                canonical_amounts(ask_depth_base_atoms, "ask_depth_base_atoms")?;
+            if !bid_depth_base_atoms
+                .iter()
+                .chain(&ask_depth_base_atoms)
+                .any(|depth| depth != "0")
+            {
+                return Err(SdkError::InvalidRequest(
+                    "Current requires at least one non-zero depth band".to_owned(),
+                ));
+            }
+            PlatformMakerCurrentPrepareRequest::Upsert {
+                maker_wallet: canonical_public_key(&maker_wallet, "maker_wallet")?,
+                enabled,
+                async_only,
+                half_spread_bps,
+                band_step_bps,
+                max_conf_bps,
+                max_oracle_dev_bps,
+                max_oracle_age_secs,
+                sync_spread_bps,
+                max_exposure_base_atoms: canonical_request_atoms(
+                    &max_exposure_base_atoms,
+                    "max_exposure_base_atoms",
+                    false,
+                )?,
+                bid_depth_base_atoms,
+                ask_depth_base_atoms,
+                valid_until_slot: canonical_request_atoms(
+                    &valid_until_slot,
+                    "valid_until_slot",
+                    true,
+                )?,
+            }
+        }
+        PlatformMakerCurrentPrepareRequest::Cancel { maker_wallet } => {
+            PlatformMakerCurrentPrepareRequest::Cancel {
+                maker_wallet: canonical_public_key(&maker_wallet, "maker_wallet")?,
+            }
+        }
+    })
+}
+
+fn canonical_amounts(values: Vec<String>, field: &str) -> Result<Vec<String>, SdkError> {
+    values
+        .into_iter()
+        .map(|value| canonical_request_atoms(&value, field, true))
+        .collect()
+}
+
+fn validate_maker_control_prepare(
+    prepared: &PlatformMakerControlPrepareResponse,
+    market_id: &str,
+    maker_wallet: &str,
+    product: PlatformMakerControlProduct,
+    action: PlatformMakerControlAction,
+) -> Result<(), SdkError> {
+    validate_platform_version(prepared.schema_version, &prepared.contract_version)?;
+    if prepared.market_id != market_id
+        || prepared.maker_wallet != maker_wallet
+        || prepared.product != product
+        || prepared.action != action
+        || !valid_handle(&prepared.maker_control_id, "mc_")
+        || prepared.expires_at_ms == 0
+    {
+        return Err(SdkError::InvalidResponse(
+            "prepared maker control is invalid".to_owned(),
+        ));
+    }
+    canonical_base64(&prepared.transaction_base64, "transaction_base64")?;
+    canonical_base58_32(&prepared.recent_blockhash, "recent_blockhash")?;
     Ok(())
 }
 
@@ -5778,6 +6166,122 @@ mod tests {
             .unwrap()
             .twaps
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn maker_controls_use_exact_product_paths_and_external_transaction_bytes() {
+        let server = MockServer::start().await;
+        let market_id = "market_33333333333333333333333333333333";
+        let wallet = "5Ji61Fbeb22Yntgv1hhHeSSLgdEdZchHeM1Tv1MjGhSL";
+        let control_id = "mc_0123456789abcdef0123456789abcdef";
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/v2/markets/{market_id}/makers/strands/prepare"
+            )))
+            .and(body_json(serde_json::json!({
+                "action": "cancel",
+                "maker_wallet": wallet,
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "schema_version": 2,
+                "contract_version": "2.0",
+                "maker_control_id": control_id,
+                "market_id": market_id,
+                "maker_wallet": wallet,
+                "product": "strand",
+                "action": "strand_cancel",
+                "transaction_base64": "AQ==",
+                "recent_blockhash": "11111111111111111111111111111111",
+                "last_valid_block_height": 123,
+                "expires_at_ms": 1786550460000u64,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/v2/markets/{market_id}/makers/currents/prepare"
+            )))
+            .and(body_json(serde_json::json!({
+                "action": "cancel",
+                "maker_wallet": wallet,
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "schema_version": 2,
+                "contract_version": "2.0",
+                "maker_control_id": control_id,
+                "market_id": market_id,
+                "maker_wallet": wallet,
+                "product": "current",
+                "action": "current_cancel",
+                "transaction_base64": "AQ==",
+                "recent_blockhash": "11111111111111111111111111111111",
+                "last_valid_block_height": 123,
+                "expires_at_ms": 1786550460000u64,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!(
+                "/v2/markets/{market_id}/makers/strands/submit"
+            )))
+            .and(body_json(serde_json::json!({
+                "maker_control_id": control_id,
+                "signed_transaction_base64": "AQ==",
+                "idempotency_key": "strand-cancel-1",
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "schema_version": 2,
+                "contract_version": "2.0",
+                "maker_control_id": control_id,
+                "market_id": market_id,
+                "maker_wallet": wallet,
+                "product": "strand",
+                "action": "strand_cancel",
+                "signature": "1".repeat(64),
+                "status": "submitted",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = StrataClient::new(server.uri()).unwrap();
+        let strand = client
+            .platform_maker_strand_prepare(
+                market_id,
+                PlatformMakerStrandPrepareRequest::Cancel {
+                    maker_wallet: wallet.to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(strand.action, PlatformMakerControlAction::StrandCancel);
+        let current = client
+            .platform_maker_current_prepare(
+                market_id,
+                PlatformMakerCurrentPrepareRequest::Cancel {
+                    maker_wallet: wallet.to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(current.action, PlatformMakerControlAction::CurrentCancel);
+        let submitted = client
+            .platform_maker_strand_submit(
+                market_id,
+                PlatformMakerControlSubmitRequest {
+                    maker_control_id: control_id.to_owned(),
+                    signed_transaction_base64: "AQ==".to_owned(),
+                    idempotency_key: "strand-cancel-1".to_owned(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            submitted.status,
+            PlatformMakerControlSubmissionStatus::Submitted
+        );
     }
 
     struct TestAccountSigner {
