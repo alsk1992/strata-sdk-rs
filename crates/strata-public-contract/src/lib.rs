@@ -618,7 +618,7 @@ impl ActionGraph {
                 node(
                     "read_market_status",
                     ActionNodeKind::Read,
-                    "Read tick size, minimum order size, and current market status.",
+                    "Read tick size, the smallest valid base-atom size, and current market status.",
                     &["books.read"],
                     Some(operation("GET", "/v2/markets/{market_id}/status", None)),
                 ),

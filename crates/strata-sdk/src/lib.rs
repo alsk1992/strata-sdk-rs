@@ -2989,34 +2989,34 @@ fn normalize_strand_prepare_request(
             async_only,
             sync_spread_ticks,
             mid_price_atoms,
-            max_exposure_base_lots,
+            max_exposure_base_atoms,
             bid_offsets_ticks,
             ask_offsets_ticks,
-            bid_sizes_base_lots,
-            ask_sizes_base_lots,
+            bid_sizes_base_atoms,
+            ask_sizes_base_atoms,
             valid_until_slot,
         } => {
             if bid_offsets_ticks.len() != 16
                 || ask_offsets_ticks.len() != 16
-                || bid_sizes_base_lots.len() != 16
-                || ask_sizes_base_lots.len() != 16
+                || bid_sizes_base_atoms.len() != 16
+                || ask_sizes_base_atoms.len() != 16
             {
                 return Err(SdkError::InvalidRequest(
                     "Strand requires exactly 16 bid and 16 ask levels".to_owned(),
                 ));
             }
-            let bid_sizes_base_lots =
-                canonical_amounts(bid_sizes_base_lots, "bid_sizes_base_lots")?;
-            let ask_sizes_base_lots =
-                canonical_amounts(ask_sizes_base_lots, "ask_sizes_base_lots")?;
-            if !bid_sizes_base_lots
+            let bid_sizes_base_atoms =
+                canonical_amounts(bid_sizes_base_atoms, "bid_sizes_base_atoms")?;
+            let ask_sizes_base_atoms =
+                canonical_amounts(ask_sizes_base_atoms, "ask_sizes_base_atoms")?;
+            if !bid_sizes_base_atoms
                 .iter()
-                .chain(&ask_sizes_base_lots)
+                .chain(&ask_sizes_base_atoms)
                 .any(|size| size != "0")
                 || bid_offsets_ticks
                     .iter()
-                    .zip(&bid_sizes_base_lots)
-                    .chain(ask_offsets_ticks.iter().zip(&ask_sizes_base_lots))
+                    .zip(&bid_sizes_base_atoms)
+                    .chain(ask_offsets_ticks.iter().zip(&ask_sizes_base_atoms))
                     .any(|(offset, size)| *offset == 0 && size != "0")
             {
                 return Err(SdkError::InvalidRequest(
@@ -3033,15 +3033,15 @@ fn normalize_strand_prepare_request(
                     "mid_price_atoms",
                     false,
                 )?,
-                max_exposure_base_lots: canonical_request_atoms(
-                    &max_exposure_base_lots,
-                    "max_exposure_base_lots",
+                max_exposure_base_atoms: canonical_request_atoms(
+                    &max_exposure_base_atoms,
+                    "max_exposure_base_atoms",
                     false,
                 )?,
                 bid_offsets_ticks,
                 ask_offsets_ticks,
-                bid_sizes_base_lots,
-                ask_sizes_base_lots,
+                bid_sizes_base_atoms,
+                ask_sizes_base_atoms,
                 valid_until_slot: canonical_request_atoms(
                     &valid_until_slot,
                     "valid_until_slot",
