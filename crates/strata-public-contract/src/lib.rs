@@ -502,6 +502,26 @@ impl CapabilityCatalog {
                     true,
                     McpSubmit,
                 ),
+                capability(
+                    "mm.strand.manage",
+                    "1.1",
+                    Beta,
+                    "mm:write",
+                    Submit,
+                    false,
+                    true,
+                    McpSubmit,
+                ),
+                capability(
+                    "mm.current.manage",
+                    "1.1",
+                    Beta,
+                    "mm:write",
+                    Submit,
+                    false,
+                    true,
+                    McpSubmit,
+                ),
             ],
         }
     }
