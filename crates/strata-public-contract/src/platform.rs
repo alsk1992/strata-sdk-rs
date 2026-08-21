@@ -612,6 +612,8 @@ pub struct PlatformMarketStatusResponse {
     pub server_time_ms: u64,
     pub status: PlatformMarketState,
     pub tick_size_atoms: String,
+    /// Smallest accepted base-asset quantity. Strata orders are atom-denominated,
+    /// so this is `1`; it is a size, never a price or `Market.base_lot_size`.
     pub minimum_order_size_atoms: String,
 }
 
@@ -2408,11 +2410,14 @@ pub enum PlatformMakerStrandPrepareRequest {
         async_only: bool,
         sync_spread_ticks: u16,
         mid_price_atoms: String,
-        max_exposure_base_lots: String,
+        #[serde(alias = "max_exposure_base_lots")]
+        max_exposure_base_atoms: String,
         bid_offsets_ticks: Vec<u16>,
         ask_offsets_ticks: Vec<u16>,
-        bid_sizes_base_lots: Vec<String>,
-        ask_sizes_base_lots: Vec<String>,
+        #[serde(alias = "bid_sizes_base_lots")]
+        bid_sizes_base_atoms: Vec<String>,
+        #[serde(alias = "ask_sizes_base_lots")]
+        ask_sizes_base_atoms: Vec<String>,
         valid_until_slot: String,
     },
     Recenter {
@@ -3164,6 +3169,46 @@ mod tests {
 
     #[test]
     fn maker_control_requests_are_tagged_exact_and_amount_safe() {
+        let strand_upsert: PlatformMakerStrandPrepareRequest =
+            serde_json::from_value(serde_json::json!({
+                "action": "upsert",
+                "maker_wallet": "5Ji61Fbeb22Yntgv1hhHeSSLgdEdZchHeM1Tv1MjGhSL",
+                "enabled": true,
+                "async_only": false,
+                "sync_spread_ticks": 1,
+                "mid_price_atoms": "123000000",
+                "max_exposure_base_atoms": "1000000",
+                "bid_offsets_ticks": vec![1; 16],
+                "ask_offsets_ticks": vec![1; 16],
+                "bid_sizes_base_atoms": vec!["1"; 16],
+                "ask_sizes_base_atoms": vec!["1"; 16],
+                "valid_until_slot": "0"
+            }))
+            .unwrap();
+        let serialized = serde_json::to_value(&strand_upsert).unwrap();
+        assert_eq!(serialized["max_exposure_base_atoms"], "1000000");
+        assert!(serialized.get("max_exposure_base_lots").is_none());
+
+        // 0.2.1 clients remain accepted, but every response and current client
+        // uses the corrected base-atom vocabulary.
+        let legacy_strand: PlatformMakerStrandPrepareRequest =
+            serde_json::from_value(serde_json::json!({
+                "action": "upsert",
+                "maker_wallet": "5Ji61Fbeb22Yntgv1hhHeSSLgdEdZchHeM1Tv1MjGhSL",
+                "enabled": true,
+                "async_only": false,
+                "sync_spread_ticks": 1,
+                "mid_price_atoms": "123000000",
+                "max_exposure_base_lots": "1000000",
+                "bid_offsets_ticks": vec![1; 16],
+                "ask_offsets_ticks": vec![1; 16],
+                "bid_sizes_base_lots": vec!["1"; 16],
+                "ask_sizes_base_lots": vec!["1"; 16],
+                "valid_until_slot": "0"
+            }))
+            .unwrap();
+        assert_eq!(serde_json::to_value(legacy_strand).unwrap(), serialized);
+
         let strand: PlatformMakerStrandPrepareRequest = serde_json::from_value(serde_json::json!({
             "action": "recenter",
             "maker_wallet": "5Ji61Fbeb22Yntgv1hhHeSSLgdEdZchHeM1Tv1MjGhSL",
