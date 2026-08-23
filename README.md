@@ -2,6 +2,11 @@
 
 The official async Rust client for live Strata markets and Sonar quotes.
 
+The official hosted API currently has market, exact-output, and asset-to-asset
+Sonar quotes enabled. The SDK still checks the live capability catalog before
+each gated operation; that is a runtime safety check, not an inactive-feature
+notice.
+
 ## Install
 
 ```toml
