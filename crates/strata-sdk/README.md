@@ -6,8 +6,8 @@ The official async Rust client for live Strata markets and Sonar quotes.
 
 ```toml
 [dependencies]
-strata-public-contract = "0.1"
-strata-sdk = "0.1"
+strata-public-contract = "0.2"
+strata-sdk = "0.2"
 ```
 
 ## Request a Sonar quote
@@ -82,6 +82,8 @@ Gross route output for an external route-quality comparison is exactly
 | `platform_maker_status_for_wallet(...)` (also `platform_maker_status(signer)`) | A maker's products, exposure, health, and kill state — public by wallet address, no signature |
 | `platform_maker_reputation_for_wallet(...)` (also `platform_maker_reputation(signer)`) | A maker's reliability, tier, and signed-quote eligibility — public by wallet address |
 | `connect_maker_for_wallet(...)` (also `connect_maker(signer)`) | Sequenced maker fill and exposure stream — public by wallet address |
+| `platform_maker_strand_prepare(...)` / `platform_maker_strand_submit(...)` | Prepare and submit externally signed Strand upsert, recenter, enable/disable, or cancel actions |
+| `platform_maker_current_prepare(...)` / `platform_maker_current_submit(...)` | Prepare and submit externally signed Current upsert or cancel actions |
 | `platform_rewards(...)` / `platform_referrals(...)` | Public community and owner-scoped state |
 | `platform_bugs(...)` / `platform_bug_submit(...)` | Signed public bug-report workflow |
 | `capabilities()` | Features currently available through the public contract |
@@ -101,6 +103,63 @@ Gross route output for an external route-quality comparison is exactly
 | `twap_prepare(...)` | Partially signed TWAP-control transaction — `PlatformTwapPrepareRequest::Direct` (the action itself, one signature) or `::Authorized` (a signed challenge) |
 | `twap_submit(...)` | Idempotent submission of an externally signed TWAP action |
 | `execute_twap(...)` | One-signature TWAP placement or cancellation when enabled: direct prepare, binding checks, verifier (`DefaultTransactionVerifier` or your own), then the session signs only the transaction |
+
+## Manage Strands and Currents
+
+Both maker products use the same custody-safe flow: request exact transaction
+bytes, verify and sign those bytes outside Strata, then submit the signed
+transaction with an idempotency key. The Rust SDK exposes every live control:
+
+```rust
+use strata_public_contract::{
+    PlatformMakerControlSubmitRequest, PlatformMakerCurrentPrepareRequest,
+    PlatformMakerStrandPrepareRequest,
+};
+
+# async fn run() -> Result<(), Box<dyn std::error::Error>> {
+# let strata = strata_sdk::StrataClient::production()?;
+# let market_id = "market_33333333333333333333333333333333";
+# let maker_wallet = "5Ji61Fbeb22Yntgv1hhHeSSLgdEdZchHeM1Tv1MjGhSL";
+let prepared = strata
+    .platform_maker_strand_prepare(
+        market_id,
+        PlatformMakerStrandPrepareRequest::Cancel {
+            maker_wallet: maker_wallet.into(),
+        },
+    )
+    .await?;
+
+// Verify `prepared.transaction_base64`, sign it in your wallet or signer, then:
+# let signed_transaction_base64 = "AQ==";
+let submitted = strata
+    .platform_maker_strand_submit(
+        market_id,
+        PlatformMakerControlSubmitRequest {
+            maker_control_id: prepared.maker_control_id,
+            signed_transaction_base64: signed_transaction_base64.into(),
+            idempotency_key: "strand-cancel-1".into(),
+        },
+    )
+    .await?;
+
+// Current uses the identical prepare/sign/submit boundary.
+let _current = strata
+    .platform_maker_current_prepare(
+        market_id,
+        PlatformMakerCurrentPrepareRequest::Cancel {
+            maker_wallet: maker_wallet.into(),
+        },
+    )
+    .await?;
+# let _ = submitted;
+# Ok(())
+# }
+```
+
+Upserts use `PlatformMakerStrandPrepareRequest::Upsert` or
+`PlatformMakerCurrentPrepareRequest::Upsert`. Amounts are base-asset atoms,
+encoded as unsigned decimal strings. `platform_maker_status_for_wallet(...)`
+reports the resulting live controls, remaining exposure, expiry, and health.
 
 Token amounts use unsigned decimal strings in atomic units. The client validates
 contract compatibility, quote binding, lifetime, and economic fields before
