@@ -3,6 +3,13 @@
 All notable changes to the Strata SDKs (`@stratabook/sdk`, `@stratabook/mcp`,
 and the `strata-sdk` Rust crate) are recorded here. Versions move together.
 
+## 0.2.10
+
+- Coordinated release for the public maker conformance runner. Rust's existing
+  Strand/Current quickstart, transaction verification, submit, status, and
+  stream contracts are unchanged and remain part of the same cross-language
+  conformance surface.
+
 ## 0.2.9
 
 - Correct the maker preparation terminology: `transaction_version=0`
