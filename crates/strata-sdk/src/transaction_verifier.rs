@@ -239,14 +239,14 @@ fn transaction_message_bytes(transaction_base64: &str) -> Result<Vec<u8>, String
 }
 
 /// Deny-by-default verification for a direct maker-wallet control. Exactly one
-/// legacy instruction may be present; the maker is its sole signer and fee
+/// native-v0 instruction may be present; the maker is its sole signer and fee
 /// payer, its public economics equal the quickstart request, and an upsert is
 /// bound to the requested opaque market. Only the server-derived PDA bump is
 /// intentionally not predicted by the client.
 pub fn verify_maker_transaction(context: &MakerVerificationContext<'_>) -> Result<(), String> {
     let tx = decode_transaction(&context.prepared.transaction_base64)?;
-    if tx.version != TransactionVersion::Legacy || tx.address_table_lookup_count != 0 {
-        return Err("maker controls must be one legacy transaction".to_owned());
+    if tx.version != TransactionVersion::V0 || tx.address_table_lookup_count != 0 {
+        return Err("maker controls must be native v0 without lookup tables".to_owned());
     }
     if tx.num_required_signatures != 1
         || tx.signature_count != 1

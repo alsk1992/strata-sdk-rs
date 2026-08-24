@@ -649,10 +649,10 @@ impl OrderCommandStream {
             .sign_transaction(&prepared.transaction_base64)
             .await
             .map_err(SdkError::Signer)?;
-        Ok((
-            prepared,
-            canonical_base64(&transaction, "signed_transaction_base64")?,
-        ))
+        let transaction = canonical_base64(&transaction, "signed_transaction_base64")?;
+        verify_signed_transaction_message(&prepared.transaction_base64, &transaction)
+            .map_err(SdkError::Verification)?;
+        Ok((prepared, transaction))
     }
 
     fn ensure_request_identity(
