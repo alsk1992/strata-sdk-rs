@@ -951,10 +951,7 @@ impl StrataClient {
     }
 
     /// Resolve an opaque asset ID or unambiguous symbol across all pages.
-    pub async fn platform_resolve_asset(
-        &self,
-        reference: &str,
-    ) -> Result<PlatformAsset, SdkError> {
+    pub async fn platform_resolve_asset(&self, reference: &str) -> Result<PlatformAsset, SdkError> {
         let requested = reference.trim();
         if requested.is_empty() {
             return Err(SdkError::InvalidRequest(
@@ -2498,8 +2495,20 @@ impl StrataClient {
                 {
                     return Ok(market)
                 }
-                Err(error @ SdkError::Api { retryable: false, .. }) => return Err(error),
-                Err(error) if !matches!(error, SdkError::Api { retryable: true, .. }) => {
+                Err(
+                    error @ SdkError::Api {
+                        retryable: false, ..
+                    },
+                ) => return Err(error),
+                Err(error)
+                    if !matches!(
+                        error,
+                        SdkError::Api {
+                            retryable: true,
+                            ..
+                        }
+                    ) =>
+                {
                     return Err(error)
                 }
                 _ => {}
@@ -2552,12 +2561,14 @@ impl StrataClient {
             tick_size,
         )?;
         let prepared = match &operation {
-            PlatformMakerQuickstartOperation::Strand(operation) => self
-                .platform_maker_strand_prepare(&market.market_id, operation.clone())
-                .await?,
-            PlatformMakerQuickstartOperation::Current(operation) => self
-                .platform_maker_current_prepare(&market.market_id, operation.clone())
-                .await?,
+            PlatformMakerQuickstartOperation::Strand(operation) => {
+                self.platform_maker_strand_prepare(&market.market_id, operation.clone())
+                    .await?
+            }
+            PlatformMakerQuickstartOperation::Current(operation) => {
+                self.platform_maker_current_prepare(&market.market_id, operation.clone())
+                    .await?
+            }
         };
         let result = PlatformMakerQuickstartPrepared {
             market,
@@ -2598,12 +2609,14 @@ impl StrataClient {
             ),
         };
         let prepared = match &operation {
-            PlatformMakerQuickstartOperation::Strand(operation) => self
-                .platform_maker_strand_prepare(&market.market_id, operation.clone())
-                .await?,
-            PlatformMakerQuickstartOperation::Current(operation) => self
-                .platform_maker_current_prepare(&market.market_id, operation.clone())
-                .await?,
+            PlatformMakerQuickstartOperation::Strand(operation) => {
+                self.platform_maker_strand_prepare(&market.market_id, operation.clone())
+                    .await?
+            }
+            PlatformMakerQuickstartOperation::Current(operation) => {
+                self.platform_maker_current_prepare(&market.market_id, operation.clone())
+                    .await?
+            }
         };
         let result = PlatformMakerQuickstartPrepared {
             market,
@@ -2638,10 +2651,8 @@ impl StrataClient {
             prepared: &prepared.prepared,
         })
         .map_err(SdkError::Verification)?;
-        let signed_transaction_base64 = canonical_base64(
-            signed_transaction_base64,
-            "signed_transaction_base64",
-        )?;
+        let signed_transaction_base64 =
+            canonical_base64(signed_transaction_base64, "signed_transaction_base64")?;
         verify_signed_transaction_message(
             &prepared.prepared.transaction_base64,
             &signed_transaction_base64,
@@ -2655,12 +2666,14 @@ impl StrataClient {
             )?,
         };
         let receipt = match prepared.product {
-            PlatformMakerControlProduct::Strand => self
-                .platform_maker_strand_submit(&prepared.market.market_id, request)
-                .await?,
-            PlatformMakerControlProduct::Current => self
-                .platform_maker_current_submit(&prepared.market.market_id, request)
-                .await?,
+            PlatformMakerControlProduct::Strand => {
+                self.platform_maker_strand_submit(&prepared.market.market_id, request)
+                    .await?
+            }
+            PlatformMakerControlProduct::Current => {
+                self.platform_maker_current_submit(&prepared.market.market_id, request)
+                    .await?
+            }
         };
         let maker_status = self
             .wait_for_maker_product(
@@ -2702,13 +2715,8 @@ impl StrataClient {
             .sign_transaction(&prepared.prepared.transaction_base64)
             .await
             .map_err(SdkError::Signer)?;
-        self.platform_maker_submit_prepared(
-            &prepared,
-            &signed,
-            None,
-            confirmation_timeout,
-        )
-        .await
+        self.platform_maker_submit_prepared(&prepared, &signed, None, confirmation_timeout)
+            .await
     }
 
     /// Idempotent one-call stop. If the product is already absent no wallet
@@ -2799,7 +2807,9 @@ impl StrataClient {
                 {
                     return Ok(status)
                 }
-                Err(SdkError::Api { retryable: true, .. }) => {}
+                Err(SdkError::Api {
+                    retryable: true, ..
+                }) => {}
                 Err(error) => return Err(error),
                 Ok(_) => {}
             }
@@ -3869,7 +3879,9 @@ fn maker_duration_slots(duration: Option<&str>) -> Result<u64, SdkError> {
         SdkError::InvalidRequest("duration must use a positive whole number".to_owned())
     })?;
     if amount == 0 {
-        return Err(SdkError::InvalidRequest("duration must be positive".to_owned()));
+        return Err(SdkError::InvalidRequest(
+            "duration must be positive".to_owned(),
+        ));
     }
     let scale = match unit.to_ascii_lowercase().as_str() {
         "s" => 1,
@@ -3991,8 +4003,8 @@ fn maker_quickstart_operation(
             "level_step_bps must be between 1 and 5,000".to_owned(),
         ));
     }
-    let furthest = u32::from(request.spread_bps)
-        + (levels.saturating_sub(1) as u32) * u32::from(level_step);
+    let furthest =
+        u32::from(request.spread_bps) + (levels.saturating_sub(1) as u32) * u32::from(level_step);
     if furthest > u32::from(u16::MAX) {
         return Err(SdkError::InvalidRequest(
             "the furthest maker level exceeds 65,535 bps".to_owned(),
@@ -4045,8 +4057,7 @@ fn maker_quickstart_operation(
                 .ok_or_else(|| SdkError::InvalidRequest("mark rounds below one tick".to_owned()))?;
             let mut offsets = vec![0u16; 16];
             for (index, offset) in offsets.iter_mut().take(levels).enumerate() {
-                let bps = u128::from(request.spread_bps)
-                    + index as u128 * u128::from(level_step);
+                let bps = u128::from(request.spread_bps) + index as u128 * u128::from(level_step);
                 let numerator = u128::from(mid_price) * bps;
                 let denominator = 10_000u128 * u128::from(tick_size);
                 let ticks = numerator.div_ceil(denominator);
@@ -4151,10 +4162,7 @@ fn maker_product_matches(
     }
 }
 
-fn same_maker_depth<'a>(
-    actual: impl Iterator<Item = &'a str>,
-    expected: &[String],
-) -> bool {
+fn same_maker_depth<'a>(actual: impl Iterator<Item = &'a str>, expected: &[String]) -> bool {
     let mut actual = actual.collect::<Vec<_>>();
     let mut expected = expected.iter().map(String::as_str).collect::<Vec<_>>();
     while actual.last() == Some(&"0") {
@@ -9480,8 +9488,7 @@ mod tests {
 
     #[test]
     fn maker_quickstart_derives_current_atoms_levels_and_expiry() {
-        let assets: PlatformAssetsResponse =
-            serde_json::from_value(fixture("assets")).unwrap();
+        let assets: PlatformAssetsResponse = serde_json::from_value(fixture("assets")).unwrap();
         let base_asset = assets
             .assets
             .into_iter()
@@ -9507,15 +9514,13 @@ mod tests {
             10_000,
         )
         .unwrap();
-        let PlatformMakerQuickstartOperation::Current(
-            PlatformMakerCurrentPrepareRequest::Upsert {
-                max_exposure_base_atoms,
-                bid_depth_base_atoms,
-                ask_depth_base_atoms,
-                valid_until_slot,
-                ..
-            },
-        ) = operation
+        let PlatformMakerQuickstartOperation::Current(PlatformMakerCurrentPrepareRequest::Upsert {
+            max_exposure_base_atoms,
+            bid_depth_base_atoms,
+            ask_depth_base_atoms,
+            valid_until_slot,
+            ..
+        }) = operation
         else {
             panic!("expected Current upsert");
         };

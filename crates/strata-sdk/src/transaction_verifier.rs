@@ -28,11 +28,10 @@ use base64::Engine as _;
 
 use crate::{
     opaque_market_id, opaque_order_id, ExecutionVerificationContext, ExecutionVerifier,
-    MakerVerificationContext, PlatformMakerControlAction, PlatformMakerCurrentPrepareRequest,
-    PlatformMakerQuickstartOperation, PlatformMakerStrandPrepareRequest,
-    OrderVerificationContext, OrderVerifier, PlatformOrderBatchOperation,
-    PlatformOrderChallengeRequest, PlatformOrderType, PlatformTradeSide, TwapVerificationContext,
-    TwapVerifier,
+    MakerVerificationContext, OrderVerificationContext, OrderVerifier, PlatformMakerControlAction,
+    PlatformMakerCurrentPrepareRequest, PlatformMakerQuickstartOperation,
+    PlatformMakerStrandPrepareRequest, PlatformOrderBatchOperation, PlatformOrderChallengeRequest,
+    PlatformOrderType, PlatformTradeSide, TwapVerificationContext, TwapVerifier,
 };
 
 /// Programs a Vault session key must never sign for directly.
@@ -306,10 +305,25 @@ pub fn verify_maker_transaction(context: &MakerVerificationContext<'_>) -> Resul
                 return Err("Strand upsert has an invalid length".to_owned());
             }
             verify_maker_market(&tx, instruction, context.market_id)?;
-            expect_u8(data, 1, u8::from(*enabled) | (u8::from(*async_only) << 1), "Strand flags")?;
+            expect_u8(
+                data,
+                1,
+                u8::from(*enabled) | (u8::from(*async_only) << 1),
+                "Strand flags",
+            )?;
             expect_u16(data, 3, *sync_spread_ticks, "Strand sync spread")?;
-            expect_u64(data, 9, atoms(mid_price_atoms, "mid_price_atoms")?, "Strand mid price")?;
-            expect_u64(data, 17, atoms(max_exposure_base_atoms, "max_exposure_base_atoms")?, "Strand exposure")?;
+            expect_u64(
+                data,
+                9,
+                atoms(mid_price_atoms, "mid_price_atoms")?,
+                "Strand mid price",
+            )?;
+            expect_u64(
+                data,
+                17,
+                atoms(max_exposure_base_atoms, "max_exposure_base_atoms")?,
+                "Strand exposure",
+            )?;
             for (index, value) in bid_offsets_ticks.iter().enumerate() {
                 expect_u16(data, 25 + index * 2, *value, "Strand bid offset")?;
             }
@@ -317,12 +331,27 @@ pub fn verify_maker_transaction(context: &MakerVerificationContext<'_>) -> Resul
                 expect_u16(data, 57 + index * 2, *value, "Strand ask offset")?;
             }
             for (index, value) in bid_sizes_base_atoms.iter().enumerate() {
-                expect_u64(data, 89 + index * 8, atoms(value, "bid size")?, "Strand bid size")?;
+                expect_u64(
+                    data,
+                    89 + index * 8,
+                    atoms(value, "bid size")?,
+                    "Strand bid size",
+                )?;
             }
             for (index, value) in ask_sizes_base_atoms.iter().enumerate() {
-                expect_u64(data, 217 + index * 8, atoms(value, "ask size")?, "Strand ask size")?;
+                expect_u64(
+                    data,
+                    217 + index * 8,
+                    atoms(value, "ask size")?,
+                    "Strand ask size",
+                )?;
             }
-            expect_u64(data, 345, atoms(valid_until_slot, "valid_until_slot")?, "Strand expiry")
+            expect_u64(
+                data,
+                345,
+                atoms(valid_until_slot, "valid_until_slot")?,
+                "Strand expiry",
+            )
         }
         (
             PlatformMakerControlAction::StrandRecenter,
@@ -335,15 +364,24 @@ pub fn verify_maker_transaction(context: &MakerVerificationContext<'_>) -> Resul
             if data.len() != 17 {
                 return Err("Strand recenter has an invalid length".to_owned());
             }
-            expect_u64(data, 1, atoms(new_mid_price_atoms, "new_mid_price_atoms")?, "Strand mid price")?;
-            expect_u64(data, 9, atoms(valid_until_slot, "valid_until_slot")?, "Strand expiry")
+            expect_u64(
+                data,
+                1,
+                atoms(new_mid_price_atoms, "new_mid_price_atoms")?,
+                "Strand mid price",
+            )?;
+            expect_u64(
+                data,
+                9,
+                atoms(valid_until_slot, "valid_until_slot")?,
+                "Strand expiry",
+            )
         }
         (
             PlatformMakerControlAction::StrandSetEnabled,
-            PlatformMakerQuickstartOperation::Strand(PlatformMakerStrandPrepareRequest::SetEnabled {
-                enabled,
-                ..
-            }),
+            PlatformMakerQuickstartOperation::Strand(
+                PlatformMakerStrandPrepareRequest::SetEnabled { enabled, .. },
+            ),
         ) => {
             if data.len() != 2 {
                 return Err("Strand enable has an invalid length".to_owned());
@@ -372,29 +410,58 @@ pub fn verify_maker_transaction(context: &MakerVerificationContext<'_>) -> Resul
                 return Err("Current upsert has an invalid length".to_owned());
             }
             verify_maker_market(&tx, instruction, context.market_id)?;
-            expect_u8(data, 1, u8::from(*enabled) | (u8::from(*async_only) << 1), "Current flags")?;
+            expect_u8(
+                data,
+                1,
+                u8::from(*enabled) | (u8::from(*async_only) << 1),
+                "Current flags",
+            )?;
             expect_u16(data, 3, *half_spread_bps, "Current spread")?;
             expect_u16(data, 5, *band_step_bps, "Current band step")?;
             expect_u16(data, 7, *max_conf_bps, "Current confidence bound")?;
             expect_u16(data, 9, *max_oracle_dev_bps, "Current deviation bound")?;
             expect_u32(data, 11, *max_oracle_age_secs, "Current mark age")?;
             expect_u16(data, 15, *sync_spread_bps, "Current sync spread")?;
-            expect_u64(data, 17, atoms(max_exposure_base_atoms, "max_exposure_base_atoms")?, "Current exposure")?;
+            expect_u64(
+                data,
+                17,
+                atoms(max_exposure_base_atoms, "max_exposure_base_atoms")?,
+                "Current exposure",
+            )?;
             for (index, value) in bid_depth_base_atoms.iter().enumerate() {
-                expect_u64(data, 25 + index * 8, atoms(value, "bid depth")?, "Current bid depth")?;
+                expect_u64(
+                    data,
+                    25 + index * 8,
+                    atoms(value, "bid depth")?,
+                    "Current bid depth",
+                )?;
             }
             for (index, value) in ask_depth_base_atoms.iter().enumerate() {
-                expect_u64(data, 89 + index * 8, atoms(value, "ask depth")?, "Current ask depth")?;
+                expect_u64(
+                    data,
+                    89 + index * 8,
+                    atoms(value, "ask depth")?,
+                    "Current ask depth",
+                )?;
             }
-            expect_u64(data, 153, atoms(valid_until_slot, "valid_until_slot")?, "Current expiry")
+            expect_u64(
+                data,
+                153,
+                atoms(valid_until_slot, "valid_until_slot")?,
+                "Current expiry",
+            )
         }
         (
             PlatformMakerControlAction::StrandCancel,
-            PlatformMakerQuickstartOperation::Strand(PlatformMakerStrandPrepareRequest::Cancel { .. }),
+            PlatformMakerQuickstartOperation::Strand(PlatformMakerStrandPrepareRequest::Cancel {
+                ..
+            }),
         )
         | (
             PlatformMakerControlAction::CurrentCancel,
-            PlatformMakerQuickstartOperation::Current(PlatformMakerCurrentPrepareRequest::Cancel { .. }),
+            PlatformMakerQuickstartOperation::Current(PlatformMakerCurrentPrepareRequest::Cancel {
+                ..
+            }),
         ) => {
             if data.len() != 1 || instruction.account_indexes.len() != 3 {
                 return Err("maker cancellation has an invalid shape".to_owned());
