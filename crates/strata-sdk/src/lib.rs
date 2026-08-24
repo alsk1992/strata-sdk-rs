@@ -19,9 +19,9 @@ pub use order_stream::{
     DeadManGuard, OrderChallengeResult, OrderCommandStream, ORDER_STREAM_AUTH_DOMAIN,
 };
 pub use transaction_verifier::{
-    decode_transaction, verify_execution_transaction, verify_order_transaction,
-    verify_twap_transaction, DecodedInstruction, DecodedTransaction, DefaultTransactionVerifier,
-    TransactionVersion,
+    decode_transaction, verify_execution_transaction, verify_maker_transaction,
+    verify_order_transaction, verify_signed_transaction_message, verify_twap_transaction,
+    DecodedInstruction, DecodedTransaction, DefaultTransactionVerifier, TransactionVersion,
 };
 pub use twap_stream::TwapStream;
 
@@ -171,6 +171,95 @@ pub trait AccountSigner: Send + Sync {
 
     /// Sign only the exact SDK-generated, short-lived account-read message.
     async fn sign_message(&self, message: &[u8]) -> Result<Vec<u8>, String>;
+}
+
+/// External maker-wallet adapter. Strata never accepts or stores its key.
+#[async_trait]
+pub trait MakerTransactionSigner: Send + Sync {
+    fn public_key(&self) -> &str;
+    async fn sign_transaction(&self, transaction_base64: &str) -> Result<String, String>;
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlatformMakerQuickstartSide {
+    Both,
+    Buy,
+    Sell,
+}
+
+/// Human-facing maker configuration. `spread_bps` is the distance from the
+/// Strata mark to the first quote on each side. `size` is an exact decimal
+/// base amount, optionally suffixed by its symbol (for example `0.01 SOL`).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlatformMakerQuickstartRequest {
+    pub market: String,
+    pub product: PlatformMakerControlProduct,
+    pub spread_bps: u16,
+    pub size: String,
+    /// `None` means ten minutes; otherwise `30s`, `10m`, `2h`, or `1d`.
+    pub duration: Option<String>,
+    /// `None` means three levels.
+    pub levels: Option<u8>,
+    /// `None` means the same value as `spread_bps`.
+    pub level_step_bps: Option<u16>,
+    pub side: PlatformMakerQuickstartSide,
+    pub async_only: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PlatformMakerQuickstartOperation {
+    Strand(PlatformMakerStrandPrepareRequest),
+    Current(PlatformMakerCurrentPrepareRequest),
+}
+
+impl PlatformMakerQuickstartOperation {
+    fn maker_wallet(&self) -> &str {
+        match self {
+            Self::Strand(operation) => strand_prepare_wallet_raw(operation),
+            Self::Current(operation) => current_prepare_wallet_raw(operation),
+        }
+    }
+
+    fn is_cancel(&self) -> bool {
+        matches!(
+            self,
+            Self::Strand(PlatformMakerStrandPrepareRequest::Cancel { .. })
+                | Self::Current(PlatformMakerCurrentPrepareRequest::Cancel { .. })
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlatformMakerQuickstartPrepared {
+    pub market: PlatformMarket,
+    pub base_asset: Option<PlatformAsset>,
+    pub product: PlatformMakerControlProduct,
+    pub operation: PlatformMakerQuickstartOperation,
+    pub prepared: PlatformMakerControlPrepareResponse,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlatformMakerQuickstartResult {
+    pub prepared: PlatformMakerQuickstartPrepared,
+    pub receipt: PlatformMakerControlSubmitResponse,
+    pub maker_status: PlatformMakerStatusResponse,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlatformMakerStopResult {
+    pub market: PlatformMarket,
+    pub product: PlatformMakerControlProduct,
+    pub prepared: Option<PlatformMakerQuickstartPrepared>,
+    pub receipt: Option<PlatformMakerControlSubmitResponse>,
+    pub maker_status: PlatformMakerStatusResponse,
+    pub already_stopped: bool,
+}
+
+pub struct MakerVerificationContext<'a> {
+    pub market_id: &'a str,
+    pub maker_wallet: &'a str,
+    pub operation: &'a PlatformMakerQuickstartOperation,
+    pub prepared: &'a PlatformMakerControlPrepareResponse,
 }
 
 /// Type-level placeholder for "no signer" (public reads).
@@ -820,6 +909,83 @@ impl StrataClient {
             ));
         }
         Ok(response)
+    }
+
+    /// Resolve an opaque market ID or case-insensitive label across all pages.
+    pub async fn platform_resolve_market(
+        &self,
+        reference: &str,
+    ) -> Result<PlatformMarket, SdkError> {
+        let requested = reference.trim();
+        if requested.is_empty() {
+            return Err(SdkError::InvalidRequest(
+                "market must be a market ID or label".to_owned(),
+            ));
+        }
+        let mut cursor = None;
+        let mut matches = Vec::new();
+        loop {
+            let page = self
+                .platform_markets(PageRequest {
+                    cursor,
+                    limit: Some(MAX_PLATFORM_PAGE_SIZE),
+                })
+                .await?;
+            matches.extend(page.markets.into_iter().filter(|market| {
+                market.market_id == requested || market.label.eq_ignore_ascii_case(requested)
+            }));
+            if !page.page.has_more {
+                break;
+            }
+            cursor = Some(page.page.next_cursor.ok_or_else(|| {
+                SdkError::InvalidResponse("market discovery pagination is incomplete".to_owned())
+            })?);
+        }
+        match matches.len() {
+            1 => Ok(matches.remove(0)),
+            0 => Err(SdkError::MarketNotFound(reference.to_owned())),
+            _ => Err(SdkError::InvalidRequest(
+                "market label is ambiguous; use its opaque market ID".to_owned(),
+            )),
+        }
+    }
+
+    /// Resolve an opaque asset ID or unambiguous symbol across all pages.
+    pub async fn platform_resolve_asset(&self, reference: &str) -> Result<PlatformAsset, SdkError> {
+        let requested = reference.trim();
+        if requested.is_empty() {
+            return Err(SdkError::InvalidRequest(
+                "asset must be an asset ID or symbol".to_owned(),
+            ));
+        }
+        let mut cursor = None;
+        let mut matches = Vec::new();
+        loop {
+            let page = self
+                .platform_assets(PageRequest {
+                    cursor,
+                    limit: Some(MAX_PLATFORM_PAGE_SIZE),
+                })
+                .await?;
+            matches.extend(page.assets.into_iter().filter(|asset| {
+                asset.asset_id == requested || asset.symbol.eq_ignore_ascii_case(requested)
+            }));
+            if !page.page.has_more {
+                break;
+            }
+            cursor = Some(page.page.next_cursor.ok_or_else(|| {
+                SdkError::InvalidResponse("asset discovery pagination is incomplete".to_owned())
+            })?);
+        }
+        match matches.len() {
+            1 => Ok(matches.remove(0)),
+            0 => Err(SdkError::InvalidRequest(format!(
+                "asset is not available: {reference}"
+            ))),
+            _ => Err(SdkError::InvalidRequest(
+                "asset symbol is ambiguous; use its opaque asset ID".to_owned(),
+            )),
+        }
     }
 
     pub async fn platform_book(
@@ -2302,6 +2468,360 @@ impl StrataClient {
         Ok(submitted)
     }
 
+    /// Wait through a brief restart until a market is active with a fresh
+    /// Strata mark, then return its resolved public identity.
+    pub async fn platform_wait_for_maker_market(
+        &self,
+        reference: &str,
+        timeout: Duration,
+    ) -> Result<PlatformMarket, SdkError> {
+        if timeout.is_zero() || timeout > Duration::from_secs(300) {
+            return Err(SdkError::InvalidRequest(
+                "maker readiness timeout must be between 1ms and 300s".to_owned(),
+            ));
+        }
+        let market = self.platform_resolve_market(reference).await?;
+        let deadline = Instant::now() + timeout;
+        loop {
+            let readiness = tokio::try_join!(
+                self.platform_market_status(&market.market_id),
+                self.platform_mark(&market.market_id),
+            );
+            match readiness {
+                Ok((status, mark))
+                    if status.status == PlatformMarketState::Active
+                        && !mark.stale
+                        && mark.price_atoms_per_base_unit.is_some() =>
+                {
+                    return Ok(market)
+                }
+                Err(
+                    error @ SdkError::Api {
+                        retryable: false, ..
+                    },
+                ) => return Err(error),
+                Err(error)
+                    if !matches!(
+                        error,
+                        SdkError::Api {
+                            retryable: true,
+                            ..
+                        }
+                    ) =>
+                {
+                    return Err(error)
+                }
+                _ => {}
+            }
+            if Instant::now() >= deadline {
+                return Err(SdkError::OperationUnavailable(format!(
+                    "market did not become active with a fresh Strata mark: {reference}"
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
+    /// Resolve human inputs and prepare one exact maker-owned transaction.
+    pub async fn platform_maker_quickstart_prepare(
+        &self,
+        maker_wallet: &str,
+        request: &PlatformMakerQuickstartRequest,
+    ) -> Result<PlatformMakerQuickstartPrepared, SdkError> {
+        let maker_wallet = canonical_public_key(maker_wallet, "maker_wallet")?;
+        let market = self
+            .platform_wait_for_maker_market(&request.market, Duration::from_secs(30))
+            .await?;
+        let base_asset = self.platform_resolve_asset(&market.base_asset_id).await?;
+        let (market_status, mark, maker_status) = tokio::try_join!(
+            self.platform_market_status(&market.market_id),
+            self.platform_mark(&market.market_id),
+            self.platform_maker_status_for_wallet(&market.market_id, &maker_wallet),
+        )?;
+        let mark_price = mark
+            .price_atoms_per_base_unit
+            .as_deref()
+            .ok_or_else(|| SdkError::OperationUnavailable("Strata mark is stale".to_owned()))?
+            .parse::<u64>()
+            .map_err(|_| SdkError::InvalidResponse("Strata mark exceeds u64".to_owned()))?;
+        let tick_size = market_status
+            .tick_size_atoms
+            .parse::<u64>()
+            .map_err(|_| SdkError::InvalidResponse("market tick size exceeds u64".to_owned()))?;
+        let current_slot = maker_status
+            .current_slot
+            .parse::<u64>()
+            .map_err(|_| SdkError::InvalidResponse("maker slot exceeds u64".to_owned()))?;
+        let operation = maker_quickstart_operation(
+            &maker_wallet,
+            request,
+            &base_asset,
+            current_slot,
+            mark_price,
+            tick_size,
+        )?;
+        let prepared = match &operation {
+            PlatformMakerQuickstartOperation::Strand(operation) => {
+                self.platform_maker_strand_prepare(&market.market_id, operation.clone())
+                    .await?
+            }
+            PlatformMakerQuickstartOperation::Current(operation) => {
+                self.platform_maker_current_prepare(&market.market_id, operation.clone())
+                    .await?
+            }
+        };
+        let result = PlatformMakerQuickstartPrepared {
+            market,
+            base_asset: Some(base_asset),
+            product: request.product,
+            operation,
+            prepared,
+        };
+        verify_maker_transaction(&MakerVerificationContext {
+            market_id: &result.market.market_id,
+            maker_wallet: &maker_wallet,
+            operation: &result.operation,
+            prepared: &result.prepared,
+        })
+        .map_err(SdkError::Verification)?;
+        Ok(result)
+    }
+
+    /// Prepare a label-aware Strand or Current cancellation.
+    pub async fn platform_maker_stop_prepare(
+        &self,
+        market: &str,
+        product: PlatformMakerControlProduct,
+        maker_wallet: &str,
+    ) -> Result<PlatformMakerQuickstartPrepared, SdkError> {
+        let maker_wallet = canonical_public_key(maker_wallet, "maker_wallet")?;
+        let market = self.platform_resolve_market(market).await?;
+        let operation = match product {
+            PlatformMakerControlProduct::Strand => PlatformMakerQuickstartOperation::Strand(
+                PlatformMakerStrandPrepareRequest::Cancel {
+                    maker_wallet: maker_wallet.clone(),
+                },
+            ),
+            PlatformMakerControlProduct::Current => PlatformMakerQuickstartOperation::Current(
+                PlatformMakerCurrentPrepareRequest::Cancel {
+                    maker_wallet: maker_wallet.clone(),
+                },
+            ),
+        };
+        let prepared = match &operation {
+            PlatformMakerQuickstartOperation::Strand(operation) => {
+                self.platform_maker_strand_prepare(&market.market_id, operation.clone())
+                    .await?
+            }
+            PlatformMakerQuickstartOperation::Current(operation) => {
+                self.platform_maker_current_prepare(&market.market_id, operation.clone())
+                    .await?
+            }
+        };
+        let result = PlatformMakerQuickstartPrepared {
+            market,
+            base_asset: None,
+            product,
+            operation,
+            prepared,
+        };
+        verify_maker_transaction(&MakerVerificationContext {
+            market_id: &result.market.market_id,
+            maker_wallet: &maker_wallet,
+            operation: &result.operation,
+            prepared: &result.prepared,
+        })
+        .map_err(SdkError::Verification)?;
+        Ok(result)
+    }
+
+    /// Submit an externally signed quickstart preparation and wait until the
+    /// matcher's chain-derived maker state observes the exact start or stop.
+    pub async fn platform_maker_submit_prepared(
+        &self,
+        prepared: &PlatformMakerQuickstartPrepared,
+        signed_transaction_base64: &str,
+        idempotency_key: Option<&str>,
+        confirmation_timeout: Option<Duration>,
+    ) -> Result<PlatformMakerQuickstartResult, SdkError> {
+        verify_maker_transaction(&MakerVerificationContext {
+            market_id: &prepared.market.market_id,
+            maker_wallet: prepared.operation.maker_wallet(),
+            operation: &prepared.operation,
+            prepared: &prepared.prepared,
+        })
+        .map_err(SdkError::Verification)?;
+        let signed_transaction_base64 =
+            canonical_base64(signed_transaction_base64, "signed_transaction_base64")?;
+        verify_signed_transaction_message(
+            &prepared.prepared.transaction_base64,
+            &signed_transaction_base64,
+        )
+        .map_err(SdkError::Verification)?;
+        let request = PlatformMakerControlSubmitRequest {
+            maker_control_id: prepared.prepared.maker_control_id.clone(),
+            signed_transaction_base64,
+            idempotency_key: normalize_idempotency_key(
+                idempotency_key.unwrap_or(&prepared.prepared.maker_control_id),
+            )?,
+        };
+        let receipt = match prepared.product {
+            PlatformMakerControlProduct::Strand => {
+                self.platform_maker_strand_submit(&prepared.market.market_id, request)
+                    .await?
+            }
+            PlatformMakerControlProduct::Current => {
+                self.platform_maker_current_submit(&prepared.market.market_id, request)
+                    .await?
+            }
+        };
+        let maker_status = self
+            .wait_for_maker_product(
+                &prepared.market.market_id,
+                prepared.operation.maker_wallet(),
+                &prepared.operation,
+                !prepared.operation.is_cancel(),
+                confirmation_timeout.unwrap_or(Duration::from_secs(45)),
+                &receipt.signature,
+            )
+            .await?;
+        Ok(PlatformMakerQuickstartResult {
+            prepared: prepared.clone(),
+            receipt,
+            maker_status,
+        })
+    }
+
+    /// One-call Rust maker start: resolve, prepare, verify, externally sign,
+    /// submit idempotently, and return only after chain-derived confirmation.
+    pub async fn platform_maker_start<S: MakerTransactionSigner + ?Sized>(
+        &self,
+        request: &PlatformMakerQuickstartRequest,
+        signer: &S,
+        confirmation_timeout: Option<Duration>,
+    ) -> Result<PlatformMakerQuickstartResult, SdkError> {
+        let maker_wallet = canonical_public_key(signer.public_key(), "maker_wallet")?;
+        let prepared = self
+            .platform_maker_quickstart_prepare(&maker_wallet, request)
+            .await?;
+        verify_maker_transaction(&MakerVerificationContext {
+            market_id: &prepared.market.market_id,
+            maker_wallet: &maker_wallet,
+            operation: &prepared.operation,
+            prepared: &prepared.prepared,
+        })
+        .map_err(SdkError::Verification)?;
+        let signed = signer
+            .sign_transaction(&prepared.prepared.transaction_base64)
+            .await
+            .map_err(SdkError::Signer)?;
+        self.platform_maker_submit_prepared(&prepared, &signed, None, confirmation_timeout)
+            .await
+    }
+
+    /// Idempotent one-call stop. If the product is already absent no wallet
+    /// prompt or transaction is produced.
+    pub async fn platform_maker_stop<S: MakerTransactionSigner + ?Sized>(
+        &self,
+        market: &str,
+        product: PlatformMakerControlProduct,
+        signer: &S,
+        confirmation_timeout: Option<Duration>,
+    ) -> Result<PlatformMakerStopResult, SdkError> {
+        let maker_wallet = canonical_public_key(signer.public_key(), "maker_wallet")?;
+        let market = self.platform_resolve_market(market).await?;
+        let before = self
+            .platform_maker_status_for_wallet(&market.market_id, &maker_wallet)
+            .await?;
+        if !maker_product_present(&before, product) {
+            return Ok(PlatformMakerStopResult {
+                market,
+                product,
+                prepared: None,
+                receipt: None,
+                maker_status: before,
+                already_stopped: true,
+            });
+        }
+        let prepared = self
+            .platform_maker_stop_prepare(&market.market_id, product, &maker_wallet)
+            .await?;
+        verify_maker_transaction(&MakerVerificationContext {
+            market_id: &market.market_id,
+            maker_wallet: &maker_wallet,
+            operation: &prepared.operation,
+            prepared: &prepared.prepared,
+        })
+        .map_err(SdkError::Verification)?;
+        let signed = signer
+            .sign_transaction(&prepared.prepared.transaction_base64)
+            .await
+            .map_err(SdkError::Signer)?;
+        let completed = self
+            .platform_maker_submit_prepared(&prepared, &signed, None, confirmation_timeout)
+            .await?;
+        Ok(PlatformMakerStopResult {
+            market,
+            product,
+            prepared: Some(prepared),
+            receipt: Some(completed.receipt),
+            maker_status: completed.maker_status,
+            already_stopped: false,
+        })
+    }
+
+    async fn wait_for_maker_product(
+        &self,
+        market_id: &str,
+        maker_wallet: &str,
+        operation: &PlatformMakerQuickstartOperation,
+        present: bool,
+        timeout: Duration,
+        signature: &str,
+    ) -> Result<PlatformMakerStatusResponse, SdkError> {
+        if timeout.is_zero() || timeout > Duration::from_secs(300) {
+            return Err(SdkError::InvalidRequest(
+                "maker confirmation timeout must be between 1ms and 300s".to_owned(),
+            ));
+        }
+        let deadline = Instant::now() + timeout;
+        loop {
+            match self
+                .platform_maker_status_for_wallet(market_id, maker_wallet)
+                .await
+            {
+                Ok(status)
+                    if (present && maker_product_matches(&status, operation))
+                        || (!present
+                            && !maker_product_present(
+                                &status,
+                                match operation {
+                                    PlatformMakerQuickstartOperation::Strand(_) => {
+                                        PlatformMakerControlProduct::Strand
+                                    }
+                                    PlatformMakerQuickstartOperation::Current(_) => {
+                                        PlatformMakerControlProduct::Current
+                                    }
+                                },
+                            )) =>
+                {
+                    return Ok(status)
+                }
+                Err(SdkError::Api {
+                    retryable: true, ..
+                }) => {}
+                Err(error) => return Err(error),
+                Ok(_) => {}
+            }
+            if Instant::now() >= deadline {
+                return Err(SdkError::OperationUnavailable(format!(
+                    "maker transaction {signature} was submitted but not observed before timeout"
+                )));
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    }
+
     pub async fn capabilities(&self) -> Result<CapabilityCatalog, SdkError> {
         let catalog: CapabilityCatalog = self.get("sonar/capabilities", &[]).await?;
         validate_version(catalog.schema_version, &catalog.contract_version)?;
@@ -3329,6 +3849,329 @@ fn validate_vault_submission(
     canonical_public_key(&response.wallet_address, "wallet_address")?;
     canonical_signature(&response.signature, "signature")?;
     Ok(())
+}
+
+fn strand_prepare_wallet_raw(request: &PlatformMakerStrandPrepareRequest) -> &str {
+    match request {
+        PlatformMakerStrandPrepareRequest::Upsert { maker_wallet, .. }
+        | PlatformMakerStrandPrepareRequest::Recenter { maker_wallet, .. }
+        | PlatformMakerStrandPrepareRequest::SetEnabled { maker_wallet, .. }
+        | PlatformMakerStrandPrepareRequest::Cancel { maker_wallet } => maker_wallet,
+    }
+}
+
+fn current_prepare_wallet_raw(request: &PlatformMakerCurrentPrepareRequest) -> &str {
+    match request {
+        PlatformMakerCurrentPrepareRequest::Upsert { maker_wallet, .. }
+        | PlatformMakerCurrentPrepareRequest::Cancel { maker_wallet } => maker_wallet,
+    }
+}
+
+fn maker_duration_slots(duration: Option<&str>) -> Result<u64, SdkError> {
+    let duration = duration.unwrap_or("10m").trim();
+    if duration.len() < 2 {
+        return Err(SdkError::InvalidRequest(
+            "duration must look like 30s, 10m, 2h, or 1d".to_owned(),
+        ));
+    }
+    let (amount, unit) = duration.split_at(duration.len() - 1);
+    let amount = amount.parse::<u64>().map_err(|_| {
+        SdkError::InvalidRequest("duration must use a positive whole number".to_owned())
+    })?;
+    if amount == 0 {
+        return Err(SdkError::InvalidRequest(
+            "duration must be positive".to_owned(),
+        ));
+    }
+    let scale = match unit.to_ascii_lowercase().as_str() {
+        "s" => 1,
+        "m" => 60,
+        "h" => 3_600,
+        "d" => 86_400,
+        _ => {
+            return Err(SdkError::InvalidRequest(
+                "duration must look like 30s, 10m, 2h, or 1d".to_owned(),
+            ))
+        }
+    };
+    let seconds = amount
+        .checked_mul(scale)
+        .filter(|seconds| *seconds <= 604_800)
+        .ok_or_else(|| SdkError::InvalidRequest("duration cannot exceed seven days".to_owned()))?;
+    seconds
+        .checked_mul(5)
+        .and_then(|slots| slots.checked_add(1))
+        .map(|slots| slots / 2)
+        .ok_or_else(|| SdkError::InvalidRequest("duration exceeds slot range".to_owned()))
+}
+
+fn human_base_atoms(value: &str, asset: &PlatformAsset) -> Result<u64, SdkError> {
+    let fields: Vec<&str> = value.split_whitespace().collect();
+    if fields.is_empty() || fields.len() > 2 {
+        return Err(SdkError::InvalidRequest(format!(
+            "size must be an exact {} amount, for example 0.01 {}",
+            asset.symbol, asset.symbol
+        )));
+    }
+    if fields.len() == 2 && !fields[1].eq_ignore_ascii_case(&asset.symbol) {
+        return Err(SdkError::InvalidRequest(format!(
+            "size is denominated in {}, not {}",
+            asset.symbol, fields[1]
+        )));
+    }
+    let mut parts = fields[0].split('.');
+    let whole = parts.next().unwrap_or_default();
+    let fraction = parts.next().unwrap_or_default();
+    if parts.next().is_some()
+        || whole.is_empty()
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+        || fraction.len() > usize::from(asset.decimals)
+    {
+        return Err(SdkError::InvalidRequest(format!(
+            "size must have at most {} decimal places",
+            asset.decimals
+        )));
+    }
+    let scale = 10u128.pow(u32::from(asset.decimals));
+    let whole = whole.parse::<u128>().map_err(|_| {
+        SdkError::InvalidRequest("size exceeds the supported base-asset range".to_owned())
+    })?;
+    let mut padded = fraction.to_owned();
+    padded.extend(std::iter::repeat_n(
+        '0',
+        usize::from(asset.decimals).saturating_sub(fraction.len()),
+    ));
+    let fractional = if padded.is_empty() {
+        0
+    } else {
+        padded.parse::<u128>().map_err(|_| {
+            SdkError::InvalidRequest("size has an invalid decimal fraction".to_owned())
+        })?
+    };
+    let atoms = whole
+        .checked_mul(scale)
+        .and_then(|value| value.checked_add(fractional))
+        .filter(|value| *value > 0 && *value <= u128::from(u64::MAX))
+        .ok_or_else(|| {
+            SdkError::InvalidRequest("size is outside the supported base-asset range".to_owned())
+        })?;
+    Ok(atoms as u64)
+}
+
+fn split_maker_size(total: u64, levels: usize, width: usize) -> Vec<String> {
+    let active = levels.min(total as usize).max(1);
+    let quotient = total / active as u64;
+    let remainder = total % active as u64;
+    (0..width)
+        .map(|index| {
+            if index >= active {
+                "0".to_owned()
+            } else {
+                (quotient + u64::from((index as u64) < remainder)).to_string()
+            }
+        })
+        .collect()
+}
+
+fn maker_quickstart_operation(
+    maker_wallet: &str,
+    request: &PlatformMakerQuickstartRequest,
+    base_asset: &PlatformAsset,
+    current_slot: u64,
+    mark_price: u64,
+    tick_size: u64,
+) -> Result<PlatformMakerQuickstartOperation, SdkError> {
+    if request.spread_bps == 0 || request.spread_bps > 5_000 {
+        return Err(SdkError::InvalidRequest(
+            "spread_bps must be between 1 and 5,000".to_owned(),
+        ));
+    }
+    let width = match request.product {
+        PlatformMakerControlProduct::Strand => 16usize,
+        PlatformMakerControlProduct::Current => 8usize,
+    };
+    let levels = usize::from(request.levels.unwrap_or(3));
+    if levels == 0 || levels > width {
+        return Err(SdkError::InvalidRequest(format!(
+            "levels must be between 1 and {width}"
+        )));
+    }
+    let level_step = request.level_step_bps.unwrap_or(request.spread_bps);
+    if level_step == 0 || level_step > 5_000 {
+        return Err(SdkError::InvalidRequest(
+            "level_step_bps must be between 1 and 5,000".to_owned(),
+        ));
+    }
+    let furthest =
+        u32::from(request.spread_bps) + (levels.saturating_sub(1) as u32) * u32::from(level_step);
+    if furthest > u32::from(u16::MAX) {
+        return Err(SdkError::InvalidRequest(
+            "the furthest maker level exceeds 65,535 bps".to_owned(),
+        ));
+    }
+    let size = human_base_atoms(&request.size, base_asset)?;
+    let valid_until_slot = current_slot
+        .checked_add(maker_duration_slots(request.duration.as_deref())?)
+        .ok_or_else(|| SdkError::InvalidRequest("duration exceeds slot range".to_owned()))?;
+    let depth = split_maker_size(size, levels, width);
+    let zero = vec!["0".to_owned(); width];
+    let bids = if request.side == PlatformMakerQuickstartSide::Sell {
+        zero.clone()
+    } else {
+        depth.clone()
+    };
+    let asks = if request.side == PlatformMakerQuickstartSide::Buy {
+        zero
+    } else {
+        depth
+    };
+    match request.product {
+        PlatformMakerControlProduct::Current => Ok(PlatformMakerQuickstartOperation::Current(
+            PlatformMakerCurrentPrepareRequest::Upsert {
+                maker_wallet: maker_wallet.to_owned(),
+                enabled: true,
+                async_only: request.async_only,
+                half_spread_bps: request.spread_bps,
+                band_step_bps: level_step,
+                max_conf_bps: 100,
+                max_oracle_dev_bps: 500,
+                max_oracle_age_secs: 10,
+                sync_spread_bps: 0,
+                max_exposure_base_atoms: size.to_string(),
+                bid_depth_base_atoms: bids,
+                ask_depth_base_atoms: asks,
+                valid_until_slot: valid_until_slot.to_string(),
+            },
+        )),
+        PlatformMakerControlProduct::Strand => {
+            if mark_price == 0 || tick_size == 0 {
+                return Err(SdkError::InvalidResponse(
+                    "market mark or tick size is invalid".to_owned(),
+                ));
+            }
+            let mid_price = mark_price
+                .checked_add(tick_size / 2)
+                .map(|value| value / tick_size * tick_size)
+                .filter(|value| *value > 0)
+                .ok_or_else(|| SdkError::InvalidRequest("mark rounds below one tick".to_owned()))?;
+            let mut offsets = vec![0u16; 16];
+            for (index, offset) in offsets.iter_mut().take(levels).enumerate() {
+                let bps = u128::from(request.spread_bps) + index as u128 * u128::from(level_step);
+                let numerator = u128::from(mid_price) * bps;
+                let denominator = 10_000u128 * u128::from(tick_size);
+                let ticks = numerator.div_ceil(denominator);
+                if ticks == 0 || ticks > u128::from(u16::MAX) {
+                    return Err(SdkError::InvalidRequest(
+                        "a Strand level cannot be represented on this tick grid".to_owned(),
+                    ));
+                }
+                *offset = ticks as u16;
+            }
+            Ok(PlatformMakerQuickstartOperation::Strand(
+                PlatformMakerStrandPrepareRequest::Upsert {
+                    maker_wallet: maker_wallet.to_owned(),
+                    enabled: true,
+                    async_only: request.async_only,
+                    sync_spread_ticks: 0,
+                    mid_price_atoms: mid_price.to_string(),
+                    max_exposure_base_atoms: size.to_string(),
+                    bid_offsets_ticks: offsets.clone(),
+                    ask_offsets_ticks: offsets,
+                    bid_sizes_base_atoms: bids,
+                    ask_sizes_base_atoms: asks,
+                    valid_until_slot: valid_until_slot.to_string(),
+                },
+            ))
+        }
+    }
+}
+
+fn maker_product_present(
+    status: &PlatformMakerStatusResponse,
+    product: PlatformMakerControlProduct,
+) -> bool {
+    match product {
+        PlatformMakerControlProduct::Strand => !status.strands.is_empty(),
+        PlatformMakerControlProduct::Current => !status.currents.is_empty(),
+    }
+}
+
+fn maker_product_matches(
+    status: &PlatformMakerStatusResponse,
+    operation: &PlatformMakerQuickstartOperation,
+) -> bool {
+    match operation {
+        PlatformMakerQuickstartOperation::Strand(PlatformMakerStrandPrepareRequest::Upsert {
+            enabled,
+            async_only,
+            mid_price_atoms,
+            max_exposure_base_atoms,
+            bid_sizes_base_atoms,
+            ask_sizes_base_atoms,
+            valid_until_slot,
+            ..
+        }) => status.strands.iter().any(|strand| {
+            strand.enabled == *enabled
+                && strand.async_only == *async_only
+                && strand.mid_price_atoms == *mid_price_atoms
+                && strand.maximum_exposure_atoms == *max_exposure_base_atoms
+                && strand.valid_until_slot.as_deref() == Some(valid_until_slot)
+                && same_maker_depth(
+                    strand.bids.iter().map(|level| level.size_atoms.as_str()),
+                    bid_sizes_base_atoms,
+                )
+                && same_maker_depth(
+                    strand.asks.iter().map(|level| level.size_atoms.as_str()),
+                    ask_sizes_base_atoms,
+                )
+        }),
+        PlatformMakerQuickstartOperation::Current(PlatformMakerCurrentPrepareRequest::Upsert {
+            enabled,
+            async_only,
+            half_spread_bps,
+            band_step_bps,
+            max_conf_bps,
+            max_oracle_age_secs,
+            sync_spread_bps,
+            max_exposure_base_atoms,
+            bid_depth_base_atoms,
+            ask_depth_base_atoms,
+            valid_until_slot,
+            ..
+        }) => status.currents.iter().any(|current| {
+            current.enabled == *enabled
+                && current.async_only == *async_only
+                && current.half_spread_bps == *half_spread_bps
+                && current.band_step_bps == *band_step_bps
+                && current.maximum_confidence_bps == *max_conf_bps
+                && current.maximum_oracle_age_seconds == *max_oracle_age_secs
+                && current.sync_spread_bps == *sync_spread_bps
+                && current.maximum_exposure_atoms == *max_exposure_base_atoms
+                && current.valid_until_slot.as_deref() == Some(valid_until_slot)
+                && same_maker_depth(
+                    current.bid_depth_atoms.iter().map(String::as_str),
+                    bid_depth_base_atoms,
+                )
+                && same_maker_depth(
+                    current.ask_depth_atoms.iter().map(String::as_str),
+                    ask_depth_base_atoms,
+                )
+        }),
+        _ => false,
+    }
+}
+
+fn same_maker_depth<'a>(actual: impl Iterator<Item = &'a str>, expected: &[String]) -> bool {
+    let mut actual = actual.collect::<Vec<_>>();
+    let mut expected = expected.iter().map(String::as_str).collect::<Vec<_>>();
+    while actual.last() == Some(&"0") {
+        actual.pop();
+    }
+    while expected.last() == Some(&"0") {
+        expected.pop();
+    }
+    actual == expected
 }
 
 fn strand_prepare_action(
@@ -8641,6 +9484,57 @@ mod tests {
             }
         }
         assert!(validate_order_authorization(&challenge, &changed).is_err());
+    }
+
+    #[test]
+    fn maker_quickstart_derives_current_atoms_levels_and_expiry() {
+        let assets: PlatformAssetsResponse = serde_json::from_value(fixture("assets")).unwrap();
+        let base_asset = assets
+            .assets
+            .into_iter()
+            .find(|asset| asset.symbol == "SOL")
+            .unwrap();
+        let request = PlatformMakerQuickstartRequest {
+            market: "SOL/USDC".to_owned(),
+            product: PlatformMakerControlProduct::Current,
+            spread_bps: 5,
+            size: "0.01 SOL".to_owned(),
+            duration: Some("10m".to_owned()),
+            levels: None,
+            level_step_bps: None,
+            side: PlatformMakerQuickstartSide::Both,
+            async_only: false,
+        };
+        let operation = maker_quickstart_operation(
+            "5Ji61Fbeb22Yntgv1hhHeSSLgdEdZchHeM1Tv1MjGhSL",
+            &request,
+            &base_asset,
+            1_000,
+            150_000_000,
+            10_000,
+        )
+        .unwrap();
+        let PlatformMakerQuickstartOperation::Current(PlatformMakerCurrentPrepareRequest::Upsert {
+            max_exposure_base_atoms,
+            bid_depth_base_atoms,
+            ask_depth_base_atoms,
+            valid_until_slot,
+            ..
+        }) = operation
+        else {
+            panic!("expected Current upsert");
+        };
+        assert_eq!(max_exposure_base_atoms, "10000000");
+        assert_eq!(valid_until_slot, "2500");
+        assert_eq!(
+            &bid_depth_base_atoms[..4],
+            &["3333334", "3333333", "3333333", "0"]
+        );
+        assert_eq!(bid_depth_base_atoms, ask_depth_base_atoms);
+        assert!(same_maker_depth(
+            ["3333334", "3333333", "3333333"].into_iter(),
+            &bid_depth_base_atoms,
+        ));
     }
 
     #[test]
