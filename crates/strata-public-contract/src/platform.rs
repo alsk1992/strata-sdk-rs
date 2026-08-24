@@ -2359,7 +2359,7 @@ pub struct PlatformMakerCurrentStatus {
     pub ask_depth_atoms: Vec<String>,
     pub maximum_exposure_atoms: String,
     pub remaining_exposure_atoms: String,
-    /// Freshness class of the market oracle the Current settles against.
+    /// Freshness class of the live Strata mark used to price this Current.
     pub oracle_health: PlatformOracleHealth,
 }
 
@@ -2435,7 +2435,7 @@ pub enum PlatformMakerStrandPrepareRequest {
 }
 
 /// One maker-owned Current mutation. Current is parameterized around the
-/// market's configured on-chain reference and therefore has no recenter action.
+/// market's live Strata mark and therefore has no recenter action.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PlatformMakerCurrentPrepareRequest {

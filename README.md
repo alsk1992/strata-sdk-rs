@@ -162,7 +162,9 @@ let _current = strata
 ```
 
 Upserts use `PlatformMakerStrandPrepareRequest::Upsert` or
-`PlatformMakerCurrentPrepareRequest::Upsert`. Amounts are base-asset atoms,
+`PlatformMakerCurrentPrepareRequest::Upsert`. Current bands are priced from
+the market's live Strata mark; no separate oracle publisher is required.
+Amounts are base-asset atoms,
 encoded as unsigned decimal strings. `platform_maker_status_for_wallet(...)`
 reports the resulting live controls, remaining exposure, expiry, and health.
 

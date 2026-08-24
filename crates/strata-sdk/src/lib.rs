@@ -32,7 +32,8 @@ use reqwest::{StatusCode, Url};
 use serde::de::DeserializeOwned;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use strata_public_contract::{ErrorResponse, CONTRACT_MAJOR, CONTRACT_VERSION};
 use thiserror::Error;
 
@@ -98,6 +99,7 @@ pub use strata_public_contract::{
 
 pub const DEFAULT_API_BASE: &str = "https://api.stratabook.app";
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_PLATFORM_CAPABILITY_CACHE: Duration = Duration::from_secs(5);
 const PUBLIC_EXECUTION_AUTH_DOMAIN: &[u8] = b"strata-sonar-execution:v1\0";
 const PUBLIC_ORDER_AUTH_DOMAIN: &[u8] = b"strata-platform-order-control:v1\0";
 const PUBLIC_TWAP_AUTH_DOMAIN: &[u8] = b"strata-twap-control:v1\0";
@@ -456,6 +458,13 @@ pub enum SdkError {
 pub struct StrataClient {
     base_url: Url,
     http: reqwest::Client,
+    platform_capability_cache: Arc<Mutex<Option<CachedPlatformDiscovery>>>,
+}
+
+#[derive(Clone, Debug)]
+struct CachedPlatformDiscovery {
+    value: PlatformDiscoveryResponse,
+    expires_at: Instant,
 }
 
 impl StrataClient {
@@ -475,7 +484,11 @@ impl StrataClient {
         }
         let base_url = normalize_base_url(base_url.as_ref())?;
         let http = reqwest::Client::builder().timeout(timeout).build()?;
-        Ok(Self { base_url, http })
+        Ok(Self {
+            base_url,
+            http,
+            platform_capability_cache: Arc::new(Mutex::new(None)),
+        })
     }
 
     /// Open one authenticated, persistent order-command connection. The
@@ -486,12 +499,48 @@ impl StrataClient {
         owner_wallet: &str,
         signer: &S,
     ) -> Result<OrderCommandStream, SdkError> {
+        self.require_platform_capability(
+            "orders.prepare",
+            CapabilityRisk::Prepare,
+            PlatformTransport::Websocket,
+        )
+        .await?;
+        self.require_platform_capability(
+            "orders.submit",
+            CapabilityRisk::Submit,
+            PlatformTransport::Websocket,
+        )
+        .await?;
         OrderCommandStream::connect(self, market_id, owner_wallet, signer).await
     }
 
     /// Open the sequenced Strata market-data stream. A sequence gap fails
     /// closed so the caller can reconnect and recover from a new snapshot.
     pub async fn connect_market_data(&self, market_id: &str) -> Result<MarketDataStream, SdkError> {
+        self.require_platform_capability(
+            "market_data.book.stream",
+            CapabilityRisk::Read,
+            PlatformTransport::Websocket,
+        )
+        .await?;
+        self.require_platform_capability(
+            "market_data.bbo.stream",
+            CapabilityRisk::Read,
+            PlatformTransport::Websocket,
+        )
+        .await?;
+        self.require_platform_capability(
+            "market_data.trades.stream",
+            CapabilityRisk::Read,
+            PlatformTransport::Websocket,
+        )
+        .await?;
+        self.require_platform_capability(
+            "market_data.marks.read",
+            CapabilityRisk::Read,
+            PlatformTransport::Websocket,
+        )
+        .await?;
         MarketDataStream::connect(self, market_id).await
     }
 
@@ -503,6 +552,12 @@ impl StrataClient {
         market_id: &str,
         execution_ids: &[String],
     ) -> Result<ExecutionStream, SdkError> {
+        self.require_platform_capability(
+            "execution.stream",
+            CapabilityRisk::Read,
+            PlatformTransport::Websocket,
+        )
+        .await?;
         ExecutionStream::connect(self, market_id, execution_ids).await
     }
 
@@ -514,6 +569,12 @@ impl StrataClient {
         market_id: &str,
         wallet_address: &str,
     ) -> Result<TwapStream, SdkError> {
+        self.require_platform_capability(
+            "algos.twap.stream",
+            CapabilityRisk::Read,
+            PlatformTransport::Websocket,
+        )
+        .await?;
         TwapStream::connect(self, market_id, wallet_address).await
     }
 
@@ -525,6 +586,12 @@ impl StrataClient {
         market_id: &str,
         wallet_address: &str,
     ) -> Result<MakerStream, SdkError> {
+        self.require_platform_capability(
+            "mm.fills.stream",
+            CapabilityRisk::Read,
+            PlatformTransport::Websocket,
+        )
+        .await?;
         MakerStream::connect(self, market_id, wallet_address, None::<&NoSigner>).await
     }
 
@@ -535,6 +602,12 @@ impl StrataClient {
         market_id: &str,
         signer: &S,
     ) -> Result<MakerStream, SdkError> {
+        self.require_platform_capability(
+            "mm.fills.stream",
+            CapabilityRisk::Read,
+            PlatformTransport::Websocket,
+        )
+        .await?;
         MakerStream::connect(self, market_id, signer.public_key(), Some(signer)).await
     }
 
@@ -545,6 +618,12 @@ impl StrataClient {
         market_id: &str,
         signer: &S,
     ) -> Result<AccountStream, SdkError> {
+        self.require_platform_capability(
+            "account.stream",
+            CapabilityRisk::Read,
+            PlatformTransport::Websocket,
+        )
+        .await?;
         AccountStream::connect(self, market_id, signer).await
     }
 
@@ -553,6 +632,54 @@ impl StrataClient {
     pub async fn platform_capabilities(&self) -> Result<PlatformDiscoveryResponse, SdkError> {
         let discovery: PlatformDiscoveryResponse = self.get("v2/capabilities", &[]).await?;
         validate_platform_discovery(&discovery)?;
+        self.store_platform_capabilities(discovery.clone())?;
+        Ok(discovery)
+    }
+
+    async fn cached_platform_capabilities(&self) -> Result<PlatformDiscoveryResponse, SdkError> {
+        let cached = self
+            .platform_capability_cache
+            .lock()
+            .map_err(|_| SdkError::InvalidResponse("capability cache is unavailable".to_owned()))?
+            .as_ref()
+            .filter(|cached| cached.expires_at > Instant::now())
+            .map(|cached| cached.value.clone());
+        match cached {
+            Some(discovery) => Ok(discovery),
+            None => self.platform_capabilities().await,
+        }
+    }
+
+    fn store_platform_capabilities(
+        &self,
+        discovery: PlatformDiscoveryResponse,
+    ) -> Result<(), SdkError> {
+        *self.platform_capability_cache.lock().map_err(|_| {
+            SdkError::InvalidResponse("capability cache is unavailable".to_owned())
+        })? = Some(CachedPlatformDiscovery {
+            value: discovery,
+            expires_at: Instant::now() + DEFAULT_PLATFORM_CAPABILITY_CACHE,
+        });
+        Ok(())
+    }
+
+    async fn require_platform_capability(
+        &self,
+        capability_id: &str,
+        risk: CapabilityRisk,
+        transport: PlatformTransport,
+    ) -> Result<PlatformDiscoveryResponse, SdkError> {
+        let discovery = self.cached_platform_capabilities().await?;
+        let available = discovery.capabilities.iter().any(|capability| {
+            capability.id == capability_id
+                && capability.risk == risk
+                && capability.transports.contains(&transport)
+        });
+        if !available {
+            return Err(SdkError::OperationUnavailable(format!(
+                "live capability is not available: {capability_id}"
+            )));
+        }
         Ok(discovery)
     }
 
@@ -566,6 +693,12 @@ impl StrataClient {
 
     /// Read product-level readiness without exposing internal services.
     pub async fn platform_status(&self) -> Result<PlatformServiceStatusResponse, SdkError> {
+        self.require_platform_capability(
+            "platform.status.read",
+            CapabilityRisk::Read,
+            PlatformTransport::Http,
+        )
+        .await?;
         let status: PlatformServiceStatusResponse = self.get("v2/status", &[]).await?;
         validate_platform_version(status.schema_version, &status.contract_version)?;
         Ok(status)
@@ -575,6 +708,12 @@ impl StrataClient {
         &self,
         request: PageRequest,
     ) -> Result<PlatformAssetsResponse, SdkError> {
+        self.require_platform_capability(
+            "assets.read",
+            CapabilityRisk::Read,
+            PlatformTransport::Http,
+        )
+        .await?;
         let query = normalize_page_request(request)?;
         let response: PlatformAssetsResponse = self.get("v2/assets", &query).await?;
         validate_platform_version(response.schema_version, &response.contract_version)?;
@@ -598,6 +737,12 @@ impl StrataClient {
         &self,
         request: PlatformSwapQuoteRequest,
     ) -> Result<PlatformSwapQuoteResponse, SdkError> {
+        self.require_platform_capability(
+            "quotes.swap.read",
+            CapabilityRisk::Read,
+            PlatformTransport::Http,
+        )
+        .await?;
         let input_asset_id = validate_platform_asset_id(&request.input_asset_id)?;
         let output_asset_id = validate_platform_asset_id(&request.output_asset_id)?;
         if input_asset_id == output_asset_id {
@@ -652,6 +797,12 @@ impl StrataClient {
         &self,
         request: PageRequest,
     ) -> Result<PlatformMarketsResponse, SdkError> {
+        self.require_platform_capability(
+            "markets.read",
+            CapabilityRisk::Read,
+            PlatformTransport::Http,
+        )
+        .await?;
         let query = normalize_page_request(request)?;
         let response: PlatformMarketsResponse = self.get("v2/markets", &query).await?;
         validate_platform_version(response.schema_version, &response.contract_version)?;
@@ -676,6 +827,12 @@ impl StrataClient {
         market_id: &str,
         request: PlatformBookRequest,
     ) -> Result<PlatformBookSnapshotResponse, SdkError> {
+        self.require_platform_capability(
+            "market_data.book.snapshot",
+            CapabilityRisk::Read,
+            PlatformTransport::Http,
+        )
+        .await?;
         let market_id = validate_platform_market_id(market_id)?;
         let query = match request.depth {
             Some(depth @ 1..=2_000) => vec![("depth".to_owned(), depth.to_string())],
@@ -709,6 +866,12 @@ impl StrataClient {
         &self,
         market_id: &str,
     ) -> Result<PlatformBestBidAskResponse, SdkError> {
+        self.require_platform_capability(
+            "books.read",
+            CapabilityRisk::Read,
+            PlatformTransport::Http,
+        )
+        .await?;
         let market_id = validate_platform_market_id(market_id)?;
         let response: PlatformBestBidAskResponse = self
             .get(&format!("v2/markets/{market_id}/bbo"), &[])
@@ -733,6 +896,12 @@ impl StrataClient {
         &self,
         market_id: &str,
     ) -> Result<PlatformFeeScheduleResponse, SdkError> {
+        self.require_platform_capability(
+            "fees.read",
+            CapabilityRisk::Read,
+            PlatformTransport::Http,
+        )
+        .await?;
         let market_id = validate_platform_market_id(market_id)?;
         let response: PlatformFeeScheduleResponse = self
             .get(&format!("v2/markets/{market_id}/fees"), &[])
@@ -757,6 +926,12 @@ impl StrataClient {
         &self,
         market_id: &str,
     ) -> Result<PlatformMarketStatusResponse, SdkError> {
+        self.require_platform_capability(
+            "markets.status.read",
+            CapabilityRisk::Read,
+            PlatformTransport::Http,
+        )
+        .await?;
         let market_id = validate_platform_market_id(market_id)?;
         let response: PlatformMarketStatusResponse = self
             .get(&format!("v2/markets/{market_id}/status"), &[])
@@ -781,6 +956,12 @@ impl StrataClient {
         market_id: &str,
         request: PlatformTradesRequest,
     ) -> Result<PlatformTradesResponse, SdkError> {
+        self.require_platform_capability(
+            "market_data.trades.read",
+            CapabilityRisk::Read,
+            PlatformTransport::Http,
+        )
+        .await?;
         let market_id = validate_platform_market_id(market_id)?;
         let query = match request.limit {
             Some(limit @ 1..=500) => vec![("limit".to_owned(), limit.to_string())],
@@ -817,6 +998,12 @@ impl StrataClient {
         market_id: &str,
         request: PlatformCandlesRequest,
     ) -> Result<PlatformCandlesResponse, SdkError> {
+        self.require_platform_capability(
+            "market_data.candles.read",
+            CapabilityRisk::Read,
+            PlatformTransport::Http,
+        )
+        .await?;
         let market_id = validate_platform_market_id(market_id)?;
         if request.to_ms <= request.from_ms {
             return Err(SdkError::InvalidRequest(
@@ -865,6 +1052,12 @@ impl StrataClient {
     }
 
     pub async fn platform_mark(&self, market_id: &str) -> Result<PlatformMarkResponse, SdkError> {
+        self.require_platform_capability(
+            "market_data.marks.read",
+            CapabilityRisk::Read,
+            PlatformTransport::Http,
+        )
+        .await?;
         let market_id = validate_platform_market_id(market_id)?;
         let response: PlatformMarkResponse = self
             .get(&format!("v2/markets/{market_id}/marks"), &[])
@@ -893,6 +1086,12 @@ impl StrataClient {
         market_id: &str,
         execution_id: &str,
     ) -> Result<PlatformExecutionStatusResponse, SdkError> {
+        self.require_platform_capability(
+            "execution.status.read",
+            CapabilityRisk::Read,
+            PlatformTransport::Http,
+        )
+        .await?;
         let market_id = validate_platform_market_id(market_id)?;
         let execution_id = execution_id.trim();
         if !valid_handle(execution_id, "se_") {
@@ -928,6 +1127,12 @@ impl StrataClient {
         market_id: &str,
         wallet_address: &str,
     ) -> Result<PlatformTwapsResponse, SdkError> {
+        self.require_platform_capability(
+            "algos.twap.read",
+            CapabilityRisk::Read,
+            PlatformTransport::Http,
+        )
+        .await?;
         let market_id = validate_platform_market_id(market_id)?;
         let wallet_address = canonical_public_key(wallet_address, "wallet_address")?;
         let response: PlatformTwapsResponse = self
@@ -963,6 +1168,12 @@ impl StrataClient {
         &self,
         wallet_address: &str,
     ) -> Result<PlatformPortfolioResponse, SdkError> {
+        self.require_platform_capability(
+            "portfolio.read",
+            CapabilityRisk::Read,
+            PlatformTransport::Http,
+        )
+        .await?;
         let wallet_address = canonical_public_key(wallet_address, "wallet_address")?;
         let response: PlatformPortfolioResponse = self
             .get(&format!("v2/account/{wallet_address}/portfolio"), &[])
@@ -990,6 +1201,12 @@ impl StrataClient {
         wallet_address: &str,
         range: PlatformPortfolioHistoryRange,
     ) -> Result<PlatformPortfolioHistoryResponse, SdkError> {
+        self.require_platform_capability(
+            "portfolio.history.read",
+            CapabilityRisk::Read,
+            PlatformTransport::Http,
+        )
+        .await?;
         let wallet_address = canonical_public_key(wallet_address, "wallet_address")?;
         let range_value = platform_history_range(range);
         let query = vec![("range".to_owned(), range_value.to_owned())];
@@ -1014,6 +1231,12 @@ impl StrataClient {
         wallet_address: &str,
         request: PlatformVaultStatusRequest,
     ) -> Result<PlatformVaultStatusResponse, SdkError> {
+        self.require_platform_capability(
+            "vault.status.read",
+            CapabilityRisk::Read,
+            PlatformTransport::Http,
+        )
+        .await?;
         let wallet_address = canonical_public_key(wallet_address, "wallet_address")?;
         let session_public_key = request
             .session_public_key
@@ -1101,6 +1324,12 @@ impl StrataClient {
         &self,
         request: PlatformVaultPausePrepareRequest,
     ) -> Result<PlatformVaultPausePrepareResponse, SdkError> {
+        self.require_platform_capability(
+            "vault.pause",
+            CapabilityRisk::Destructive,
+            PlatformTransport::Http,
+        )
+        .await?;
         let request = PlatformVaultPausePrepareRequest {
             wallet_address: canonical_public_key(&request.wallet_address, "wallet_address")?,
             paused: request.paused,
@@ -1130,6 +1359,12 @@ impl StrataClient {
         &self,
         request: PlatformVaultSetupPrepareRequest,
     ) -> Result<PlatformVaultSetupPrepareResponse, SdkError> {
+        self.require_platform_capability(
+            "vault.setup",
+            CapabilityRisk::Submit,
+            PlatformTransport::Http,
+        )
+        .await?;
         let wallet_address = canonical_public_key(&request.wallet_address, "wallet_address")?;
         let session_public_key =
             canonical_public_key(&request.session_public_key, "session_public_key")?;
@@ -1216,6 +1451,12 @@ impl StrataClient {
         &self,
         request: PlatformVaultDelegatePrepareRequest,
     ) -> Result<PlatformVaultDelegatePrepareResponse, SdkError> {
+        self.require_platform_capability(
+            "vault.delegate.manage",
+            CapabilityRisk::Destructive,
+            PlatformTransport::Http,
+        )
+        .await?;
         let wallet_address = canonical_public_key(&request.wallet_address, "wallet_address")?;
         let session_public_key =
             canonical_public_key(&request.session_public_key, "session_public_key")?;
@@ -1253,6 +1494,12 @@ impl StrataClient {
         &self,
         request: PlatformVaultPolicyPrepareRequest,
     ) -> Result<PlatformVaultPolicyPrepareResponse, SdkError> {
+        self.require_platform_capability(
+            "vault.policy.manage",
+            CapabilityRisk::Destructive,
+            PlatformTransport::Http,
+        )
+        .await?;
         let wallet_address = canonical_public_key(&request.wallet_address, "wallet_address")?;
         let allowed = &request.withdrawal_access.allowed_wallet_addresses;
         let mut unique_wallets = HashSet::new();
@@ -1301,6 +1548,12 @@ impl StrataClient {
         &self,
         request: PlatformVaultDepositPrepareRequest,
     ) -> Result<PlatformVaultDepositPrepareResponse, SdkError> {
+        self.require_platform_capability(
+            "vault.deposit",
+            CapabilityRisk::Submit,
+            PlatformTransport::Http,
+        )
+        .await?;
         let wallet_address = canonical_public_key(&request.wallet_address, "wallet_address")?;
         let session_public_key = request
             .session_public_key
@@ -1347,6 +1600,12 @@ impl StrataClient {
         &self,
         request: PlatformVaultWithdrawPrepareRequest,
     ) -> Result<PlatformVaultWithdrawPrepareResponse, SdkError> {
+        self.require_platform_capability(
+            "vault.withdraw",
+            CapabilityRisk::Destructive,
+            PlatformTransport::Http,
+        )
+        .await?;
         let request = PlatformVaultWithdrawPrepareRequest {
             wallet_address: canonical_public_key(&request.wallet_address, "wallet_address")?,
             market_id: validate_platform_market_id(&request.market_id)?,
@@ -1385,6 +1644,12 @@ impl StrataClient {
         &self,
         request: PlatformVaultSubmitRequest,
     ) -> Result<PlatformVaultSubmitResponse, SdkError> {
+        self.require_platform_capability(
+            "vault.relay",
+            CapabilityRisk::Submit,
+            PlatformTransport::Http,
+        )
+        .await?;
         if !valid_handle(&request.preparation_id, "vp_") {
             return Err(SdkError::InvalidRequest(
                 "preparation_id is invalid".to_owned(),
@@ -1408,6 +1673,12 @@ impl StrataClient {
         &self,
         preparation_id: &str,
     ) -> Result<PlatformVaultSubmitResponse, SdkError> {
+        self.require_platform_capability(
+            "vault.relay",
+            CapabilityRisk::Submit,
+            PlatformTransport::Http,
+        )
+        .await?;
         let preparation_id = preparation_id.trim();
         if !valid_handle(preparation_id, "vp_") {
             return Err(SdkError::InvalidRequest(
@@ -1425,6 +1696,12 @@ impl StrataClient {
         &self,
         request: PlatformRewardsRequest,
     ) -> Result<PlatformRewardsResponse, SdkError> {
+        self.require_platform_capability(
+            "rewards.read",
+            CapabilityRisk::Read,
+            PlatformTransport::Http,
+        )
+        .await?;
         let wallet = request
             .wallet_address
             .as_deref()
@@ -1459,6 +1736,12 @@ impl StrataClient {
         &self,
         wallet_address: &str,
     ) -> Result<PlatformReferralsResponse, SdkError> {
+        self.require_platform_capability(
+            "referrals.read",
+            CapabilityRisk::Read,
+            PlatformTransport::Http,
+        )
+        .await?;
         let wallet_address = canonical_public_key(wallet_address, "wallet_address")?;
         let response: PlatformReferralsResponse = self
             .get(&format!("v2/referrals/{wallet_address}"), &[])
@@ -1476,6 +1759,12 @@ impl StrataClient {
         &self,
         request: PlatformReferralLinkRequest,
     ) -> Result<PlatformReferralLinkResponse, SdkError> {
+        self.require_platform_capability(
+            "referrals.link",
+            CapabilityRisk::Submit,
+            PlatformTransport::Http,
+        )
+        .await?;
         let request = PlatformReferralLinkRequest {
             wallet_address: canonical_public_key(&request.wallet_address, "wallet_address")?,
             referral_code: normalize_referral_code(&request.referral_code)?,
@@ -1502,6 +1791,12 @@ impl StrataClient {
         &self,
         request: PlatformReferralClaimRequest,
     ) -> Result<PlatformReferralClaimResponse, SdkError> {
+        self.require_platform_capability(
+            "referrals.claim",
+            CapabilityRisk::Submit,
+            PlatformTransport::Http,
+        )
+        .await?;
         let wallet_address = canonical_public_key(&request.wallet_address, "wallet_address")?;
         let payout_wallet_address = request
             .payout_wallet_address
@@ -1536,6 +1831,12 @@ impl StrataClient {
         &self,
         wallet_address: &str,
     ) -> Result<PlatformBugsResponse, SdkError> {
+        self.require_platform_capability(
+            "bugs.read",
+            CapabilityRisk::Read,
+            PlatformTransport::Http,
+        )
+        .await?;
         let wallet_address = canonical_public_key(wallet_address, "wallet_address")?;
         let response: PlatformBugsResponse =
             self.get(&format!("v2/bugs/{wallet_address}"), &[]).await?;
@@ -1552,6 +1853,12 @@ impl StrataClient {
         &self,
         request: PlatformBugSubmitRequest,
     ) -> Result<PlatformBugSubmitResponse, SdkError> {
+        self.require_platform_capability(
+            "bugs.submit",
+            CapabilityRisk::Submit,
+            PlatformTransport::Http,
+        )
+        .await?;
         let request = PlatformBugSubmitRequest {
             owner_wallet: canonical_public_key(&request.owner_wallet, "owner_wallet")?,
             message: normalize_bug_message(&request.message)?,
@@ -1578,11 +1885,18 @@ impl StrataClient {
         signer: &S,
         request: PlatformAccountMarketRequest,
     ) -> Result<PlatformAccountSnapshotResponse, SdkError> {
+        let discovery = self
+            .require_platform_capability(
+                "account.read",
+                CapabilityRisk::Read,
+                PlatformTransport::Http,
+            )
+            .await?;
         let market_id = validate_platform_market_id(market_id)?;
         let wallet_address =
             canonical_public_key(signer.public_key(), "account signer public key")?;
         let fill_limit = normalize_fill_limit(request.fill_limit)?;
-        let timestamp_ms = self.platform_capabilities().await?.server_time_ms;
+        let timestamp_ms = discovery.server_time_ms;
         let message =
             account_http_auth_message(&market_id, &wallet_address, timestamp_ms, fill_limit)?;
         let signature = signer
@@ -1683,6 +1997,12 @@ impl StrataClient {
         market_id: &str,
         wallet_address: &str,
     ) -> Result<PlatformMakerStatusResponse, SdkError> {
+        self.require_platform_capability(
+            "mm.status.read",
+            CapabilityRisk::Read,
+            PlatformTransport::Http,
+        )
+        .await?;
         let market_id = validate_platform_market_id(market_id)?;
         let wallet_address = canonical_public_key(wallet_address, "wallet_address")?;
         self.read_platform_maker_status(&market_id, &wallet_address, None)
@@ -1706,6 +2026,12 @@ impl StrataClient {
         &self,
         request: PlatformMakerStatusAuthorizedRequest,
     ) -> Result<PlatformMakerStatusResponse, SdkError> {
+        self.require_platform_capability(
+            "mm.status.read",
+            CapabilityRisk::Read,
+            PlatformTransport::Http,
+        )
+        .await?;
         let market_id = validate_platform_market_id(&request.market_id)?;
         let wallet_address = canonical_public_key(&request.wallet_address, "wallet_address")?;
         let signature =
@@ -1754,6 +2080,12 @@ impl StrataClient {
         market_id: &str,
         wallet_address: &str,
     ) -> Result<PlatformMakerReputationResponse, SdkError> {
+        self.require_platform_capability(
+            "mm.reputation.read",
+            CapabilityRisk::Read,
+            PlatformTransport::Http,
+        )
+        .await?;
         let market_id = validate_platform_market_id(market_id)?;
         let wallet_address = canonical_public_key(wallet_address, "wallet_address")?;
         self.read_platform_maker_reputation(&market_id, &wallet_address, None)
@@ -1777,6 +2109,12 @@ impl StrataClient {
         &self,
         request: PlatformMakerReputationAuthorizedRequest,
     ) -> Result<PlatformMakerReputationResponse, SdkError> {
+        self.require_platform_capability(
+            "mm.reputation.read",
+            CapabilityRisk::Read,
+            PlatformTransport::Http,
+        )
+        .await?;
         let market_id = validate_platform_market_id(&request.market_id)?;
         let wallet_address = canonical_public_key(&request.wallet_address, "wallet_address")?;
         let signature =
@@ -1825,6 +2163,12 @@ impl StrataClient {
         market_id: &str,
         request: PlatformMakerStrandPrepareRequest,
     ) -> Result<PlatformMakerControlPrepareResponse, SdkError> {
+        self.require_platform_capability(
+            "mm.strand.manage",
+            CapabilityRisk::Submit,
+            PlatformTransport::Http,
+        )
+        .await?;
         let market_id = validate_platform_market_id(market_id)?;
         let expected_action = strand_prepare_action(&request);
         let expected_wallet = strand_prepare_wallet(&request)?;
@@ -1845,13 +2189,19 @@ impl StrataClient {
         Ok(prepared)
     }
 
-    /// Prepare one exact maker-signed Current transaction. Upsert fails closed
-    /// when the market has no verified on-chain reference; cancel stays usable.
+    /// Prepare one exact maker-signed Current transaction. Upsert prices its
+    /// bands from the market's live Strata mark; cancel stays usable.
     pub async fn platform_maker_current_prepare(
         &self,
         market_id: &str,
         request: PlatformMakerCurrentPrepareRequest,
     ) -> Result<PlatformMakerControlPrepareResponse, SdkError> {
+        self.require_platform_capability(
+            "mm.current.manage",
+            CapabilityRisk::Submit,
+            PlatformTransport::Http,
+        )
+        .await?;
         let market_id = validate_platform_market_id(market_id)?;
         let expected_action = current_prepare_action(&request);
         let expected_wallet = current_prepare_wallet(&request)?;
@@ -1907,6 +2257,16 @@ impl StrataClient {
         expected_product: PlatformMakerControlProduct,
         request: PlatformMakerControlSubmitRequest,
     ) -> Result<PlatformMakerControlSubmitResponse, SdkError> {
+        let capability_id = match expected_product {
+            PlatformMakerControlProduct::Strand => "mm.strand.manage",
+            PlatformMakerControlProduct::Current => "mm.current.manage",
+        };
+        self.require_platform_capability(
+            capability_id,
+            CapabilityRisk::Submit,
+            PlatformTransport::Http,
+        )
+        .await?;
         let market_id = validate_platform_market_id(market_id)?;
         if !valid_handle(&request.maker_control_id, "mc_") {
             return Err(SdkError::InvalidRequest(
@@ -2158,6 +2518,12 @@ impl StrataClient {
         market_id: &str,
         request: PlatformOrderChallengeRequest,
     ) -> Result<PlatformOrderChallengeResponse, SdkError> {
+        self.require_platform_capability(
+            "orders.prepare",
+            CapabilityRisk::Prepare,
+            PlatformTransport::Http,
+        )
+        .await?;
         let market_id = validate_platform_market_id(market_id)?;
         let request = normalize_order_challenge_request(request)?;
         let expected_action = order_request_action(&request);
@@ -2200,6 +2566,12 @@ impl StrataClient {
         market_id: &str,
         request: PlatformOrderPrepareRequest,
     ) -> Result<PlatformOrderPrepareResponse, SdkError> {
+        self.require_platform_capability(
+            "orders.prepare",
+            CapabilityRisk::Prepare,
+            PlatformTransport::Http,
+        )
+        .await?;
         let market_id = validate_platform_market_id(market_id)?;
         let request = match request {
             PlatformOrderPrepareRequest::Authorized(authorization) => {
@@ -2245,6 +2617,12 @@ impl StrataClient {
         market_id: &str,
         request: PlatformOrderSubmitRequest,
     ) -> Result<PlatformOrderSubmitResponse, SdkError> {
+        self.require_platform_capability(
+            "orders.submit",
+            CapabilityRisk::Submit,
+            PlatformTransport::Http,
+        )
+        .await?;
         let market_id = validate_platform_market_id(market_id)?;
         if !valid_handle(&request.order_control_id, "or_") {
             return Err(SdkError::InvalidRequest(
@@ -2285,6 +2663,12 @@ impl StrataClient {
         market_id: &str,
         request: PlatformOrderStatusRequest,
     ) -> Result<PlatformOrderStatusResponse, SdkError> {
+        self.require_platform_capability(
+            "orders.submit",
+            CapabilityRisk::Submit,
+            PlatformTransport::Http,
+        )
+        .await?;
         let market_id = validate_platform_market_id(market_id)?;
         if !valid_handle(&request.order_control_id, "or_") {
             return Err(SdkError::InvalidRequest(
@@ -2327,6 +2711,12 @@ impl StrataClient {
         market_id: &str,
         request: PlatformTwapChallengeRequest,
     ) -> Result<PlatformTwapChallengeResponse, SdkError> {
+        let capability_id = match twap_request_action(&request) {
+            PlatformTwapControlAction::Place => ("algos.twap.place", CapabilityRisk::Submit),
+            PlatformTwapControlAction::Cancel => ("algos.twap.cancel", CapabilityRisk::Destructive),
+        };
+        self.require_platform_capability(capability_id.0, capability_id.1, PlatformTransport::Http)
+            .await?;
         let market_id = validate_platform_market_id(market_id)?;
         let request = normalize_twap_challenge_request(request)?;
         let expected_action = twap_request_action(&request);
@@ -2361,6 +2751,20 @@ impl StrataClient {
         market_id: &str,
         request: PlatformTwapPrepareRequest,
     ) -> Result<PlatformTwapPrepareResponse, SdkError> {
+        if let PlatformTwapPrepareRequest::Direct(operation) = &request {
+            let capability_id = match twap_request_action(operation) {
+                PlatformTwapControlAction::Place => ("algos.twap.place", CapabilityRisk::Submit),
+                PlatformTwapControlAction::Cancel => {
+                    ("algos.twap.cancel", CapabilityRisk::Destructive)
+                }
+            };
+            self.require_platform_capability(
+                capability_id.0,
+                capability_id.1,
+                PlatformTransport::Http,
+            )
+            .await?;
+        }
         let market_id = validate_platform_market_id(market_id)?;
         let request = match request {
             PlatformTwapPrepareRequest::Authorized(authorization) => {
@@ -3108,7 +3512,7 @@ fn normalize_current_prepare_request(
                 || max_oracle_dev_bps > 500
             {
                 return Err(SdkError::InvalidRequest(
-                    "Current oracle and spread bounds are invalid".to_owned(),
+                    "Current mark-reference and spread bounds are invalid".to_owned(),
                 ));
             }
             let bid_depth_base_atoms =
@@ -5745,7 +6149,131 @@ mod tests {
     use wiremock::matchers::{body_json, header, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    fn test_platform_discovery() -> PlatformDiscoveryResponse {
+        let mut discovery: PlatformDiscoveryResponse =
+            serde_json::from_str(strata_public_contract::platform::PLATFORM_CAPABILITIES_FIXTURE)
+                .unwrap();
+        let http = vec![PlatformTransport::Http];
+        let websocket = vec![PlatformTransport::Websocket];
+        let http_and_websocket = vec![PlatformTransport::Http, PlatformTransport::Websocket];
+        let capability = |id: &str, risk: CapabilityRisk, transports: Vec<PlatformTransport>| {
+            LivePlatformCapability {
+                id: id.to_owned(),
+                risk,
+                required_scope: "test".to_owned(),
+                transports,
+                mcp_exposure: McpExposure::None,
+            }
+        };
+        discovery.capabilities = vec![
+            capability("platform.discover", CapabilityRisk::Read, http.clone()),
+            capability("platform.status.read", CapabilityRisk::Read, http.clone()),
+            capability("assets.read", CapabilityRisk::Read, http.clone()),
+            capability("markets.read", CapabilityRisk::Read, http.clone()),
+            capability("books.read", CapabilityRisk::Read, http_and_websocket),
+            capability("markets.status.read", CapabilityRisk::Read, http.clone()),
+            capability("fees.read", CapabilityRisk::Read, http.clone()),
+            capability(
+                "market_data.book.snapshot",
+                CapabilityRisk::Read,
+                http.clone(),
+            ),
+            capability(
+                "market_data.book.stream",
+                CapabilityRisk::Read,
+                websocket.clone(),
+            ),
+            capability(
+                "market_data.bbo.stream",
+                CapabilityRisk::Read,
+                websocket.clone(),
+            ),
+            capability(
+                "market_data.trades.read",
+                CapabilityRisk::Read,
+                http.clone(),
+            ),
+            capability(
+                "market_data.trades.stream",
+                CapabilityRisk::Read,
+                websocket.clone(),
+            ),
+            capability(
+                "market_data.candles.read",
+                CapabilityRisk::Read,
+                http.clone(),
+            ),
+            capability(
+                "market_data.marks.read",
+                CapabilityRisk::Read,
+                vec![PlatformTransport::Http, PlatformTransport::Websocket],
+            ),
+            capability("quotes.swap.read", CapabilityRisk::Read, http.clone()),
+            capability("execution.status.read", CapabilityRisk::Read, http.clone()),
+            capability("execution.stream", CapabilityRisk::Read, websocket.clone()),
+            capability(
+                "orders.prepare",
+                CapabilityRisk::Prepare,
+                vec![PlatformTransport::Http, PlatformTransport::Websocket],
+            ),
+            capability(
+                "orders.submit",
+                CapabilityRisk::Submit,
+                vec![PlatformTransport::Http, PlatformTransport::Websocket],
+            ),
+            capability("algos.twap.place", CapabilityRisk::Submit, http.clone()),
+            capability(
+                "algos.twap.cancel",
+                CapabilityRisk::Destructive,
+                http.clone(),
+            ),
+            capability("algos.twap.read", CapabilityRisk::Read, http.clone()),
+            capability("algos.twap.stream", CapabilityRisk::Read, websocket.clone()),
+            capability("account.read", CapabilityRisk::Read, http.clone()),
+            capability("account.stream", CapabilityRisk::Read, websocket.clone()),
+            capability("portfolio.read", CapabilityRisk::Read, http.clone()),
+            capability("portfolio.history.read", CapabilityRisk::Read, http.clone()),
+            capability("vault.status.read", CapabilityRisk::Read, http.clone()),
+            capability("vault.setup", CapabilityRisk::Submit, http.clone()),
+            capability("vault.deposit", CapabilityRisk::Submit, http.clone()),
+            capability("vault.withdraw", CapabilityRisk::Destructive, http.clone()),
+            capability(
+                "vault.delegate.manage",
+                CapabilityRisk::Destructive,
+                http.clone(),
+            ),
+            capability(
+                "vault.policy.manage",
+                CapabilityRisk::Destructive,
+                http.clone(),
+            ),
+            capability("vault.pause", CapabilityRisk::Destructive, http.clone()),
+            capability("vault.relay", CapabilityRisk::Submit, http.clone()),
+            capability("mm.status.read", CapabilityRisk::Read, http.clone()),
+            capability("mm.reputation.read", CapabilityRisk::Read, http.clone()),
+            capability("mm.fills.stream", CapabilityRisk::Read, websocket),
+            capability("mm.strand.manage", CapabilityRisk::Submit, http.clone()),
+            capability("mm.current.manage", CapabilityRisk::Submit, http.clone()),
+            capability("rewards.read", CapabilityRisk::Read, http.clone()),
+            capability("referrals.read", CapabilityRisk::Read, http.clone()),
+            capability("referrals.link", CapabilityRisk::Submit, http.clone()),
+            capability("referrals.claim", CapabilityRisk::Submit, http.clone()),
+            capability("bugs.read", CapabilityRisk::Read, http.clone()),
+            capability("bugs.submit", CapabilityRisk::Submit, http),
+        ];
+        discovery
+    }
+
+    fn seed_platform_capabilities(client: &StrataClient) {
+        client
+            .store_platform_capabilities(test_platform_discovery())
+            .unwrap();
+    }
+
     fn fixture(path: &str) -> serde_json::Value {
+        if path == "platform-capabilities" {
+            return serde_json::to_value(test_platform_discovery()).unwrap();
+        }
         let raw = match path {
             "action-graph" => strata_public_contract::contract_fixtures::ACTION_GRAPH,
             "markets" => strata_public_contract::contract_fixtures::MARKETS,
@@ -5760,9 +6288,6 @@ mod tests {
             "twap-challenge" => strata_public_contract::platform::PLATFORM_TWAP_CHALLENGE_FIXTURE,
             "twap-prepare" => strata_public_contract::platform::PLATFORM_TWAP_PREPARE_FIXTURE,
             "twap-submit" => strata_public_contract::platform::PLATFORM_TWAP_SUBMIT_FIXTURE,
-            "platform-capabilities" => {
-                strata_public_contract::platform::PLATFORM_CAPABILITIES_FIXTURE
-            }
             "platform-action-graph" => strata_public_contract::platform::PLATFORM_ACTION_GRAPH,
             "platform-status" => strata_public_contract::platform::PLATFORM_SERVICE_STATUS_FIXTURE,
             "assets" => strata_public_contract::platform::PLATFORM_ASSETS_FIXTURE,
@@ -6169,6 +6694,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn platform_capability_preflight_fails_closed_and_caches_discovery() {
+        let server = MockServer::start().await;
+        let mut discovery = test_platform_discovery();
+        discovery
+            .capabilities
+            .retain(|capability| capability.id != "mm.current.manage");
+        Mock::given(method("GET"))
+            .and(path("/v2/capabilities"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(discovery))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = StrataClient::new(server.uri()).unwrap();
+        for _ in 0..2 {
+            let error = client
+                .platform_maker_current_prepare(
+                    "market_33333333333333333333333333333333",
+                    PlatformMakerCurrentPrepareRequest::Cancel {
+                        maker_wallet: "5Ji61Fbeb22Yntgv1hhHeSSLgdEdZchHeM1Tv1MjGhSL".to_owned(),
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(matches!(
+                error,
+                SdkError::OperationUnavailable(message)
+                    if message.contains("mm.current.manage")
+            ));
+        }
+
+        seed_platform_capabilities(&client);
+        client
+            .require_platform_capability(
+                "algos.twap.cancel",
+                CapabilityRisk::Destructive,
+                PlatformTransport::Http,
+            )
+            .await
+            .unwrap();
+        assert!(client
+            .require_platform_capability(
+                "algos.twap.cancel",
+                CapabilityRisk::Submit,
+                PlatformTransport::Http,
+            )
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
     async fn maker_controls_use_exact_product_paths_and_external_transaction_bytes() {
         let server = MockServer::start().await;
         let market_id = "market_33333333333333333333333333333333";
@@ -6247,6 +6823,7 @@ mod tests {
             .await;
 
         let client = StrataClient::new(server.uri()).unwrap();
+        seed_platform_capabilities(&client);
         let strand = client
             .platform_maker_strand_prepare(
                 market_id,
@@ -6809,6 +7386,7 @@ mod tests {
         });
 
         let client = StrataClient::new(format!("http://{address}")).unwrap();
+        seed_platform_capabilities(&client);
         let mut stream = client.connect_market_data(market_id).await.unwrap();
         assert!(matches!(
             stream.next_event().await.unwrap(),
@@ -6901,6 +7479,7 @@ mod tests {
             signature_byte: 9,
         };
         let client = StrataClient::new(format!("http://{address}")).unwrap();
+        seed_platform_capabilities(&client);
         let mut stream = client.connect_account(market_id, &signer).await.unwrap();
         assert!(matches!(
             stream.next_event().await.unwrap(),
@@ -7005,6 +7584,7 @@ mod tests {
             let _ = socket.next().await;
         });
         let client = StrataClient::new(format!("http://{address}")).unwrap();
+        seed_platform_capabilities(&client);
         let ids: Vec<String> = vec![
             "se_0123456789abcdef0123456789abcdef".to_owned(),
             "se_fedcba9876543210fedcba9876543210".to_owned(),
@@ -7106,6 +7686,7 @@ mod tests {
             let _ = socket.next().await;
         });
         let client = StrataClient::new(format!("http://{address}")).unwrap();
+        seed_platform_capabilities(&client);
         let mut stream = client.connect_twaps(&market_id, &wallet).await.unwrap();
         match stream.next_event().await.unwrap() {
             Some(PlatformTwapEvent::TwapsSnapshot { twaps, .. }) => assert_eq!(twaps.len(), 1),
@@ -7222,6 +7803,7 @@ mod tests {
             signature_byte: 7,
         };
         let client = StrataClient::new(format!("http://{address}")).unwrap();
+        seed_platform_capabilities(&client);
         let mut stream = client.connect_maker(market_id, &signer).await.unwrap();
         match stream.next_event().await.unwrap() {
             Some(PlatformMakerEvent::MakerSnapshot { status, fills, .. }) => {
@@ -7307,6 +7889,7 @@ mod tests {
             .await;
 
         let client = StrataClient::new(server.uri()).unwrap();
+        seed_platform_capabilities(&client);
         let challenge = client
             .order_challenge(
                 market_id,
@@ -7405,6 +7988,7 @@ mod tests {
             .await;
 
         let client = StrataClient::new(server.uri()).unwrap();
+        seed_platform_capabilities(&client);
         let challenge = client
             .twap_challenge(
                 market_id,
@@ -7579,6 +8163,7 @@ mod tests {
             .await;
 
         let client = StrataClient::new(server.uri()).unwrap();
+        seed_platform_capabilities(&client);
         let signer = OneSignatureSigner {
             expected_transaction: transaction,
         };
@@ -7683,6 +8268,7 @@ mod tests {
                 .await;
             // No submit mount: a refusal must stop before signing.
             let client = StrataClient::new(server.uri()).unwrap();
+            seed_platform_capabilities(&client);
             let signer = OneSignatureSigner {
                 expected_transaction: "never signed".to_owned(),
             };
@@ -7740,6 +8326,7 @@ mod tests {
             .await;
 
         let client = StrataClient::new(server.uri()).unwrap();
+        seed_platform_capabilities(&client);
         let signer = OneSignatureSigner {
             expected_transaction: "AQ==".to_owned(),
         };
