@@ -28,6 +28,8 @@ use base64::Engine as _;
 
 use crate::{
     opaque_market_id, opaque_order_id, ExecutionVerificationContext, ExecutionVerifier,
+    MakerVerificationContext, PlatformMakerControlAction, PlatformMakerCurrentPrepareRequest,
+    PlatformMakerQuickstartOperation, PlatformMakerStrandPrepareRequest,
     OrderVerificationContext, OrderVerifier, PlatformOrderBatchOperation,
     PlatformOrderChallengeRequest, PlatformOrderType, PlatformTradeSide, TwapVerificationContext,
     TwapVerifier,
@@ -208,6 +210,264 @@ pub fn decode_transaction(transaction_base64: &str) -> Result<DecodedTransaction
         instructions,
         address_table_lookup_count,
     })
+}
+
+/// Prove that an external wallet filled signatures without replacing the
+/// exact transaction message the SDK verified.
+pub fn verify_signed_transaction_message(
+    prepared_transaction_base64: &str,
+    signed_transaction_base64: &str,
+) -> Result<(), String> {
+    let prepared = transaction_message_bytes(prepared_transaction_base64)?;
+    let signed = transaction_message_bytes(signed_transaction_base64)?;
+    if prepared != signed {
+        return Err("signed transaction message changed after verification".to_owned());
+    }
+    Ok(())
+}
+
+fn transaction_message_bytes(transaction_base64: &str) -> Result<Vec<u8>, String> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(transaction_base64.trim())
+        .map_err(|_| "invalid base64 payload".to_owned())?;
+    let mut reader = Reader::new(&bytes);
+    let signature_count = reader.compact_u16()?;
+    reader.take(signature_count.saturating_mul(64))?;
+    if reader.offset >= bytes.len() {
+        return Err("transaction is truncated".to_owned());
+    }
+    Ok(bytes[reader.offset..].to_vec())
+}
+
+/// Deny-by-default verification for a direct maker-wallet control. Exactly one
+/// legacy instruction may be present; the maker is its sole signer and fee
+/// payer, its public economics equal the quickstart request, and an upsert is
+/// bound to the requested opaque market. Only the server-derived PDA bump is
+/// intentionally not predicted by the client.
+pub fn verify_maker_transaction(context: &MakerVerificationContext<'_>) -> Result<(), String> {
+    let tx = decode_transaction(&context.prepared.transaction_base64)?;
+    if tx.version != TransactionVersion::Legacy || tx.address_table_lookup_count != 0 {
+        return Err("maker controls must be one legacy transaction".to_owned());
+    }
+    if tx.num_required_signatures != 1
+        || tx.signature_count != 1
+        || tx.static_account_keys.first().map(String::as_str) != Some(context.maker_wallet)
+        || tx.num_readonly_signed != 0
+    {
+        return Err("maker control must require only the maker wallet".to_owned());
+    }
+    if tx.recent_blockhash != context.prepared.recent_blockhash {
+        return Err("prepared maker blockhash does not match".to_owned());
+    }
+    if tx.instructions.len() != 1 {
+        return Err("maker control must contain exactly one instruction".to_owned());
+    }
+    let instruction = &tx.instructions[0];
+    if instruction.account_indexes.first() != Some(&0) {
+        return Err("maker wallet is not the instruction signer".to_owned());
+    }
+    let program = tx
+        .static_account_keys
+        .get(usize::from(instruction.program_id_index))
+        .ok_or_else(|| "maker instruction program is not static".to_owned())?;
+    if WELL_KNOWN_PROGRAMS.contains(&program.as_str()) {
+        return Err("maker control targets an invalid program".to_owned());
+    }
+    let expected_tag = match context.prepared.action {
+        PlatformMakerControlAction::StrandUpsert => 41,
+        PlatformMakerControlAction::StrandRecenter => 42,
+        PlatformMakerControlAction::StrandCancel => 43,
+        PlatformMakerControlAction::StrandSetEnabled => 44,
+        PlatformMakerControlAction::CurrentUpsert => 47,
+        PlatformMakerControlAction::CurrentCancel => 48,
+    };
+    let data = &instruction.data;
+    if data.first() != Some(&expected_tag) {
+        return Err("maker instruction action changed".to_owned());
+    }
+    match (&context.prepared.action, context.operation) {
+        (
+            PlatformMakerControlAction::StrandUpsert,
+            PlatformMakerQuickstartOperation::Strand(PlatformMakerStrandPrepareRequest::Upsert {
+                enabled,
+                async_only,
+                sync_spread_ticks,
+                mid_price_atoms,
+                max_exposure_base_atoms,
+                bid_offsets_ticks,
+                ask_offsets_ticks,
+                bid_sizes_base_atoms,
+                ask_sizes_base_atoms,
+                valid_until_slot,
+                ..
+            }),
+        ) => {
+            if data.len() != 353 {
+                return Err("Strand upsert has an invalid length".to_owned());
+            }
+            verify_maker_market(&tx, instruction, context.market_id)?;
+            expect_u8(data, 1, u8::from(*enabled) | (u8::from(*async_only) << 1), "Strand flags")?;
+            expect_u16(data, 3, *sync_spread_ticks, "Strand sync spread")?;
+            expect_u64(data, 9, atoms(mid_price_atoms, "mid_price_atoms")?, "Strand mid price")?;
+            expect_u64(data, 17, atoms(max_exposure_base_atoms, "max_exposure_base_atoms")?, "Strand exposure")?;
+            for (index, value) in bid_offsets_ticks.iter().enumerate() {
+                expect_u16(data, 25 + index * 2, *value, "Strand bid offset")?;
+            }
+            for (index, value) in ask_offsets_ticks.iter().enumerate() {
+                expect_u16(data, 57 + index * 2, *value, "Strand ask offset")?;
+            }
+            for (index, value) in bid_sizes_base_atoms.iter().enumerate() {
+                expect_u64(data, 89 + index * 8, atoms(value, "bid size")?, "Strand bid size")?;
+            }
+            for (index, value) in ask_sizes_base_atoms.iter().enumerate() {
+                expect_u64(data, 217 + index * 8, atoms(value, "ask size")?, "Strand ask size")?;
+            }
+            expect_u64(data, 345, atoms(valid_until_slot, "valid_until_slot")?, "Strand expiry")
+        }
+        (
+            PlatformMakerControlAction::StrandRecenter,
+            PlatformMakerQuickstartOperation::Strand(PlatformMakerStrandPrepareRequest::Recenter {
+                new_mid_price_atoms,
+                valid_until_slot,
+                ..
+            }),
+        ) => {
+            if data.len() != 17 {
+                return Err("Strand recenter has an invalid length".to_owned());
+            }
+            expect_u64(data, 1, atoms(new_mid_price_atoms, "new_mid_price_atoms")?, "Strand mid price")?;
+            expect_u64(data, 9, atoms(valid_until_slot, "valid_until_slot")?, "Strand expiry")
+        }
+        (
+            PlatformMakerControlAction::StrandSetEnabled,
+            PlatformMakerQuickstartOperation::Strand(PlatformMakerStrandPrepareRequest::SetEnabled {
+                enabled,
+                ..
+            }),
+        ) => {
+            if data.len() != 2 {
+                return Err("Strand enable has an invalid length".to_owned());
+            }
+            expect_u8(data, 1, u8::from(*enabled), "Strand enabled state")
+        }
+        (
+            PlatformMakerControlAction::CurrentUpsert,
+            PlatformMakerQuickstartOperation::Current(PlatformMakerCurrentPrepareRequest::Upsert {
+                enabled,
+                async_only,
+                half_spread_bps,
+                band_step_bps,
+                max_conf_bps,
+                max_oracle_dev_bps,
+                max_oracle_age_secs,
+                sync_spread_bps,
+                max_exposure_base_atoms,
+                bid_depth_base_atoms,
+                ask_depth_base_atoms,
+                valid_until_slot,
+                ..
+            }),
+        ) => {
+            if data.len() != 161 {
+                return Err("Current upsert has an invalid length".to_owned());
+            }
+            verify_maker_market(&tx, instruction, context.market_id)?;
+            expect_u8(data, 1, u8::from(*enabled) | (u8::from(*async_only) << 1), "Current flags")?;
+            expect_u16(data, 3, *half_spread_bps, "Current spread")?;
+            expect_u16(data, 5, *band_step_bps, "Current band step")?;
+            expect_u16(data, 7, *max_conf_bps, "Current confidence bound")?;
+            expect_u16(data, 9, *max_oracle_dev_bps, "Current deviation bound")?;
+            expect_u32(data, 11, *max_oracle_age_secs, "Current mark age")?;
+            expect_u16(data, 15, *sync_spread_bps, "Current sync spread")?;
+            expect_u64(data, 17, atoms(max_exposure_base_atoms, "max_exposure_base_atoms")?, "Current exposure")?;
+            for (index, value) in bid_depth_base_atoms.iter().enumerate() {
+                expect_u64(data, 25 + index * 8, atoms(value, "bid depth")?, "Current bid depth")?;
+            }
+            for (index, value) in ask_depth_base_atoms.iter().enumerate() {
+                expect_u64(data, 89 + index * 8, atoms(value, "ask depth")?, "Current ask depth")?;
+            }
+            expect_u64(data, 153, atoms(valid_until_slot, "valid_until_slot")?, "Current expiry")
+        }
+        (
+            PlatformMakerControlAction::StrandCancel,
+            PlatformMakerQuickstartOperation::Strand(PlatformMakerStrandPrepareRequest::Cancel { .. }),
+        )
+        | (
+            PlatformMakerControlAction::CurrentCancel,
+            PlatformMakerQuickstartOperation::Current(PlatformMakerCurrentPrepareRequest::Cancel { .. }),
+        ) => {
+            if data.len() != 1 || instruction.account_indexes.len() != 3 {
+                return Err("maker cancellation has an invalid shape".to_owned());
+            }
+            let receiver = instruction
+                .account_indexes
+                .get(2)
+                .and_then(|index| tx.static_account_keys.get(usize::from(*index)))
+                .map(String::as_str);
+            if receiver != Some(context.maker_wallet) {
+                return Err("maker rent receiver changed".to_owned());
+            }
+            Ok(())
+        }
+        _ => Err("prepared maker action does not match the requested operation".to_owned()),
+    }
+}
+
+fn verify_maker_market(
+    tx: &DecodedTransaction,
+    instruction: &DecodedInstruction,
+    expected_market_id: &str,
+) -> Result<(), String> {
+    let market = instruction
+        .account_indexes
+        .get(1)
+        .and_then(|index| tx.static_account_keys.get(usize::from(*index)))
+        .ok_or_else(|| "maker market account is not static".to_owned())?;
+    if opaque_market_id(market) != expected_market_id {
+        return Err("maker transaction touches another market".to_owned());
+    }
+    Ok(())
+}
+
+fn expect_u8(data: &[u8], offset: usize, expected: u8, field: &str) -> Result<(), String> {
+    if data.get(offset) == Some(&expected) {
+        Ok(())
+    } else {
+        Err(format!("{field} changed"))
+    }
+}
+
+fn expect_u16(data: &[u8], offset: usize, expected: u16, field: &str) -> Result<(), String> {
+    let bytes: [u8; 2] = data
+        .get(offset..offset + 2)
+        .and_then(|slice| slice.try_into().ok())
+        .ok_or_else(|| format!("{field} is missing"))?;
+    if u16::from_le_bytes(bytes) == expected {
+        Ok(())
+    } else {
+        Err(format!("{field} changed"))
+    }
+}
+
+fn expect_u32(data: &[u8], offset: usize, expected: u32, field: &str) -> Result<(), String> {
+    let bytes: [u8; 4] = data
+        .get(offset..offset + 4)
+        .and_then(|slice| slice.try_into().ok())
+        .ok_or_else(|| format!("{field} is missing"))?;
+    if u32::from_le_bytes(bytes) == expected {
+        Ok(())
+    } else {
+        Err(format!("{field} changed"))
+    }
+}
+
+fn expect_u64(data: &[u8], offset: usize, expected: u64, field: &str) -> Result<(), String> {
+    let actual = read_u64(data, offset).map_err(|_| format!("{field} is missing"))?;
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(format!("{field} changed"))
+    }
 }
 
 struct DelegatedInstruction {
@@ -970,6 +1230,28 @@ mod tests {
             decode_transaction("not base64!").unwrap_err(),
             "invalid base64 payload"
         );
+    }
+
+    #[test]
+    fn external_signer_may_change_signatures_but_not_the_message() {
+        let prepared = place_transaction(PlaceTransactionOptions::default());
+        let mut signed = base64::engine::general_purpose::STANDARD
+            .decode(&prepared)
+            .unwrap();
+        signed[1] = 9;
+        let signed = base64::engine::general_purpose::STANDARD.encode(&signed);
+        verify_signed_transaction_message(&prepared, &signed).unwrap();
+
+        let mut changed = base64::engine::general_purpose::STANDARD
+            .decode(&signed)
+            .unwrap();
+        *changed.last_mut().unwrap() ^= 1;
+        let error = verify_signed_transaction_message(
+            &prepared,
+            &base64::engine::general_purpose::STANDARD.encode(changed),
+        )
+        .unwrap_err();
+        assert!(error.contains("message changed"), "{error}");
     }
 
     #[test]

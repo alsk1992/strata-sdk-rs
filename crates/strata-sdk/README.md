@@ -2,6 +2,11 @@
 
 The official async Rust client for live Strata markets and Sonar quotes.
 
+The official hosted API currently has market, exact-output, and asset-to-asset
+Sonar quotes enabled. The SDK still checks the live capability catalog before
+each gated operation; that is a runtime safety check, not an inactive-feature
+notice.
+
 ## Install
 
 ```toml
@@ -82,6 +87,8 @@ Gross route output for an external route-quality comparison is exactly
 | `platform_maker_status_for_wallet(...)` (also `platform_maker_status(signer)`) | A maker's products, exposure, health, and kill state — public by wallet address, no signature |
 | `platform_maker_reputation_for_wallet(...)` (also `platform_maker_reputation(signer)`) | A maker's reliability, tier, and signed-quote eligibility — public by wallet address |
 | `connect_maker_for_wallet(...)` (also `connect_maker(signer)`) | Sequenced maker fill and exposure stream — public by wallet address |
+| `platform_maker_start(...)` / `platform_maker_stop(...)` | Label-aware maker quickstart: decimal size, safe defaults, byte-exact verification, external signing, idempotent submission, and chain-derived confirmation |
+| `platform_maker_quickstart_prepare(...)` / `platform_maker_submit_prepared(...)` | Split the same verified flow across an external wallet bridge |
 | `platform_maker_strand_prepare(...)` / `platform_maker_strand_submit(...)` | Prepare and submit externally signed Strand upsert, recenter, enable/disable, or cancel actions |
 | `platform_maker_current_prepare(...)` / `platform_maker_current_submit(...)` | Prepare and submit externally signed Current upsert or cancel actions |
 | `platform_rewards(...)` / `platform_referrals(...)` | Public community and owner-scoped state |
@@ -106,9 +113,60 @@ Gross route output for an external route-quality comparison is exactly
 
 ## Manage Strands and Currents
 
-Both maker products use the same custody-safe flow: request exact transaction
-bytes, verify and sign those bytes outside Strata, then submit the signed
-transaction with an idempotency key. The Rust SDK exposes every live control:
+The high-level Rust path takes human inputs and hides product arrays, token
+atoms, market IDs, tick math, expiry slots, and confirmation polling:
+
+```rust
+use strata_public_contract::PlatformMakerControlProduct;
+use strata_sdk::{
+    PlatformMakerQuickstartRequest, PlatformMakerQuickstartSide, StrataClient,
+};
+
+# async fn run() -> Result<(), Box<dyn std::error::Error>> {
+# let strata = StrataClient::production()?;
+# let maker_signer = todo!("implement MakerTransactionSigner with your wallet or HSM");
+let live = strata
+    .platform_maker_start(
+        &PlatformMakerQuickstartRequest {
+            market: "SOL/USDC".into(),
+            product: PlatformMakerControlProduct::Current,
+            spread_bps: 5,
+            size: "0.01 SOL".into(),
+            duration: Some("10m".into()),
+            levels: None,          // defaults to three
+            level_step_bps: None,  // defaults to spread_bps
+            side: PlatformMakerQuickstartSide::Both,
+            async_only: false,
+        },
+        &maker_signer,
+        None,
+    )
+    .await?;
+
+println!("confirmed at slot {}", live.maker_status.current_slot);
+
+strata
+    .platform_maker_stop(
+        "SOL/USDC",
+        PlatformMakerControlProduct::Current,
+        &maker_signer,
+        None,
+    )
+    .await?;
+# Ok(())
+# }
+```
+
+`MakerTransactionSigner` exposes only a public key and one
+`sign_transaction(...)` callback. Before calling it, the SDK decodes the exact
+legacy Solana transaction and checks its signer, market, action, expiry, spread,
+depth, exposure, and every other economic field. `platform_maker_start` returns
+only after the chain-derived status matches; `platform_maker_stop` skips signing
+when the product is already absent.
+
+Both maker products also expose every low-level control. Request exact
+transaction bytes, verify and sign those bytes outside Strata, then submit the
+signed transaction with an idempotency key:
 
 ```rust
 use strata_public_contract::{
@@ -157,9 +215,17 @@ let _current = strata
 ```
 
 Upserts use `PlatformMakerStrandPrepareRequest::Upsert` or
-`PlatformMakerCurrentPrepareRequest::Upsert`. Amounts are base-asset atoms,
+`PlatformMakerCurrentPrepareRequest::Upsert`. Current bands are priced from
+the market's live Strata mark; no separate oracle publisher is required.
+Amounts are base-asset atoms,
 encoded as unsigned decimal strings. `platform_maker_status_for_wallet(...)`
 reports the resulting live controls, remaining exposure, expiry, and health.
+
+For maker funding, initialize the market Vault if needed, submit the active
+Strand or Current, then use `platform_vault_deposit_prepare(...)` and
+`platform_vault_submit(...)`. Available collateral remains in that market while
+at least one control is live and returns to the canonical Vault balance after
+the final control is disabled, exhausted, expired, or cancelled.
 
 Token amounts use unsigned decimal strings in atomic units. The client validates
 contract compatibility, quote binding, lifetime, and economic fields before

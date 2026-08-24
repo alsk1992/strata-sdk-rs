@@ -18,5 +18,5 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
-strata-public-contract = { version = "0.2.4", path = "crates/strata-public-contract" }
-strata-sdk = { version = "0.2.4", path = "crates/strata-sdk" }
+strata-public-contract = { version = "0.2.5", path = "crates/strata-public-contract" }
+strata-sdk = { version = "0.2.5", path = "crates/strata-sdk" }
