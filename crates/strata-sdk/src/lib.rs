@@ -2341,7 +2341,7 @@ impl StrataClient {
         let request = normalize_strand_prepare_request(request)?;
         let prepared: PlatformMakerControlPrepareResponse = self
             .post(
-                &format!("v2/markets/{market_id}/makers/strands/prepare"),
+                &format!("v2/markets/{market_id}/makers/strands/prepare?transaction_version=0"),
                 &request,
             )
             .await?;
@@ -2374,7 +2374,7 @@ impl StrataClient {
         let request = normalize_current_prepare_request(request)?;
         let prepared: PlatformMakerControlPrepareResponse = self
             .post(
-                &format!("v2/markets/{market_id}/makers/currents/prepare"),
+                &format!("v2/markets/{market_id}/makers/currents/prepare?transaction_version=0"),
                 &request,
             )
             .await?;
@@ -7610,6 +7610,7 @@ mod tests {
             .and(path(format!(
                 "/v2/markets/{market_id}/makers/strands/prepare"
             )))
+            .and(query_param("transaction_version", "0"))
             .and(body_json(serde_json::json!({
                 "action": "cancel",
                 "maker_wallet": wallet,
@@ -7634,6 +7635,7 @@ mod tests {
             .and(path(format!(
                 "/v2/markets/{market_id}/makers/currents/prepare"
             )))
+            .and(query_param("transaction_version", "0"))
             .and(body_json(serde_json::json!({
                 "action": "cancel",
                 "maker_wallet": wallet,

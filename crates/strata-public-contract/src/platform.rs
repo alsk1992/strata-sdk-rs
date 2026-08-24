@@ -2487,8 +2487,9 @@ pub struct PlatformMakerControlPrepareResponse {
     pub maker_wallet: String,
     pub product: PlatformMakerControlProduct,
     pub action: PlatformMakerControlAction,
-    /// Unsigned legacy Solana transaction. The maker verifies the exact
-    /// instruction and fills its only signature slot externally.
+    /// Unsigned Solana transaction in the format negotiated by the prepare
+    /// endpoint. The maker verifies the exact instruction and fills its only
+    /// signature slot externally.
     pub transaction_base64: String,
     pub recent_blockhash: String,
     pub last_valid_block_height: u64,
