@@ -159,10 +159,11 @@ strata
 
 `MakerTransactionSigner` exposes only a public key and one
 `sign_transaction(...)` callback. Before calling it, the SDK decodes the exact
-legacy Solana transaction and checks its signer, market, action, expiry, spread,
-depth, exposure, and every other economic field. `platform_maker_start` returns
-only after the chain-derived status matches; `platform_maker_stop` skips signing
-when the product is already absent.
+native-v0 Solana transaction and checks its signer, market, action, expiry,
+spread, depth, exposure, and every other economic field. After signing it also
+proves the message is still byte-identical before submission.
+`platform_maker_start` returns only after the chain-derived status matches;
+`platform_maker_stop` skips signing when the product is already absent.
 
 Both maker products also expose every low-level control. Request exact
 transaction bytes, verify and sign those bytes outside Strata, then submit the

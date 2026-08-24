@@ -2556,6 +2556,7 @@ impl StrataClient {
             &maker_wallet,
             request,
             &base_asset,
+            &market.label,
             current_slot,
             mark_price,
             tick_size,
@@ -3415,14 +3416,15 @@ impl StrataClient {
             .sign_transaction(&prepared.transaction_base64)
             .await
             .map_err(SdkError::Signer)?;
+        let signed_transaction =
+            canonical_base64(&signed_transaction, "signed_transaction_base64")?;
+        verify_signed_transaction_message(&prepared.transaction_base64, &signed_transaction)
+            .map_err(SdkError::Verification)?;
         self.twap_submit(
             &market_id,
             PlatformTwapSubmitRequest {
                 twap_control_id: prepared.twap_control_id.clone(),
-                signed_transaction_base64: canonical_base64(
-                    &signed_transaction,
-                    "signed_transaction_base64",
-                )?,
+                signed_transaction_base64: signed_transaction,
                 idempotency_key: normalize_idempotency_key(
                     idempotency_key.unwrap_or(&prepared.twap_control_id),
                 )?,
@@ -3489,6 +3491,8 @@ impl StrataClient {
             .map_err(SdkError::Signer)?;
         let signed_transaction =
             canonical_base64(&signed_transaction, "signed_transaction_base64")?;
+        verify_signed_transaction_message(&prepared.transaction_base64, &signed_transaction)
+            .map_err(SdkError::Verification)?;
         self.order_submit(
             &market_id,
             PlatformOrderSubmitRequest {
@@ -3574,13 +3578,10 @@ impl StrataClient {
             .sign_transaction(&prepared.transaction_base64)
             .await
             .map_err(SdkError::Signer)?;
-        base64::engine::general_purpose::STANDARD
-            .decode(signed_transaction.trim())
-            .map_err(|_| {
-                SdkError::InvalidResponse(
-                    "session signer returned an invalid base64 transaction".to_owned(),
-                )
-            })?;
+        let signed_transaction =
+            canonical_base64(&signed_transaction, "signed_transaction_base64")?;
+        verify_signed_transaction_message(&prepared.transaction_base64, &signed_transaction)
+            .map_err(SdkError::Verification)?;
         let idempotency_key =
             normalize_idempotency_key(idempotency_key.unwrap_or(&prepared.execution_id))?;
         let submitted: ExecutionSubmitResponse = self
@@ -3905,18 +3906,29 @@ fn maker_duration_slots(duration: Option<&str>) -> Result<u64, SdkError> {
         .ok_or_else(|| SdkError::InvalidRequest("duration exceeds slot range".to_owned()))
 }
 
-fn human_base_atoms(value: &str, asset: &PlatformAsset) -> Result<u64, SdkError> {
+fn human_base_atoms(
+    value: &str,
+    asset: &PlatformAsset,
+    market_label: &str,
+) -> Result<u64, SdkError> {
+    let market_symbol = market_label.split_once('/').and_then(|(base, quote)| {
+        (!base.trim().is_empty() && !quote.trim().is_empty()).then(|| base.trim())
+    });
+    let display_symbol = market_symbol.unwrap_or(&asset.symbol);
     let fields: Vec<&str> = value.split_whitespace().collect();
     if fields.is_empty() || fields.len() > 2 {
         return Err(SdkError::InvalidRequest(format!(
             "size must be an exact {} amount, for example 0.01 {}",
-            asset.symbol, asset.symbol
+            display_symbol, display_symbol
         )));
     }
-    if fields.len() == 2 && !fields[1].eq_ignore_ascii_case(&asset.symbol) {
+    if fields.len() == 2
+        && !fields[1].eq_ignore_ascii_case(&asset.symbol)
+        && !market_symbol.is_some_and(|symbol| fields[1].eq_ignore_ascii_case(symbol))
+    {
         return Err(SdkError::InvalidRequest(format!(
             "size is denominated in {}, not {}",
-            asset.symbol, fields[1]
+            display_symbol, fields[1]
         )));
     }
     let mut parts = fields[0].split('.');
@@ -3978,6 +3990,7 @@ fn maker_quickstart_operation(
     maker_wallet: &str,
     request: &PlatformMakerQuickstartRequest,
     base_asset: &PlatformAsset,
+    market_label: &str,
     current_slot: u64,
     mark_price: u64,
     tick_size: u64,
@@ -4010,7 +4023,7 @@ fn maker_quickstart_operation(
             "the furthest maker level exceeds 65,535 bps".to_owned(),
         ));
     }
-    let size = human_base_atoms(&request.size, base_asset)?;
+    let size = human_base_atoms(&request.size, base_asset, market_label)?;
     let valid_until_slot = current_slot
         .checked_add(maker_duration_slots(request.duration.as_deref())?)
         .ok_or_else(|| SdkError::InvalidRequest("duration exceeds slot range".to_owned()))?;
@@ -8891,7 +8904,32 @@ mod tests {
 
         async fn sign_transaction(&self, transaction_base64: &str) -> Result<String, String> {
             assert_eq!(transaction_base64, self.expected_transaction);
-            Ok("BQYHCA==".to_owned())
+            Ok(transaction_base64.to_owned())
+        }
+    }
+
+    struct MessageMutatingSigner {
+        expected_transaction: String,
+    }
+
+    #[async_trait]
+    impl SessionSigner for MessageMutatingSigner {
+        fn public_key(&self) -> &str {
+            transaction_verifier::test_support::SESSION_PUBLIC_KEY
+        }
+
+        async fn sign_message(&self, _message: &[u8]) -> Result<Vec<u8>, String> {
+            panic!("one-signature path must not sign a message");
+        }
+
+        async fn sign_transaction(&self, transaction_base64: &str) -> Result<String, String> {
+            assert_eq!(transaction_base64, self.expected_transaction);
+            let mut transaction = base64::engine::general_purpose::STANDARD
+                .decode(transaction_base64)
+                .unwrap();
+            let last = transaction.last_mut().unwrap();
+            *last ^= 1;
+            Ok(base64::engine::general_purpose::STANDARD.encode(transaction))
         }
     }
 
@@ -8990,14 +9028,14 @@ mod tests {
                 "size_atoms": PLACE_SIZE.to_string()
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(prepared))
-            .expect(2)
+            .expect(3)
             .mount(&server)
             .await;
         Mock::given(method("POST"))
             .and(path(format!("/v2/markets/{market_id}/orders/submit")))
             .and(body_json(serde_json::json!({
                 "order_control_id": "or_44444444444444444444444444444444",
-                "signed_transaction_base64": "BQYHCA==",
+                "signed_transaction_base64": transaction,
                 "idempotency_key": "or_44444444444444444444444444444444"
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(submitted))
@@ -9008,7 +9046,7 @@ mod tests {
         let client = StrataClient::new(server.uri()).unwrap();
         seed_platform_capabilities(&client);
         let signer = OneSignatureSigner {
-            expected_transaction: transaction,
+            expected_transaction: transaction.clone(),
         };
         let operation = OrderExecuteOperation::Place {
             owner_wallet: OWNER_WALLET.to_owned(),
@@ -9045,6 +9083,24 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(*recording.seen.lock().unwrap(), vec!["order".to_owned()]);
+
+        let error = client
+            .execute_order(
+                &market_id,
+                &operation,
+                &MessageMutatingSigner {
+                    expected_transaction: transaction,
+                },
+                &DefaultTransactionVerifier,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            SdkError::Verification(message)
+                if message.contains("signed transaction message changed after verification")
+        ));
     }
 
     #[tokio::test]
@@ -9136,9 +9192,14 @@ mod tests {
 
     #[tokio::test]
     async fn execute_twap_uses_the_direct_prepare_body_and_one_signature() {
-        use transaction_verifier::test_support::{OWNER_WALLET, SESSION_PUBLIC_KEY};
+        use transaction_verifier::test_support::{
+            place_transaction, PlaceTransactionOptions, OWNER_WALLET, SESSION_PUBLIC_KEY,
+        };
         let server = MockServer::start().await;
         let market_id = "market_22222222222222222222222222222222";
+        let transaction = place_transaction(PlaceTransactionOptions::default());
+        let mut prepared = fixture("twap-prepare");
+        prepared["transaction_base64"] = serde_json::json!(transaction);
         Mock::given(method("POST"))
             .and(path(format!("/v2/markets/{market_id}/twaps/prepare")))
             .and(body_json(serde_json::json!({
@@ -9152,7 +9213,7 @@ mod tests {
                 "interval_slots": 100,
                 "limit_price_atoms": "150000000"
             })))
-            .respond_with(ResponseTemplate::new(200).set_body_json(fixture("twap-prepare")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(prepared))
             .expect(1)
             .mount(&server)
             .await;
@@ -9160,7 +9221,7 @@ mod tests {
             .and(path(format!("/v2/markets/{market_id}/twaps/submit")))
             .and(body_json(serde_json::json!({
                 "twap_control_id": "twctl_44444444444444444444444444444444",
-                "signed_transaction_base64": "BQYHCA==",
+                "signed_transaction_base64": transaction,
                 "idempotency_key": "twap-attempt-7"
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(fixture("twap-submit")))
@@ -9171,7 +9232,7 @@ mod tests {
         let client = StrataClient::new(server.uri()).unwrap();
         seed_platform_capabilities(&client);
         let signer = OneSignatureSigner {
-            expected_transaction: "AQ==".to_owned(),
+            expected_transaction: transaction,
         };
         let recording = RecordingVerifier {
             market_id: market_id.to_owned(),
@@ -9227,7 +9288,7 @@ mod tests {
             .and(path("/sonar/markets/sol-usdc/execution/submit"))
             .and(body_json(serde_json::json!({
                 "execution_id": prepared["execution_id"],
-                "signed_transaction_base64": "BQYHCA==",
+                "signed_transaction_base64": prepared["transaction_base64"],
                 "idempotency_key": prepared["execution_id"]
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(fixture("execution-submit")))
@@ -9489,11 +9550,13 @@ mod tests {
     #[test]
     fn maker_quickstart_derives_current_atoms_levels_and_expiry() {
         let assets: PlatformAssetsResponse = serde_json::from_value(fixture("assets")).unwrap();
-        let base_asset = assets
+        let mut base_asset = assets
             .assets
             .into_iter()
             .find(|asset| asset.symbol == "SOL")
             .unwrap();
+        base_asset.symbol = "WSOL".to_owned();
+        base_asset.name = "Wrapped SOL".to_owned();
         let request = PlatformMakerQuickstartRequest {
             market: "SOL/USDC".to_owned(),
             product: PlatformMakerControlProduct::Current,
@@ -9509,11 +9572,17 @@ mod tests {
             "5Ji61Fbeb22Yntgv1hhHeSSLgdEdZchHeM1Tv1MjGhSL",
             &request,
             &base_asset,
+            &request.market,
             1_000,
             150_000_000,
             10_000,
         )
         .unwrap();
+        assert_eq!(
+            human_base_atoms("0.01 WSOL", &base_asset, &request.market).unwrap(),
+            10_000_000
+        );
+        assert!(human_base_atoms("0.01 BTC", &base_asset, &request.market).is_err());
         let PlatformMakerQuickstartOperation::Current(PlatformMakerCurrentPrepareRequest::Upsert {
             max_exposure_base_atoms,
             bid_depth_base_atoms,
