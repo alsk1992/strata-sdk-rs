@@ -91,6 +91,8 @@ Gross route output for an external route-quality comparison is exactly
 | `platform_maker_quickstart_prepare(...)` / `platform_maker_submit_prepared(...)` | Split the same verified flow across an external wallet bridge |
 | `platform_maker_strand_prepare(...)` / `platform_maker_strand_submit(...)` | Prepare and submit externally signed Strand upsert, recenter, enable/disable, or cancel actions |
 | `platform_maker_current_prepare(...)` / `platform_maker_current_submit(...)` | Prepare and submit externally signed Current upsert or cancel actions |
+| `platform_maker_intent_prepare(...)` / `platform_maker_intent_submit(...)` | Prepare and submit a sponsored Vault-session post or permanent revoke for an existing curated IntentBook seat |
+| `platform_maker_intent_execute(...)` | Verify, session-sign, and submit that exact IntentBook packet in one call |
 | `platform_rewards(...)` / `platform_referrals(...)` | Public community and owner-scoped state |
 | `platform_bugs(...)` / `platform_bug_submit(...)` | Signed public bug-report workflow |
 | `capabilities()` | Features currently available through the public contract |
@@ -221,6 +223,14 @@ the market's live Strata mark; no separate oracle publisher is required.
 Amounts are base-asset atoms,
 encoded as unsigned decimal strings. `platform_maker_status_for_wallet(...)`
 reports the resulting live controls, remaining exposure, expiry, and health.
+
+Existing curated IntentBook seats use `PlatformMakerIntentPrepareRequest` with
+`platform_maker_intent_prepare(...)` / `platform_maker_intent_submit(...)`, or
+the one-call `platform_maker_intent_execute(...)`. The built-in
+`DefaultTransactionVerifier` binds the Vault, owner, session, market, intent,
+account roles, side, price band, and maximum fill before the session signs.
+Strata pays the network fee and records it for bounded recovery from a later
+deposit. `Revoke` permanently closes that curated seat; it is not a pause.
 
 For maker funding, initialize the market Vault if needed, submit the active
 Strand or Current, then use `platform_vault_deposit_prepare(...)` and

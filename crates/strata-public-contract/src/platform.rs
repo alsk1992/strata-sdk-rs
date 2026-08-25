@@ -2303,7 +2303,7 @@ pub struct PlatformMakerSignedQuote {
 #[serde(deny_unknown_fields)]
 pub struct PlatformMakerIntentStatus {
     pub active: bool,
-    pub side: PlatformMakerSide,
+    pub side: PlatformMakerIntentSide,
     pub minimum_price_atoms: String,
     pub maximum_price_atoms: String,
     pub maximum_fill_size_atoms: String,
@@ -2529,6 +2529,80 @@ pub struct PlatformMakerControlSubmitResponse {
     pub action: PlatformMakerControlAction,
     pub signature: String,
     pub status: PlatformMakerControlSubmissionStatus,
+}
+
+/// Side exposed by the existing on-chain IntentRecord. `Both` commits the
+/// same maker seat on both sides and is cap-checked against both assets.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlatformMakerIntentSide {
+    Buy,
+    Sell,
+    Both,
+}
+
+/// Vault-session control of an already admin-registered IntentRecord. This
+/// does not create a new intent product or registration mechanism: it exposes
+/// the existing post/revoke lifecycle through the owner's approved session.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PlatformMakerIntentPrepareRequest {
+    Post {
+        market_id: String,
+        owner_wallet: String,
+        session_public_key: String,
+        side: PlatformMakerIntentSide,
+        min_price_atoms: String,
+        max_price_atoms: String,
+        max_fill_size_atoms: String,
+    },
+    Revoke {
+        market_id: String,
+        owner_wallet: String,
+        session_public_key: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlatformMakerIntentAction {
+    Post,
+    Revoke,
+}
+
+/// Canonical sponsored Vault transaction. The external session verifies the
+/// echoed bindings and fills only its signature slot; the owner wallet does
+/// not sign each intent update.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlatformMakerIntentPrepareResponse {
+    pub schema_version: u16,
+    pub contract_version: String,
+    pub market_id: String,
+    pub owner_wallet: String,
+    pub vault_address: String,
+    pub session_public_key: String,
+    pub intent_address: String,
+    pub action: PlatformMakerIntentAction,
+    pub transaction_base64: String,
+    pub recent_blockhash: String,
+    pub last_valid_block_height: u64,
+    pub expires_at_ms: u64,
+    /// Strata is the fee payer. The confirmed network cost is recorded for
+    /// bounded recovery from a later owner deposit.
+    pub sponsored: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlatformMakerIntentSubmitRequest {
+    pub signed_transaction_base64: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlatformMakerIntentSubmitResponse {
+    pub signature: String,
 }
 
 /// Which Strata maker product produced a maker-side fill.
@@ -2827,7 +2901,7 @@ mod tests {
         assert_eq!(service_status.status, PlatformServiceState::Operational);
         assert_eq!(service_status.available_operations, 59);
         assert_eq!(graph.entry_operation_id, "platform.capabilities.read");
-        assert_eq!(graph.operations.len(), 69);
+        assert_eq!(graph.operations.len(), 70);
         assert_eq!(maker_reputation.tier, PlatformMakerReputationTier::Gold);
         assert_eq!(maker_status.active_products, 3);
         match &maker_stream {
