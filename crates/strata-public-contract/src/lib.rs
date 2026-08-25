@@ -503,6 +503,16 @@ impl CapabilityCatalog {
                     McpSubmit,
                 ),
                 capability(
+                    "mm.intent.manage",
+                    "1.1",
+                    Beta,
+                    "mm:write",
+                    Submit,
+                    false,
+                    true,
+                    McpSubmit,
+                ),
+                capability(
                     "mm.strand.manage",
                     "1.1",
                     Beta,
