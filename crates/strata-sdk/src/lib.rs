@@ -19,8 +19,8 @@ pub use order_stream::{
     DeadManGuard, OrderChallengeResult, OrderCommandStream, ORDER_STREAM_AUTH_DOMAIN,
 };
 pub use transaction_verifier::{
-    decode_transaction, verify_execution_transaction, verify_maker_transaction,
-    verify_intent_transaction, verify_order_transaction, verify_signed_transaction_message,
+    decode_transaction, verify_execution_transaction, verify_intent_transaction,
+    verify_maker_transaction, verify_order_transaction, verify_signed_transaction_message,
     verify_twap_transaction, DecodedInstruction, DecodedTransaction, DefaultTransactionVerifier,
     TransactionVersion,
 };
@@ -56,12 +56,11 @@ pub use strata_public_contract::platform::{
     PlatformMakerIntentPrepareResponse, PlatformMakerIntentSide, PlatformMakerIntentSubmitRequest,
     PlatformMakerIntentSubmitResponse, PlatformMakerProduct, PlatformMakerReputationResponse,
     PlatformMakerReputationTier, PlatformMakerStatusResponse, PlatformMakerStrandPrepareRequest,
-    PlatformMakerTierProgress,
-    PlatformMarkResponse, PlatformMarket, PlatformMarketAction, PlatformMarketDataEvent,
-    PlatformMarketState, PlatformMarketStatusResponse, PlatformMarketsResponse, PlatformOperation,
-    PlatformOperationTransport, PlatformOrderAction, PlatformOrderBatchOperation,
-    PlatformOrderChallengeRequest, PlatformOrderChallengeResponse, PlatformOrderCommand,
-    PlatformOrderCommandBatchEvent, PlatformOrderCommandBatchFormat,
+    PlatformMakerTierProgress, PlatformMarkResponse, PlatformMarket, PlatformMarketAction,
+    PlatformMarketDataEvent, PlatformMarketState, PlatformMarketStatusResponse,
+    PlatformMarketsResponse, PlatformOperation, PlatformOperationTransport, PlatformOrderAction,
+    PlatformOrderBatchOperation, PlatformOrderChallengeRequest, PlatformOrderChallengeResponse,
+    PlatformOrderCommand, PlatformOrderCommandBatchEvent, PlatformOrderCommandBatchFormat,
     PlatformOrderCommandClientFrame, PlatformOrderCommandEvent, PlatformOrderCommandServerFrame,
     PlatformOrderControlStatus, PlatformOrderPrepareAuthorization, PlatformOrderPrepareRequest,
     PlatformOrderPrepareResponse, PlatformOrderState, PlatformOrderStatusRequest,
@@ -2560,11 +2559,8 @@ impl StrataClient {
             .sign_transaction(&prepared.transaction_base64)
             .await
             .map_err(SdkError::Signer)?;
-        verify_signed_transaction_message(
-            &prepared.transaction_base64,
-            &signed_transaction_base64,
-        )
-        .map_err(SdkError::Verification)?;
+        verify_signed_transaction_message(&prepared.transaction_base64, &signed_transaction_base64)
+            .map_err(SdkError::Verification)?;
         self.platform_maker_intent_submit(
             &prepared.market_id,
             PlatformMakerIntentSubmitRequest {
