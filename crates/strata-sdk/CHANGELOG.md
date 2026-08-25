@@ -3,6 +3,12 @@
 All notable changes to the Strata SDKs (`@stratabook/sdk`, `@stratabook/mcp`,
 and the `strata-sdk` Rust crate) are recorded here. Versions move together.
 
+## 0.2.15
+
+- Add typed IntentBook prepare, submit, and one-call Vault-session execution.
+- Add exact transaction verification for the Vault envelope, owner, session,
+  market, intent account, roles, side, price band, and maximum fill.
+
 ## 0.2.14
 
 - Add exact, one-signature session rotation to Vault setup: revoke a named old

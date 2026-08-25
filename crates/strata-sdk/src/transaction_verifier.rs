@@ -28,8 +28,9 @@ use base64::Engine as _;
 
 use crate::{
     opaque_market_id, opaque_order_id, ExecutionVerificationContext, ExecutionVerifier,
-    MakerVerificationContext, OrderVerificationContext, OrderVerifier, PlatformMakerControlAction,
-    PlatformMakerCurrentPrepareRequest, PlatformMakerQuickstartOperation,
+    IntentVerificationContext, IntentVerifier, MakerVerificationContext, OrderVerificationContext,
+    OrderVerifier, PlatformMakerControlAction, PlatformMakerCurrentPrepareRequest,
+    PlatformMakerIntentPrepareRequest, PlatformMakerIntentSide, PlatformMakerQuickstartOperation,
     PlatformMakerStrandPrepareRequest, PlatformOrderBatchOperation, PlatformOrderChallengeRequest,
     PlatformOrderType, PlatformTradeSide, TwapVerificationContext, TwapVerifier,
 };
@@ -53,6 +54,8 @@ const DELEGATED_ENVELOPE_TAG: u8 = 3;
 /// Inner instruction tags a delegated order-control transaction may carry.
 const INNER_TAG_BALANCE: u8 = 1;
 const INNER_TAG_CANCEL_ORDER: u8 = 4;
+const INNER_TAG_INTENT_POST: u8 = 9;
+const INNER_TAG_INTENT_REVOKE: u8 = 10;
 const INNER_TAG_PLACE_ORDER: u8 = 33;
 const INNER_TAG_MARKET_ACCOUNT: u8 = 34;
 const INNER_TAG_TWAP_CANCEL: u8 = 36;
@@ -543,6 +546,9 @@ struct DelegatedInstruction {
     /// Base58 keys of the inner instruction's accounts, in order (`None` when
     /// an index points outside the static key table).
     inner_accounts: Vec<Option<String>>,
+    /// Registered-market and other policy accounts after the encoded inner
+    /// account list.
+    policy_accounts: Vec<Option<String>>,
 }
 
 struct StructuralOptions {
@@ -630,6 +636,10 @@ fn structural_checks(
             }
             Some(_) => {}
         }
+        let inner_account_count = usize::from(data[13]);
+        if instruction.account_indexes.len() < 6 + inner_account_count {
+            return Err("delegated instruction account list is truncated".to_owned());
+        }
         delegated.push(DelegatedInstruction {
             inner_tag: inner[0],
             inner,
@@ -637,6 +647,13 @@ fn structural_checks(
                 .account_indexes
                 .iter()
                 .skip(6)
+                .take(inner_account_count)
+                .map(|index| keys.get(usize::from(*index)).cloned())
+                .collect(),
+            policy_accounts: instruction
+                .account_indexes
+                .iter()
+                .skip(6 + inner_account_count)
                 .map(|index| keys.get(usize::from(*index)).cloned())
                 .collect(),
         });
@@ -956,6 +973,105 @@ pub fn verify_order_transaction(context: &OrderVerificationContext<'_>) -> Resul
     Ok(())
 }
 
+/// Deny-by-default verification of one Vault-session IntentBook mutation.
+pub fn verify_intent_transaction(context: &IntentVerificationContext<'_>) -> Result<(), String> {
+    let tx = decode_transaction(&context.prepared.transaction_base64)?;
+    if tx.version != TransactionVersion::Legacy || tx.address_table_lookup_count != 0 {
+        return Err("intent control must be a legacy transaction without lookups".to_owned());
+    }
+    if tx.num_required_signatures != 2 || tx.instructions.len() != 1 {
+        return Err("intent control must require only relay and session signatures".to_owned());
+    }
+    let delegated = structural_checks(
+        &tx,
+        context.session_public_key,
+        context.owner_wallet,
+        &context.prepared.recent_blockhash,
+        StructuralOptions {
+            allow_address_tables: false,
+            require_envelope: true,
+        },
+    )?;
+    if delegated.len() != 1 {
+        return Err("intent control must contain exactly one delegated instruction".to_owned());
+    }
+    let outer = &tx.instructions[0];
+    let key = |position: usize| {
+        outer
+            .account_indexes
+            .get(position)
+            .and_then(|index| tx.static_account_keys.get(usize::from(*index)))
+            .map(String::as_str)
+    };
+    if key(0) != Some(context.session_public_key)
+        || key(1) != Some(context.prepared.vault_address.as_str())
+        || key(4) != Some(context.owner_wallet)
+        || key(5) != tx.static_account_keys.first().map(String::as_str)
+    {
+        return Err("intent control has invalid Vault-session bindings".to_owned());
+    }
+    let instruction = &delegated[0];
+    let inner_key = |position: usize| {
+        instruction
+            .inner_accounts
+            .get(position)
+            .and_then(Option::as_deref)
+    };
+    let market = inner_key(1).ok_or_else(|| "intent market is not static".to_owned())?;
+    if instruction.inner_accounts.len() != 4
+        || inner_key(0) != Some(context.prepared.vault_address.as_str())
+        || inner_key(2) != Some(context.prepared.intent_address.as_str())
+        || instruction.policy_accounts.len() != 1
+        || instruction.policy_accounts[0].as_deref() != Some(market)
+    {
+        return Err("intent control has invalid intent accounts".to_owned());
+    }
+    if opaque_market_id(market) != context.market_id {
+        return Err("intent control touches another market".to_owned());
+    }
+    let envelope = &outer.data;
+    let inner_length = usize::from(envelope[11]) | (usize::from(envelope[12]) << 8);
+    let roles_start = 14 + inner_length;
+    let roles = envelope
+        .get(roles_start..roles_start + usize::from(envelope[13]))
+        .ok_or_else(|| "intent control account roles are truncated".to_owned())?;
+    if roles != [1, 0, 2, 2] {
+        return Err("intent control has invalid account roles".to_owned());
+    }
+    match context.operation {
+        PlatformMakerIntentPrepareRequest::Revoke { .. } => {
+            if instruction.inner_tag != INNER_TAG_INTENT_REVOKE || instruction.inner.len() != 1 {
+                return Err("intent control is not the requested revoke".to_owned());
+            }
+        }
+        PlatformMakerIntentPrepareRequest::Post {
+            side,
+            min_price_atoms,
+            max_price_atoms,
+            max_fill_size_atoms,
+            ..
+        } => {
+            let side = match side {
+                PlatformMakerIntentSide::Buy => 0,
+                PlatformMakerIntentSide::Sell => 1,
+                PlatformMakerIntentSide::Both => 2,
+            };
+            if instruction.inner_tag != INNER_TAG_INTENT_POST
+                || instruction.inner.len() != 33
+                || instruction.inner[1] != side
+                || instruction.inner[2..9] != [0u8; 7]
+                || read_u64(&instruction.inner, 9)? != atoms(min_price_atoms, "min_price_atoms")?
+                || read_u64(&instruction.inner, 17)? != atoms(max_price_atoms, "max_price_atoms")?
+                || read_u64(&instruction.inner, 25)?
+                    != atoms(max_fill_size_atoms, "max_fill_size_atoms")?
+            {
+                return Err("intent control does not post the requested economics".to_owned());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Structural verification of a prepared TWAP-control transaction: session
 /// co-signs only delegated TWAP instructions and never pays; the bound TWAP
 /// economics are checked against the echoed prepare fields by the client.
@@ -1024,6 +1140,13 @@ impl OrderVerifier for DefaultTransactionVerifier {
 }
 
 #[async_trait]
+impl IntentVerifier for DefaultTransactionVerifier {
+    async fn verify(&self, context: &IntentVerificationContext<'_>) -> Result<(), String> {
+        verify_intent_transaction(context)
+    }
+}
+
+#[async_trait]
 impl TwapVerifier for DefaultTransactionVerifier {
     async fn verify(&self, context: &TwapVerificationContext<'_>) -> Result<(), String> {
         verify_twap_transaction(context)
@@ -1084,6 +1207,14 @@ pub(crate) mod test_support {
 
     pub(crate) fn recent_blockhash() -> String {
         bs58::encode(RECENT_BLOCKHASH).into_string()
+    }
+
+    pub(crate) fn vault_address() -> String {
+        bs58::encode(VAULT_PDA).into_string()
+    }
+
+    pub(crate) fn intent_address() -> String {
+        bs58::encode(ORDER_PDA).into_string()
     }
 
     fn compact(mut value: usize) -> Vec<u8> {
@@ -1203,6 +1334,71 @@ pub(crate) mod test_support {
             message.extend_from_slice(instruction);
         }
         message.extend(compact(0));
+        let mut wire = compact(2);
+        wire.extend_from_slice(&[0u8; 128]);
+        wire.extend_from_slice(&message);
+        base64::engine::general_purpose::STANDARD.encode(wire)
+    }
+
+    /// A compact legacy transaction carrying only one sponsored Vault-session
+    /// IntentBook post. The advanced fill transaction is separate and retains
+    /// the production ALT/lattice packing path.
+    pub(crate) fn intent_transaction(side: u8) -> String {
+        let session = key(SESSION_PUBLIC_KEY);
+        let owner = key(OWNER_WALLET);
+        let keys = vec![
+            FEE_PAYER,
+            session,
+            DELEGATE_PDA,
+            ORDER_PDA,
+            USER_ACCOUNT,
+            VAULT_PDA,
+            STRATA_PROGRAM,
+            owner,
+            MARKET_PDA,
+            VAULT_PROGRAM,
+        ];
+        let at = |wanted: [u8; 32]| -> u8 {
+            keys.iter()
+                .position(|candidate| *candidate == wanted)
+                .unwrap() as u8
+        };
+        let mut inner = vec![INNER_TAG_INTENT_POST, side];
+        inner.extend_from_slice(&[0; 7]);
+        inner.extend_from_slice(&149_000_000u64.to_le_bytes());
+        inner.extend_from_slice(&151_000_000u64.to_le_bytes());
+        inner.extend_from_slice(&PLACE_SIZE.to_le_bytes());
+        let mut data = vec![DELEGATED_ENVELOPE_TAG];
+        data.extend_from_slice(&0u64.to_le_bytes());
+        data.extend_from_slice(&[0, 0]);
+        data.extend_from_slice(&(inner.len() as u16).to_le_bytes());
+        data.push(4);
+        data.extend_from_slice(&inner);
+        data.extend_from_slice(&[1, 0, 2, 2]);
+        // fixed: session, Vault, delegate, Strata, owner, relay; inner four;
+        // registered-market policy account.
+        let accounts = [
+            at(session),
+            at(VAULT_PDA),
+            at(DELEGATE_PDA),
+            at(STRATA_PROGRAM),
+            at(owner),
+            at(FEE_PAYER),
+            at(VAULT_PDA),
+            at(MARKET_PDA),
+            at(ORDER_PDA),
+            at(USER_ACCOUNT),
+            at(MARKET_PDA),
+        ];
+        let compiled = instruction(at(VAULT_PROGRAM), &accounts, &data);
+        let mut message = vec![2, 1, 5];
+        message.extend(compact(keys.len()));
+        for key in &keys {
+            message.extend_from_slice(key);
+        }
+        message.extend_from_slice(&RECENT_BLOCKHASH);
+        message.extend(compact(1));
+        message.extend(compiled);
         let mut wire = compact(2);
         wire.extend_from_slice(&[0u8; 128]);
         wire.extend_from_slice(&message);
@@ -1395,6 +1591,59 @@ mod tests {
         })
         .unwrap_err();
         assert!(error.contains("blockhash"), "{error}");
+    }
+
+    #[test]
+    fn built_in_intent_verifier_binds_the_complete_post() {
+        let operation = PlatformMakerIntentPrepareRequest::Post {
+            market_id: market_id(),
+            owner_wallet: OWNER_WALLET.to_owned(),
+            session_public_key: SESSION_PUBLIC_KEY.to_owned(),
+            side: PlatformMakerIntentSide::Both,
+            min_price_atoms: "149000000".to_owned(),
+            max_price_atoms: "151000000".to_owned(),
+            max_fill_size_atoms: PLACE_SIZE.to_string(),
+        };
+        let prepared = crate::PlatformMakerIntentPrepareResponse {
+            schema_version: 2,
+            contract_version: "2.0".to_owned(),
+            market_id: market_id(),
+            owner_wallet: OWNER_WALLET.to_owned(),
+            vault_address: vault_address(),
+            session_public_key: SESSION_PUBLIC_KEY.to_owned(),
+            intent_address: intent_address(),
+            action: crate::PlatformMakerIntentAction::Post,
+            transaction_base64: intent_transaction(2),
+            recent_blockhash: recent_blockhash(),
+            last_valid_block_height: 400_000_000,
+            expires_at_ms: 1_786_550_460_000,
+            sponsored: true,
+        };
+        let market_id = market_id();
+        {
+            let context = IntentVerificationContext {
+                market_id: &market_id,
+                operation: &operation,
+                prepared: &prepared,
+                owner_wallet: OWNER_WALLET,
+                session_public_key: SESSION_PUBLIC_KEY,
+            };
+            verify_intent_transaction(&context).unwrap();
+        }
+
+        let changed = crate::PlatformMakerIntentPrepareResponse {
+            transaction_base64: intent_transaction(0),
+            ..prepared
+        };
+        let changed_context = IntentVerificationContext {
+            market_id: &market_id,
+            operation: &operation,
+            prepared: &changed,
+            owner_wallet: OWNER_WALLET,
+            session_public_key: SESSION_PUBLIC_KEY,
+        };
+        let error = verify_intent_transaction(&changed_context).unwrap_err();
+        assert!(error.contains("requested economics"), "{error}");
     }
 
     #[test]

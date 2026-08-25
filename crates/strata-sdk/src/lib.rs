@@ -19,9 +19,10 @@ pub use order_stream::{
     DeadManGuard, OrderChallengeResult, OrderCommandStream, ORDER_STREAM_AUTH_DOMAIN,
 };
 pub use transaction_verifier::{
-    decode_transaction, verify_execution_transaction, verify_maker_transaction,
-    verify_order_transaction, verify_signed_transaction_message, verify_twap_transaction,
-    DecodedInstruction, DecodedTransaction, DefaultTransactionVerifier, TransactionVersion,
+    decode_transaction, verify_execution_transaction, verify_intent_transaction,
+    verify_maker_transaction, verify_order_transaction, verify_signed_transaction_message,
+    verify_twap_transaction, DecodedInstruction, DecodedTransaction, DefaultTransactionVerifier,
+    TransactionVersion,
 };
 pub use twap_stream::TwapStream;
 
@@ -51,13 +52,15 @@ pub use strata_public_contract::platform::{
     PlatformMakerControlProduct, PlatformMakerControlSubmissionStatus,
     PlatformMakerControlSubmitRequest, PlatformMakerControlSubmitResponse,
     PlatformMakerCurrentPrepareRequest, PlatformMakerEvent, PlatformMakerFill,
-    PlatformMakerProduct, PlatformMakerReputationResponse, PlatformMakerReputationTier,
-    PlatformMakerStatusResponse, PlatformMakerStrandPrepareRequest, PlatformMakerTierProgress,
-    PlatformMarkResponse, PlatformMarket, PlatformMarketAction, PlatformMarketDataEvent,
-    PlatformMarketState, PlatformMarketStatusResponse, PlatformMarketsResponse, PlatformOperation,
-    PlatformOperationTransport, PlatformOrderAction, PlatformOrderBatchOperation,
-    PlatformOrderChallengeRequest, PlatformOrderChallengeResponse, PlatformOrderCommand,
-    PlatformOrderCommandBatchEvent, PlatformOrderCommandBatchFormat,
+    PlatformMakerIntentAction, PlatformMakerIntentPrepareRequest,
+    PlatformMakerIntentPrepareResponse, PlatformMakerIntentSide, PlatformMakerIntentSubmitRequest,
+    PlatformMakerIntentSubmitResponse, PlatformMakerProduct, PlatformMakerReputationResponse,
+    PlatformMakerReputationTier, PlatformMakerStatusResponse, PlatformMakerStrandPrepareRequest,
+    PlatformMakerTierProgress, PlatformMarkResponse, PlatformMarket, PlatformMarketAction,
+    PlatformMarketDataEvent, PlatformMarketState, PlatformMarketStatusResponse,
+    PlatformMarketsResponse, PlatformOperation, PlatformOperationTransport, PlatformOrderAction,
+    PlatformOrderBatchOperation, PlatformOrderChallengeRequest, PlatformOrderChallengeResponse,
+    PlatformOrderCommand, PlatformOrderCommandBatchEvent, PlatformOrderCommandBatchFormat,
     PlatformOrderCommandClientFrame, PlatformOrderCommandEvent, PlatformOrderCommandServerFrame,
     PlatformOrderControlStatus, PlatformOrderPrepareAuthorization, PlatformOrderPrepareRequest,
     PlatformOrderPrepareResponse, PlatformOrderState, PlatformOrderStatusRequest,
@@ -289,6 +292,19 @@ pub trait SessionSigner: Send + Sync {
 
     /// Add only the session signature to an already-verified transaction.
     async fn sign_transaction(&self, transaction_base64: &str) -> Result<String, String>;
+}
+
+pub struct IntentVerificationContext<'a> {
+    pub market_id: &'a str,
+    pub operation: &'a PlatformMakerIntentPrepareRequest,
+    pub prepared: &'a PlatformMakerIntentPrepareResponse,
+    pub owner_wallet: &'a str,
+    pub session_public_key: &'a str,
+}
+
+#[async_trait]
+pub trait IntentVerifier: Send + Sync {
+    async fn verify(&self, context: &IntentVerificationContext<'_>) -> Result<(), String>;
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1471,11 +1487,11 @@ impl StrataClient {
                     canonical_public_key(wallet, "allowed_wallet_address").is_err()
                         || !allowed_wallets.insert(wallet.clone())
                 })
-            || ((response.withdrawal_access.mode == PlatformVaultWithdrawalMode::Restricted)
-                != !response
+            || (response.withdrawal_access.mode == PlatformVaultWithdrawalMode::Restricted)
+                == response
                     .withdrawal_access
                     .allowed_wallet_addresses
-                    .is_empty())
+                    .is_empty()
         {
             return Err(SdkError::InvalidResponse(
                 "Vault withdrawal access is inconsistent".to_owned(),
@@ -2401,6 +2417,157 @@ impl StrataClient {
             expected_action,
         )?;
         Ok(prepared)
+    }
+
+    /// Prepare one sponsored Vault-session update of an existing curated
+    /// IntentBook seat. The owner wallet does not sign each update.
+    pub async fn platform_maker_intent_prepare(
+        &self,
+        market_id: &str,
+        request: PlatformMakerIntentPrepareRequest,
+    ) -> Result<PlatformMakerIntentPrepareResponse, SdkError> {
+        self.require_platform_capability(
+            "mm.intent.manage",
+            CapabilityRisk::Submit,
+            PlatformTransport::Http,
+        )
+        .await?;
+        let market_id = validate_platform_market_id(market_id)?;
+        let request = normalize_intent_prepare_request(request, &market_id)?;
+        let (owner_wallet, session_public_key, expected_action) = match &request {
+            PlatformMakerIntentPrepareRequest::Post {
+                owner_wallet,
+                session_public_key,
+                ..
+            } => (
+                owner_wallet.as_str(),
+                session_public_key.as_str(),
+                PlatformMakerIntentAction::Post,
+            ),
+            PlatformMakerIntentPrepareRequest::Revoke {
+                owner_wallet,
+                session_public_key,
+                ..
+            } => (
+                owner_wallet.as_str(),
+                session_public_key.as_str(),
+                PlatformMakerIntentAction::Revoke,
+            ),
+        };
+        let prepared: PlatformMakerIntentPrepareResponse = self
+            .post(
+                &format!("v2/markets/{market_id}/makers/intents/prepare"),
+                &request,
+            )
+            .await?;
+        validate_platform_version(prepared.schema_version, &prepared.contract_version)?;
+        if prepared.market_id != market_id
+            || prepared.owner_wallet != owner_wallet
+            || prepared.session_public_key != session_public_key
+            || prepared.action != expected_action
+            || !prepared.sponsored
+        {
+            return Err(SdkError::InvalidResponse(
+                "maker-intent preparation does not match the request".to_owned(),
+            ));
+        }
+        canonical_public_key(&prepared.vault_address, "vault_address")?;
+        canonical_public_key(&prepared.intent_address, "intent_address")?;
+        canonical_base64(&prepared.transaction_base64, "transaction_base64")?;
+        canonical_base58_32(&prepared.recent_blockhash, "recent_blockhash")?;
+        if prepared.last_valid_block_height == 0 || prepared.expires_at_ms == 0 {
+            return Err(SdkError::InvalidResponse(
+                "maker-intent preparation has no live validity window".to_owned(),
+            ));
+        }
+        Ok(prepared)
+    }
+
+    /// Submit an exact session-signed intent packet. Exact retries during its
+    /// live blockhash window return the same confirmed transaction signature.
+    pub async fn platform_maker_intent_submit(
+        &self,
+        market_id: &str,
+        request: PlatformMakerIntentSubmitRequest,
+    ) -> Result<PlatformMakerIntentSubmitResponse, SdkError> {
+        self.require_platform_capability(
+            "mm.intent.manage",
+            CapabilityRisk::Submit,
+            PlatformTransport::Http,
+        )
+        .await?;
+        let market_id = validate_platform_market_id(market_id)?;
+        let request = PlatformMakerIntentSubmitRequest {
+            signed_transaction_base64: canonical_base64(
+                &request.signed_transaction_base64,
+                "signed_transaction_base64",
+            )?,
+        };
+        let response: PlatformMakerIntentSubmitResponse = self
+            .post(
+                &format!("v2/markets/{market_id}/makers/intents/submit"),
+                &request,
+            )
+            .await?;
+        canonical_signature(&response.signature, "signature")?;
+        Ok(response)
+    }
+
+    /// One-call intent control: prepare, verify, session-sign, and submit.
+    pub async fn platform_maker_intent_execute<
+        S: SessionSigner + ?Sized,
+        V: IntentVerifier + ?Sized,
+    >(
+        &self,
+        market_id: &str,
+        request: PlatformMakerIntentPrepareRequest,
+        signer: &S,
+        verifier: &V,
+    ) -> Result<PlatformMakerIntentSubmitResponse, SdkError> {
+        let session_public_key = canonical_public_key(signer.public_key(), "session_public_key")?;
+        let request_session = match &request {
+            PlatformMakerIntentPrepareRequest::Post {
+                session_public_key, ..
+            }
+            | PlatformMakerIntentPrepareRequest::Revoke {
+                session_public_key, ..
+            } => canonical_public_key(session_public_key, "session_public_key")?,
+        };
+        if request_session != session_public_key {
+            return Err(SdkError::InvalidRequest(
+                "intent session_public_key does not match signer".to_owned(),
+            ));
+        }
+        let prepared = self
+            .platform_maker_intent_prepare(market_id, request.clone())
+            .await?;
+        let owner_wallet = match &request {
+            PlatformMakerIntentPrepareRequest::Post { owner_wallet, .. }
+            | PlatformMakerIntentPrepareRequest::Revoke { owner_wallet, .. } => owner_wallet,
+        };
+        verifier
+            .verify(&IntentVerificationContext {
+                market_id: &prepared.market_id,
+                operation: &request,
+                prepared: &prepared,
+                owner_wallet,
+                session_public_key: &session_public_key,
+            })
+            .await
+            .map_err(SdkError::Verification)?;
+        let signed_transaction_base64 = signer
+            .sign_transaction(&prepared.transaction_base64)
+            .await
+            .map_err(SdkError::Signer)?;
+        verify_signed_transaction_message(&prepared.transaction_base64, &signed_transaction_base64)
+            .map_err(SdkError::Verification)?;
+        self.platform_maker_intent_submit(
+            &prepared.market_id,
+            PlatformMakerIntentSubmitRequest {
+                signed_transaction_base64,
+            },
+        )
+        .await
     }
 
     pub async fn platform_maker_strand_submit(
@@ -4426,6 +4593,77 @@ fn normalize_current_prepare_request(
         PlatformMakerCurrentPrepareRequest::Cancel { maker_wallet } => {
             PlatformMakerCurrentPrepareRequest::Cancel {
                 maker_wallet: canonical_public_key(&maker_wallet, "maker_wallet")?,
+            }
+        }
+    })
+}
+
+fn normalize_intent_prepare_request(
+    request: PlatformMakerIntentPrepareRequest,
+    expected_market_id: &str,
+) -> Result<PlatformMakerIntentPrepareRequest, SdkError> {
+    Ok(match request {
+        PlatformMakerIntentPrepareRequest::Post {
+            market_id,
+            owner_wallet,
+            session_public_key,
+            side,
+            min_price_atoms,
+            max_price_atoms,
+            max_fill_size_atoms,
+        } => {
+            let market_id = validate_platform_market_id(&market_id)?;
+            if market_id != expected_market_id {
+                return Err(SdkError::InvalidRequest(
+                    "intent request market_id does not match the route".to_owned(),
+                ));
+            }
+            let min_price_atoms =
+                canonical_request_atoms(&min_price_atoms, "min_price_atoms", false)?;
+            let max_price_atoms =
+                canonical_request_atoms(&max_price_atoms, "max_price_atoms", false)?;
+            if min_price_atoms.parse::<u64>().expect("canonical u64")
+                > max_price_atoms.parse::<u64>().expect("canonical u64")
+            {
+                return Err(SdkError::InvalidRequest(
+                    "min_price_atoms must not exceed max_price_atoms".to_owned(),
+                ));
+            }
+            PlatformMakerIntentPrepareRequest::Post {
+                market_id,
+                owner_wallet: canonical_public_key(&owner_wallet, "owner_wallet")?,
+                session_public_key: canonical_public_key(
+                    &session_public_key,
+                    "session_public_key",
+                )?,
+                side,
+                min_price_atoms,
+                max_price_atoms,
+                max_fill_size_atoms: canonical_request_atoms(
+                    &max_fill_size_atoms,
+                    "max_fill_size_atoms",
+                    false,
+                )?,
+            }
+        }
+        PlatformMakerIntentPrepareRequest::Revoke {
+            market_id,
+            owner_wallet,
+            session_public_key,
+        } => {
+            let market_id = validate_platform_market_id(&market_id)?;
+            if market_id != expected_market_id {
+                return Err(SdkError::InvalidRequest(
+                    "intent request market_id does not match the route".to_owned(),
+                ));
+            }
+            PlatformMakerIntentPrepareRequest::Revoke {
+                market_id,
+                owner_wallet: canonical_public_key(&owner_wallet, "owner_wallet")?,
+                session_public_key: canonical_public_key(
+                    &session_public_key,
+                    "session_public_key",
+                )?,
             }
         }
     })
