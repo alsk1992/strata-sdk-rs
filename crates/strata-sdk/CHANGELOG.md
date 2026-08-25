@@ -3,6 +3,11 @@
 All notable changes to the Strata SDKs (`@stratabook/sdk`, `@stratabook/mcp`,
 and the `strata-sdk` Rust crate) are recorded here. Versions move together.
 
+## 0.2.11
+
+- Coordinated release for the installed TypeScript maker-conformance CLI
+  entrypoint fix. Rust's public contracts remain unchanged.
+
 ## 0.2.10
 
 - Coordinated release for the public maker conformance runner. Rust's existing
