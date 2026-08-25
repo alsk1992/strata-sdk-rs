@@ -3,6 +3,14 @@
 All notable changes to the Strata SDKs (`@stratabook/sdk`, `@stratabook/mcp`,
 and the `strata-sdk` Rust crate) are recorded here. Versions move together.
 
+## 0.2.14
+
+- Add exact, one-signature session rotation to Vault setup: revoke a named old
+  delegate and approve the new delegate under the supplied owner policy in one
+  transaction.
+- Validate the echoed replacement identity and complete session policy before
+  returning a prepared transaction to callers.
+
 ## 0.2.12
 
 - Coordinated release for MCP 0.2.12's client-neutral, direct-use onboarding.

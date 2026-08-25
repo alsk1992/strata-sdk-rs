@@ -1219,6 +1219,11 @@ pub const PLATFORM_SESSION_MAX_SPENDING_LIMITS: usize = 4;
 pub struct PlatformVaultSetupPrepareRequest {
     pub wallet_address: String,
     pub session_public_key: String,
+    /// Optional old session key to revoke in the same transaction that
+    /// registers `session_public_key`. If it is already absent, setup still
+    /// succeeds. This makes local credential rotation one owner signature.
+    #[serde(default)]
+    pub replace_session_public_key: Option<String>,
     /// Optional. Names the market whose price protection the session pins
     /// when the product has one; the session trades every market either way.
     #[serde(default)]
@@ -1249,6 +1254,8 @@ pub struct PlatformVaultSetupPrepareResponse {
     pub server_time_ms: u64,
     pub wallet_address: String,
     pub session_public_key: String,
+    /// The old session requested for atomic replacement, if any.
+    pub replace_session_public_key: Option<String>,
     /// The market named in the request, if any.
     pub market_id: Option<String>,
     pub mode: PlatformVaultSetupMode,

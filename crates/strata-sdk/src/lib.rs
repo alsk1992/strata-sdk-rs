@@ -1539,6 +1539,19 @@ impl StrataClient {
                 "session_public_key must differ from wallet_address".to_owned(),
             ));
         }
+        let replace_session_public_key = request
+            .replace_session_public_key
+            .as_deref()
+            .map(|session| canonical_public_key(session, "replace_session_public_key"))
+            .transpose()?;
+        if replace_session_public_key
+            .as_ref()
+            .is_some_and(|session| session == &wallet_address || session == &session_public_key)
+        {
+            return Err(SdkError::InvalidRequest(
+                "replace_session_public_key must differ from the wallet and new session".to_owned(),
+            ));
+        }
         let market_id = request
             .market_id
             .as_deref()
@@ -1582,6 +1595,7 @@ impl StrataClient {
         let request = PlatformVaultSetupPrepareRequest {
             wallet_address,
             session_public_key,
+            replace_session_public_key,
             market_id,
             expires_at_ms: request.expires_at_ms,
             minimum_interval_seconds: Some(minimum_interval_seconds),
@@ -1593,6 +1607,7 @@ impl StrataClient {
         validate_platform_version(response.schema_version, &response.contract_version)?;
         if response.wallet_address != request.wallet_address
             || response.session_public_key != request.session_public_key
+            || response.replace_session_public_key != request.replace_session_public_key
             || response.market_id != request.market_id
             || response.expires_at_ms != request.expires_at_ms
             || response.permanent != request.expires_at_ms.is_none()
@@ -7801,6 +7816,7 @@ mod tests {
             .and(body_json(serde_json::json!({
                 "wallet_address": wallet,
                 "session_public_key": "9Uu7cLBgfMk233BAjMvTS8XJy6KbZK7oQ7NXuCTi3Fg2",
+                "replace_session_public_key": null,
                 "market_id": "market_33333333333333333333333333333333",
                 "expires_at_ms": null,
                 "minimum_interval_seconds": 1,
@@ -8028,6 +8044,7 @@ mod tests {
             .platform_vault_setup_prepare(PlatformVaultSetupPrepareRequest {
                 wallet_address: wallet.to_owned(),
                 session_public_key: "9Uu7cLBgfMk233BAjMvTS8XJy6KbZK7oQ7NXuCTi3Fg2".to_owned(),
+                replace_session_public_key: None,
                 market_id: Some("market_33333333333333333333333333333333".to_owned()),
                 expires_at_ms: None,
                 minimum_interval_seconds: None,
