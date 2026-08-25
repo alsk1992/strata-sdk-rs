@@ -3,6 +3,12 @@
 All notable changes to the Strata SDKs (`@stratabook/sdk`, `@stratabook/mcp`,
 and the `strata-sdk` Rust crate) are recorded here. Versions move together.
 
+## 0.2.16
+
+- Add the missing `mm.intent.manage` entry to the packaged v1 capability
+  fixture so Rust and TypeScript discovery examples remain byte-identical.
+- Runtime behavior and the public Rust API are unchanged from 0.2.15.
+
 ## 0.2.15
 
 - Add typed IntentBook prepare, submit, and one-call Vault-session execution.
