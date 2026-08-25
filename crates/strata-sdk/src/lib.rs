@@ -1487,11 +1487,11 @@ impl StrataClient {
                     canonical_public_key(wallet, "allowed_wallet_address").is_err()
                         || !allowed_wallets.insert(wallet.clone())
                 })
-            || ((response.withdrawal_access.mode == PlatformVaultWithdrawalMode::Restricted)
-                != !response
+            || (response.withdrawal_access.mode == PlatformVaultWithdrawalMode::Restricted)
+                == response
                     .withdrawal_access
                     .allowed_wallet_addresses
-                    .is_empty())
+                    .is_empty()
         {
             return Err(SdkError::InvalidResponse(
                 "Vault withdrawal access is inconsistent".to_owned(),

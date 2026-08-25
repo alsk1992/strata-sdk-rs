@@ -1620,15 +1620,16 @@ mod tests {
             sponsored: true,
         };
         let market_id = market_id();
-        let context = IntentVerificationContext {
-            market_id: &market_id,
-            operation: &operation,
-            prepared: &prepared,
-            owner_wallet: OWNER_WALLET,
-            session_public_key: SESSION_PUBLIC_KEY,
-        };
-        verify_intent_transaction(&context).unwrap();
-        drop(context);
+        {
+            let context = IntentVerificationContext {
+                market_id: &market_id,
+                operation: &operation,
+                prepared: &prepared,
+                owner_wallet: OWNER_WALLET,
+                session_public_key: SESSION_PUBLIC_KEY,
+            };
+            verify_intent_transaction(&context).unwrap();
+        }
 
         let changed = crate::PlatformMakerIntentPrepareResponse {
             transaction_base64: intent_transaction(0),
