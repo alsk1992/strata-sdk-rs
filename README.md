@@ -1,11 +1,32 @@
+<p align="center">
+  <a href="https://stratabook.app">
+    <img src="https://raw.githubusercontent.com/alsk1992/strata-sdk-rs/main/assets/readme-hero.svg" alt="Strata Rust SDK — The deepest book in DeFi" width="100%" />
+  </a>
+</p>
+
+<p align="center">
+  <a href="https://stratabook.app">Trade</a> ·
+  <a href="https://stratabook.org/docs/agent-sdks">Docs</a> ·
+  <a href="https://crates.io/crates/strata-sdk">crates.io</a> ·
+  <a href="https://docs.rs/strata-sdk">docs.rs</a> ·
+  <a href="https://github.com/alsk1992/strata-mcp">MCP</a>
+</p>
+
 # `strata-sdk`
 
-The official async Rust client for live Strata markets and Sonar quotes.
+The official async Rust SDK for Strata. Read live markets and books, request
+Sonar quotes, trade through owner-controlled Vault sessions, and manage Intent,
+Strand and Current liquidity from one strongly typed client.
 
-The official hosted API currently has market, exact-output, and asset-to-asset
-Sonar quotes enabled. The SDK still checks the live capability catalog before
-each gated operation; that is a runtime safety check, not an inactive-feature
-notice.
+| Live surface | What it gives you |
+| --- | --- |
+| Market data | Markets, books, best prices, marks, candles, trades and streams |
+| Sonar | Exact-input, exact-output and asset-to-asset quotes |
+| Trading | Quote execution, resting orders and TWAPs through capped Vault sessions |
+| Market making | IntentBook seats, Strands, Currents, maker status, fills and reputation |
+
+Each request is checked against Strata's live capability catalog, so a paused
+operation stops immediately across the SDK, MCP and hosted API.
 
 ## Install
 
@@ -113,7 +134,7 @@ Gross route output for an external route-quality comparison is exactly
 | `twap_submit(...)` | Idempotent submission of an externally signed TWAP action |
 | `execute_twap(...)` | One-signature TWAP placement or cancellation when enabled: direct prepare, binding checks, verifier (`DefaultTransactionVerifier` or your own), then the session signs only the transaction |
 
-## Manage Strands and Currents
+## Market making: Intent, Strands and Currents
 
 The high-level Rust path takes human inputs and hides product arrays, token
 atoms, market IDs, tick math, expiry slots, and confirmation polling:
@@ -218,8 +239,8 @@ let _current = strata
 ```
 
 Upserts use `PlatformMakerStrandPrepareRequest::Upsert` or
-`PlatformMakerCurrentPrepareRequest::Upsert`. Current bands are priced from
-the market's live Strata mark; no separate oracle publisher is required.
+`PlatformMakerCurrentPrepareRequest::Upsert`. Current bands track the market's
+live Strata mark automatically.
 Amounts are base-asset atoms,
 encoded as unsigned decimal strings. `platform_maker_status_for_wallet(...)`
 reports the resulting live controls, remaining exposure, expiry, and health.
