@@ -1204,9 +1204,9 @@ pub enum PlatformVaultSetupMode {
     ReplaceSession,
 }
 
-/// Session policy applied when onboarding does not state one: at most one
-/// execution per second per session, and a 1% maximum tolerance.
-pub const PLATFORM_SESSION_DEFAULT_MINIMUM_INTERVAL_SECONDS: u32 = 1;
+/// Session policy applied when onboarding does not state one: strategy timing
+/// is unrestricted and the maximum price tolerance is 1%.
+pub const PLATFORM_SESSION_DEFAULT_MINIMUM_INTERVAL_SECONDS: u32 = 0;
 pub const PLATFORM_SESSION_DEFAULT_MAXIMUM_TOLERANCE_BPS: u16 = 100;
 /// A session carries at most this many spending limits.
 pub const PLATFORM_SESSION_MAX_SPENDING_LIMITS: usize = 4;
@@ -1232,7 +1232,7 @@ pub struct PlatformVaultSetupPrepareRequest {
     /// product.
     #[serde(default)]
     pub expires_at_ms: Option<u64>,
-    /// Absent takes `PLATFORM_SESSION_DEFAULT_MINIMUM_INTERVAL_SECONDS`.
+    /// Optional legacy hard cadence floor. Absent/zero leaves timing to the strategy.
     #[serde(default)]
     pub minimum_interval_seconds: Option<u32>,
     /// Absent takes `PLATFORM_SESSION_DEFAULT_MAXIMUM_TOLERANCE_BPS`.

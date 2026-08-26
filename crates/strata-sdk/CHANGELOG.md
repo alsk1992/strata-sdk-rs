@@ -3,6 +3,14 @@
 All notable changes to the Strata SDKs (`@stratabook/sdk`, `@stratabook/mcp`,
 and the `strata-sdk` Rust crate) are recorded here. Versions move together.
 
+## 0.2.17
+
+- Default Vault sessions to unrestricted strategy timing while preserving the
+  existing wire field for callers that deliberately choose a hard cadence
+  floor. Account layouts and transaction shapes are unchanged.
+- Accept zero in setup verification and align the fixture with the TypeScript
+  SDK, MCP server, live service, and upgraded Vault program.
+
 ## 0.2.16
 
 - Add the missing `mm.intent.manage` entry to the packaged v1 capability

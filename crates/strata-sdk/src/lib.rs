@@ -1583,7 +1583,7 @@ impl StrataClient {
         if request
             .expires_at_ms
             .is_some_and(|expiry| expiry % 1_000 != 0 || expiry <= now_ms.saturating_add(60_000))
-            || !(1..=86_400).contains(&minimum_interval_seconds)
+            || minimum_interval_seconds > 86_400
             || !(1..=1_000).contains(&maximum_tolerance_bps)
             || request.spending_limits.len() > PLATFORM_SESSION_MAX_SPENDING_LIMITS
         {
@@ -8057,7 +8057,7 @@ mod tests {
                 "replace_session_public_key": null,
                 "market_id": "market_33333333333333333333333333333333",
                 "expires_at_ms": null,
-                "minimum_interval_seconds": 1,
+                "minimum_interval_seconds": 0,
                 "maximum_tolerance_bps": 100,
                 "spending_limits": [
                     {
