@@ -3,6 +3,11 @@
 All notable changes to the Strata SDKs (`@stratabook/sdk`, `@stratabook/mcp`,
 and the `strata-sdk` Rust crate) are recorded here. Versions move together.
 
+## 0.2.18
+
+- Coordinated release for the agent runtime and TypeScript retry contract.
+  Rust APIs and transaction behavior are unchanged from 0.2.17.
+
 ## 0.2.17
 
 - Default Vault sessions to unrestricted strategy timing while preserving the
