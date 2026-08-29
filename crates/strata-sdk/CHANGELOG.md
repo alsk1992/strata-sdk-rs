@@ -3,6 +3,13 @@
 All notable changes to the Strata SDKs (`@stratabook/sdk`, `@stratabook/mcp`,
 and the `strata-sdk` Rust crate) are recorded here. Versions move together.
 
+## 0.2.19
+
+- Add `PlatformSelfTradePrevention::None` and make it the wire default when a
+  persistent order challenge omits proactive self-trade cancellation.
+- Keep the matcher and on-chain self-fill prohibition unchanged while all four
+  cancellation policies remain available as explicit opt-ins.
+
 ## 0.2.18
 
 - Coordinated release for the agent runtime and TypeScript retry contract.

@@ -811,7 +811,7 @@ impl ActionGraph {
                 node(
                     "open_order_command_stream",
                     ActionNodeKind::Prepare,
-                    "Authenticate one persistent sequenced order channel for low-latency commands, explicit self-trade policy, and pushed confirmation.",
+                    "Authenticate one persistent sequenced order channel for low-latency commands, optional self-trade cancellation, and pushed confirmation.",
                     &["orders.prepare", "orders.submit"],
                     Some(operation(
                         "WEBSOCKET",
@@ -875,7 +875,7 @@ impl ActionGraph {
                 edge("sign_transaction", "submit_execution", "trade.submit is enabled and the signed transaction is unmodified"),
                 edge("submit_execution", "receive_receipt", "the execution ID and idempotency key match"),
                 edge("discover_platform_markets", "open_order_command_stream", "orders.prepare and orders.submit advertise websocket transport and the owner-configured session signer is available"),
-                edge("open_order_command_stream", "request_order_challenge", "signed socket authentication succeeds and an explicit self-trade prevention policy is selected"),
+                edge("open_order_command_stream", "request_order_challenge", "signed socket authentication succeeds; self-trade cancellation remains off unless the owner explicitly selects a policy"),
                 edge("open_order_command_stream", "maintain_dead_man", "the exact cancel-all authorization and transaction are externally verified and signed"),
                 edge("open_order_command_stream", "certify_order_command_slo", "a release or recurring production load certificate is required"),
                 edge("discover_platform_markets", "request_order_challenge", "orders.prepare is enabled and the market accepts order control"),

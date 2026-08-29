@@ -1887,12 +1887,15 @@ pub struct PlatformOrderStatusResponse {
     pub updated_at_ms: u64,
 }
 
-/// Collision policy for an incoming order that would cross the owner's own
-/// resting liquidity. Every mode still preserves Strata's matcher and on-chain
-/// self-fill prohibition; this only controls which order is cancelled first.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+/// Optional collision policy for an incoming order that would cross the
+/// owner's own resting liquidity. Every mode still preserves Strata's matcher
+/// and on-chain self-fill prohibition; active policies only control which
+/// order is cancelled first.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlatformSelfTradePrevention {
+    #[default]
+    None,
     CancelTaker,
     CancelMaker,
     CancelBoth,
@@ -1911,6 +1914,7 @@ pub enum PlatformOrderCommand {
     },
     Challenge {
         request: PlatformOrderChallengeRequest,
+        #[serde(default)]
         self_trade_prevention: PlatformSelfTradePrevention,
     },
     Prepare {
@@ -3158,7 +3162,7 @@ mod tests {
     }
 
     #[test]
-    fn persistent_order_commands_are_strict_and_explicit_about_self_trade_policy() {
+    fn persistent_order_commands_default_to_no_self_trade_policy() {
         let frame: PlatformOrderCommandClientFrame = serde_json::from_value(serde_json::json!({
             "type": "command",
             "request_id": "agent-1",
@@ -3184,8 +3188,8 @@ mod tests {
                 ..
             }
         ));
-        assert!(
-            serde_json::from_value::<PlatformOrderCommandClientFrame>(serde_json::json!({
+        let default_frame: PlatformOrderCommandClientFrame =
+            serde_json::from_value(serde_json::json!({
                 "type": "command",
                 "request_id": "agent-1",
                 "sequence": "1",
@@ -3198,8 +3202,17 @@ mod tests {
                     }
                 }
             }))
-            .is_err()
-        );
+            .unwrap();
+        assert!(matches!(
+            default_frame,
+            PlatformOrderCommandClientFrame::Command {
+                command: PlatformOrderCommand::Challenge {
+                    self_trade_prevention: PlatformSelfTradePrevention::None,
+                    ..
+                },
+                ..
+            }
+        ));
     }
 
     #[test]
