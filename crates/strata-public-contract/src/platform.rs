@@ -1891,20 +1891,15 @@ pub struct PlatformOrderStatusResponse {
 /// owner's own resting liquidity. Every mode still preserves Strata's matcher
 /// and on-chain self-fill prohibition; active policies only control which
 /// order is cancelled first.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlatformSelfTradePrevention {
+    #[default]
     None,
     CancelTaker,
     CancelMaker,
     CancelBoth,
     SkipOwnLiquidity,
-}
-
-impl Default for PlatformSelfTradePrevention {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 /// One command on the persistent order-control connection. Challenge results
