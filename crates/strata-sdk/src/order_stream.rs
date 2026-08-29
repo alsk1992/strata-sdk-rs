@@ -572,7 +572,7 @@ impl OrderCommandStream {
                     owner_wallet: self.owner_wallet.clone(),
                     session_public_key: self.session_public_key.clone(),
                 },
-                PlatformSelfTradePrevention::CancelTaker,
+                PlatformSelfTradePrevention::None,
             )
             .await?;
         let (prepared, signed_transaction_base64) = self
