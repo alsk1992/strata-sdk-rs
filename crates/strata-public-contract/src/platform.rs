@@ -71,6 +71,9 @@ pub const PLATFORM_PORTFOLIO_FIXTURE: &str = include_str!("../fixtures/v2/portfo
 pub const PLATFORM_REWARDS_FIXTURE: &str = include_str!("../fixtures/v2/rewards.json");
 #[cfg(any(test, feature = "fixtures"))]
 #[doc(hidden)]
+pub const PLATFORM_POINTS_FIXTURE: &str = include_str!("../fixtures/v2/points.json");
+#[cfg(any(test, feature = "fixtures"))]
+#[doc(hidden)]
 pub const PLATFORM_REFERRALS_FIXTURE: &str = include_str!("../fixtures/v2/referrals.json");
 #[cfg(any(test, feature = "fixtures"))]
 #[doc(hidden)]
@@ -1526,6 +1529,72 @@ pub struct PlatformRewardsResponse {
     pub standings: Vec<PlatformRewardStanding>,
 }
 
+/// Public earn-lane allocation for the active weekly Points epoch.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlatformPointsWeightsBps {
+    pub volume: u16,
+    pub maker: u16,
+    pub bugs: u16,
+    pub referrals: u16,
+}
+
+/// One immutable fleet-wide Points balance on the public standings.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlatformPointsStanding {
+    pub rank: u32,
+    pub wallet_address: String,
+    pub points: String,
+    pub volume_points: String,
+    pub maker_points: String,
+    pub bug_points: String,
+    pub referral_points: String,
+}
+
+/// Optional wallet projection returned by the aggregate Points read.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlatformOwnerPoints {
+    pub wallet_address: String,
+    pub rank: Option<u32>,
+    pub points: String,
+    pub volume_points: String,
+    pub maker_points: String,
+    pub bug_points: String,
+    pub referral_points: String,
+}
+
+/// Complete agent-facing snapshot of the immutable fleet-wide Points program.
+///
+/// Current-epoch activity remains provisional and is deliberately excluded
+/// until the allocation close proof finishes. `strata_rewards` remains the
+/// backwards-compatible legacy summary; new integrations should use this.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlatformPointsResponse {
+    pub schema_version: u16,
+    pub contract_version: String,
+    pub server_time_ms: u64,
+    pub program_scope: String,
+    pub season: String,
+    pub season_index: u64,
+    pub season_start_ms: u64,
+    pub genesis_ms: u64,
+    pub genesis_epochs: u64,
+    pub epoch_index: u64,
+    pub epoch_in_season: u64,
+    pub epoch_start_ms: u64,
+    pub epoch_end_ms: u64,
+    pub allocation_finalizes_after_ms: u64,
+    pub balances_include_closed_epochs_only: bool,
+    pub weekly_points_budget: String,
+    pub weights_bps: PlatformPointsWeightsBps,
+    pub total_wallets: u32,
+    pub owner: Option<PlatformOwnerPoints>,
+    pub standings: Vec<PlatformPointsStanding>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlatformReferralsResponse {
@@ -2854,6 +2923,7 @@ mod tests {
             serde_json::from_str(PLATFORM_PORTFOLIO_FIXTURE).unwrap();
         let rewards: PlatformRewardsResponse =
             serde_json::from_str(PLATFORM_REWARDS_FIXTURE).unwrap();
+        let points: PlatformPointsResponse = serde_json::from_str(PLATFORM_POINTS_FIXTURE).unwrap();
         let referrals: PlatformReferralsResponse =
             serde_json::from_str(PLATFORM_REFERRALS_FIXTURE).unwrap();
         let referral_link: PlatformReferralLinkResponse =
@@ -2903,9 +2973,13 @@ mod tests {
 
         assert_eq!(discovery.schema_version, PLATFORM_SCHEMA_VERSION);
         assert_eq!(service_status.status, PlatformServiceState::Operational);
-        assert_eq!(service_status.available_operations, 59);
+        assert_eq!(service_status.available_operations, 60);
         assert_eq!(graph.entry_operation_id, "platform.capabilities.read");
-        assert_eq!(graph.operations.len(), 70);
+        assert_eq!(graph.operations.len(), 71);
+        assert!(graph
+            .operations
+            .iter()
+            .any(|operation| operation.id == "points.read"));
         assert_eq!(maker_reputation.tier, PlatformMakerReputationTier::Gold);
         assert_eq!(maker_status.active_products, 3);
         match &maker_stream {
@@ -2980,6 +3054,8 @@ mod tests {
         assert_eq!(twap_submit.twap_control_id, twap_prepare.twap_control_id);
         assert_eq!(portfolio_history.points.len(), 2);
         assert_eq!(rewards.standings.len(), 2);
+        assert_eq!(points.program_scope, "all_live_markets");
+        assert_eq!(points.weekly_points_budget, "1000000");
         assert!(referrals.enabled);
         assert_eq!(referral_link.status, "pending_first_fill");
         assert_eq!(referral_claim.status, "requested");

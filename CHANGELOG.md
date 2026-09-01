@@ -3,6 +3,17 @@
 All notable changes to the Strata SDKs (`@stratabook/sdk`, `@stratabook/mcp`,
 and the `strata-sdk` Rust crate) are recorded here. Versions move together.
 
+## 0.2.21
+
+- Coordinated version-parity release for Agent Harness 1.2. Rust APIs and
+  transaction behavior are unchanged from 0.2.20.
+
+## 0.2.20
+
+- Add strict fleet-wide Points response types and `platform_points`, including
+  validation of allocation weights, ranks, windows, and owner lane totals.
+- Add the `points` command to the official Rust terminal client.
+
 ## 0.2.19
 
 - Add `PlatformSelfTradePrevention::None` and make it the wire default when a
