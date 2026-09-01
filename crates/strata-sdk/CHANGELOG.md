@@ -3,6 +3,11 @@
 All notable changes to the Strata SDKs (`@stratabook/sdk`, `@stratabook/mcp`,
 and the `strata-sdk` Rust crate) are recorded here. Versions move together.
 
+## 0.2.22
+
+- Coordinated version-parity patch for profile-aware maker conformance. Rust
+  APIs and transaction behavior are unchanged from 0.2.21.
+
 ## 0.2.21
 
 - Coordinated version-parity release for Agent Harness 1.2. Rust APIs and
