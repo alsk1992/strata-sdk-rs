@@ -11,8 +11,8 @@ use strata_sdk::{
     ExecutionChallengeRequest, ExecutionPrepareAuthorization, ExecutionPrepareRequest,
     ExecutionSubmitRequest, PlatformOrderBatchOperation, PlatformOrderChallengeRequest,
     PlatformOrderPrepareAuthorization, PlatformOrderPrepareRequest, PlatformOrderStatusRequest,
-    PlatformOrderSubmitRequest, PlatformOrderType, PlatformTradeSide, QuoteRequest, QuoteSide,
-    StrataClient, DEFAULT_API_BASE, DEFAULT_MAXIMUM_TOLERANCE_BPS,
+    PlatformOrderSubmitRequest, PlatformOrderType, PlatformPointsRequest, PlatformTradeSide,
+    QuoteRequest, QuoteSide, StrataClient, DEFAULT_API_BASE, DEFAULT_MAXIMUM_TOLERANCE_BPS,
 };
 
 #[derive(Debug, Parser)]
@@ -44,6 +44,15 @@ enum Command {
         /// Include markets that are currently not quote-ready.
         #[arg(long)]
         all: bool,
+    },
+    /// Read the complete fleet-wide immutable Points program in one request.
+    Points {
+        /// Optional owner wallet for its rank and lane breakdown.
+        #[arg(long)]
+        wallet: Option<String>,
+        /// Number of public standings to return.
+        #[arg(long, default_value_t = 25)]
+        limit: u16,
     },
     /// Request a short-lived quote by market label or public market ID.
     Quote {
@@ -326,6 +335,52 @@ async fn main() -> Result<(), Box<dyn Error>> {
                         market.base_decimals,
                         market.quote_decimals
                     );
+                }
+            }
+        }
+        Command::Points { wallet, limit } => {
+            let response = client
+                .platform_points(PlatformPointsRequest {
+                    wallet_address: wallet,
+                    limit: Some(limit),
+                })
+                .await?;
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(&response)?);
+            } else {
+                println!(
+                    "Strata Points · {} · epoch {}",
+                    response.season, response.epoch_index
+                );
+                println!("  scope:     all live markets");
+                println!("  budget:    {} Points/week", response.weekly_points_budget);
+                println!(
+                    "  weights:   volume {} · maker {} · bugs {} · referrals {} bps",
+                    response.weights_bps.volume,
+                    response.weights_bps.maker,
+                    response.weights_bps.bugs,
+                    response.weights_bps.referrals
+                );
+                println!("  finalizes: {}", response.allocation_finalizes_after_ms);
+                println!("  wallets:   {}", response.total_wallets);
+                if let Some(owner) = response.owner {
+                    println!(
+                        "  owner:     {} Points, rank {}",
+                        owner.points,
+                        owner
+                            .rank
+                            .map_or_else(|| "—".to_owned(), |rank| rank.to_string())
+                    );
+                    println!(
+                        "             volume {} · maker {} · bugs {} · referrals {}",
+                        owner.volume_points,
+                        owner.maker_points,
+                        owner.bug_points,
+                        owner.referral_points
+                    );
+                }
+                for row in response.standings {
+                    println!("  #{} {} {}", row.rank, row.wallet_address, row.points);
                 }
             }
         }

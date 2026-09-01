@@ -65,7 +65,8 @@ pub use strata_public_contract::platform::{
     PlatformOrderControlStatus, PlatformOrderPrepareAuthorization, PlatformOrderPrepareRequest,
     PlatformOrderPrepareResponse, PlatformOrderState, PlatformOrderStatusRequest,
     PlatformOrderStatusResponse, PlatformOrderSubmissionStatus, PlatformOrderSubmitRequest,
-    PlatformOrderSubmitResponse, PlatformOrderType, PlatformOwnerRewards,
+    PlatformOrderSubmitResponse, PlatformOrderType, PlatformOwnerPoints, PlatformOwnerRewards,
+    PlatformPointsResponse, PlatformPointsStanding, PlatformPointsWeightsBps,
     PlatformPortfolioHistoryPoint, PlatformPortfolioHistoryRange, PlatformPortfolioHistoryResponse,
     PlatformPortfolioResponse, PlatformReferralClaimRequest, PlatformReferralClaimResponse,
     PlatformReferralLinkRequest, PlatformReferralLinkResponse, PlatformReferralsResponse,
@@ -131,6 +132,8 @@ pub struct PlatformRewardsRequest {
     pub wallet_address: Option<String>,
     pub limit: Option<u16>,
 }
+
+pub type PlatformPointsRequest = PlatformRewardsRequest;
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct PlatformVaultStatusRequest {
@@ -1923,6 +1926,48 @@ impl StrataClient {
             _ => {
                 return Err(SdkError::InvalidResponse(
                     "reward owner does not match the request".to_owned(),
+                ))
+            }
+        }
+        Ok(response)
+    }
+
+    /// Complete fleet-wide Points snapshot. This is the preferred one-call
+    /// agent read; `platform_rewards` remains for compatibility.
+    pub async fn platform_points(
+        &self,
+        request: PlatformPointsRequest,
+    ) -> Result<PlatformPointsResponse, SdkError> {
+        self.require_platform_capability(
+            "points.read",
+            CapabilityRisk::Read,
+            PlatformTransport::Http,
+        )
+        .await?;
+        let wallet = request
+            .wallet_address
+            .as_deref()
+            .map(|value| canonical_public_key(value, "wallet_address"))
+            .transpose()?;
+        let mut query = Vec::new();
+        if let Some(wallet) = &wallet {
+            query.push(("wallet_address".to_owned(), wallet.clone()));
+        }
+        if let Some(limit @ 1..=100) = request.limit {
+            query.push(("limit".to_owned(), limit.to_string()));
+        } else if request.limit.is_some() {
+            return Err(SdkError::InvalidRequest(
+                "Points standings limit must be between 1 and 100".to_owned(),
+            ));
+        }
+        let response: PlatformPointsResponse = self.get("v2/points", &query).await?;
+        validate_platform_points(&response)?;
+        match (&wallet, &response.owner) {
+            (Some(expected), Some(owner)) if owner.wallet_address == *expected => {}
+            (None, None) => {}
+            _ => {
+                return Err(SdkError::InvalidResponse(
+                    "Points owner does not match the request".to_owned(),
                 ))
             }
         }
@@ -3996,6 +4041,105 @@ fn validate_platform_version(schema_version: u16, contract_version: &str) -> Res
         return Err(SdkError::InvalidResponse(format!(
             "unsupported platform contract {contract_version} (schema {schema_version})"
         )));
+    }
+    Ok(())
+}
+
+fn parse_points(value: &str, field: &str) -> Result<u64, SdkError> {
+    if value.is_empty()
+        || (value.len() > 1 && value.starts_with('0'))
+        || !value.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(SdkError::InvalidResponse(format!(
+            "{field} is not a canonical Points value"
+        )));
+    }
+    value.parse::<u64>().map_err(|_| {
+        SdkError::InvalidResponse(format!("{field} exceeds the supported Points range"))
+    })
+}
+
+fn validate_points_breakdown(
+    points: &str,
+    volume: &str,
+    maker: &str,
+    bugs: &str,
+    referrals: &str,
+    field: &str,
+) -> Result<(), SdkError> {
+    let total = parse_points(points, &format!("{field}.points"))? as u128;
+    let lanes = parse_points(volume, &format!("{field}.volume_points"))? as u128
+        + parse_points(maker, &format!("{field}.maker_points"))? as u128
+        + parse_points(bugs, &format!("{field}.bug_points"))? as u128
+        + parse_points(referrals, &format!("{field}.referral_points"))? as u128;
+    if total != lanes {
+        return Err(SdkError::InvalidResponse(format!(
+            "{field} Points total does not match its lane breakdown"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_platform_points(response: &PlatformPointsResponse) -> Result<(), SdkError> {
+    validate_platform_version(response.schema_version, &response.contract_version)?;
+    if response.program_scope != "all_live_markets"
+        || !response.balances_include_closed_epochs_only
+        || response.standings.len() > 100
+        || response.standings.len() > response.total_wallets as usize
+        || response.genesis_ms > response.season_start_ms
+        || response.season_start_ms > response.epoch_start_ms
+        || response.epoch_start_ms >= response.epoch_end_ms
+        || response.epoch_end_ms > response.allocation_finalizes_after_ms
+        || u32::from(response.weights_bps.volume)
+            + u32::from(response.weights_bps.maker)
+            + u32::from(response.weights_bps.bugs)
+            + u32::from(response.weights_bps.referrals)
+            != 10_000
+    {
+        return Err(SdkError::InvalidResponse(
+            "Points program metadata is invalid".to_owned(),
+        ));
+    }
+    parse_points(&response.weekly_points_budget, "weekly_points_budget")?;
+    let mut wallets = HashSet::new();
+    for (index, row) in response.standings.iter().enumerate() {
+        if row.rank as usize != index + 1
+            || !wallets.insert(canonical_public_key(
+                &row.wallet_address,
+                "standings.wallet_address",
+            )?)
+        {
+            return Err(SdkError::InvalidResponse(
+                "Points standings are invalid".to_owned(),
+            ));
+        }
+        validate_points_breakdown(
+            &row.points,
+            &row.volume_points,
+            &row.maker_points,
+            &row.bug_points,
+            &row.referral_points,
+            "standings row",
+        )?;
+    }
+    if let Some(owner) = &response.owner {
+        canonical_public_key(&owner.wallet_address, "owner.wallet_address")?;
+        if owner
+            .rank
+            .is_some_and(|rank| rank == 0 || rank > response.total_wallets)
+        {
+            return Err(SdkError::InvalidResponse(
+                "Points owner rank is invalid".to_owned(),
+            ));
+        }
+        validate_points_breakdown(
+            &owner.points,
+            &owner.volume_points,
+            &owner.maker_points,
+            &owner.bug_points,
+            &owner.referral_points,
+            "owner",
+        )?;
     }
     Ok(())
 }
@@ -7363,6 +7507,7 @@ mod tests {
             capability("mm.fills.stream", CapabilityRisk::Read, websocket),
             capability("mm.strand.manage", CapabilityRisk::Submit, http.clone()),
             capability("mm.current.manage", CapabilityRisk::Submit, http.clone()),
+            capability("points.read", CapabilityRisk::Read, http.clone()),
             capability("rewards.read", CapabilityRisk::Read, http.clone()),
             capability("referrals.read", CapabilityRisk::Read, http.clone()),
             capability("referrals.link", CapabilityRisk::Submit, http.clone()),
@@ -7444,6 +7589,7 @@ mod tests {
             }
             "vault-submit" => strata_public_contract::platform::PLATFORM_VAULT_SUBMIT_FIXTURE,
             "rewards" => strata_public_contract::platform::PLATFORM_REWARDS_FIXTURE,
+            "points" => strata_public_contract::platform::PLATFORM_POINTS_FIXTURE,
             "referrals" => strata_public_contract::platform::PLATFORM_REFERRALS_FIXTURE,
             "referral-link" => strata_public_contract::platform::PLATFORM_REFERRAL_LINK_FIXTURE,
             "referral-claim" => strata_public_contract::platform::PLATFORM_REFERRAL_CLAIM_FIXTURE,
@@ -7707,7 +7853,7 @@ mod tests {
         );
         assert_eq!(
             client.platform_status().await.unwrap().available_operations,
-            59
+            60
         );
         assert!(!client
             .platform_assets(PageRequest::default())
@@ -8150,6 +8296,14 @@ mod tests {
             .mount(&server)
             .await;
         Mock::given(method("GET"))
+            .and(path("/v2/points"))
+            .and(query_param("wallet_address", wallet))
+            .and(query_param("limit", "20"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(fixture("points")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
             .and(path("/v2/rewards"))
             .and(query_param("wallet_address", wallet))
             .and(query_param("limit", "20"))
@@ -8388,6 +8542,15 @@ mod tests {
             PlatformVaultWithdrawalMode::Restricted
         );
         assert!(policy.owner_signature_required);
+        assert!(client
+            .platform_points(PlatformPointsRequest {
+                wallet_address: Some(wallet.to_owned()),
+                limit: Some(20),
+            })
+            .await
+            .unwrap()
+            .owner
+            .is_some());
         assert!(client
             .platform_rewards(PlatformRewardsRequest {
                 wallet_address: Some(wallet.to_owned()),

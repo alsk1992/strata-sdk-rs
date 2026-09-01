@@ -6,7 +6,7 @@
 
 <p align="center">
   <a href="https://stratabook.app">Trade</a> ·
-  <a href="https://stratabook.org/docs/agent-sdks">Docs</a> ·
+  <a href="https://stratabook.app/docs/agent-sdks">Docs</a> ·
   <a href="https://crates.io/crates/strata-sdk">crates.io</a> ·
   <a href="https://docs.rs/strata-sdk">docs.rs</a> ·
   <a href="https://github.com/alsk1992/strata-mcp">MCP</a>
@@ -114,7 +114,8 @@ Gross route output for an external route-quality comparison is exactly
 | `platform_maker_current_prepare(...)` / `platform_maker_current_submit(...)` | Prepare and submit externally signed Current upsert or cancel actions |
 | `platform_maker_intent_prepare(...)` / `platform_maker_intent_submit(...)` | Prepare and submit a sponsored Vault-session post or permanent revoke for an existing curated IntentBook seat |
 | `platform_maker_intent_execute(...)` | Verify, session-sign, and submit that exact IntentBook packet in one call |
-| `platform_rewards(...)` / `platform_referrals(...)` | Public community and owner-scoped state |
+| `platform_points(...)` | Complete fleet-wide Points Season/epoch, allocation rules, owner breakdown, rank and bounded standings in one read |
+| `platform_rewards(...)` / `platform_referrals(...)` | Backwards-compatible rewards summary and owner-scoped referral state |
 | `platform_bugs(...)` / `platform_bug_submit(...)` | Signed public bug-report workflow |
 | `capabilities()` | Features currently available through the public contract |
 | `action_graph()` | Live operation topology and external signing boundaries |
